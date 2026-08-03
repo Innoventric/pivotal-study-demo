@@ -10983,6 +10983,11 @@ function stageComplete(p, s){
 function anatUnlocked(p, key){
   const i = ANAT_STAGES.findIndex(s => s.k === key);
   if(i <= 0) return true;
+  /* The Product Order stage may never open until the procedure is actually scheduled,
+     and this holds even under an override: ordering product for a procedure with no
+     date, hospital or physician is meaningless. */
+  if(key === "order" && !stageComplete(p, ANAT_STAGES.find(s => s.k === "scheduling")))
+    return false;
   if(p.anatOverride) return true;
   return ANAT_STAGES.slice(0, i).every(s => stageComplete(p, s));
 }
@@ -11246,6 +11251,41 @@ function notify(text, forRoles, forUserIds, locationId){
     forRoles:forRoles||[], forUserIds:forUserIds||[], locationId:locationId||null, read:false });
   commit();
 }
+/* A product-order request has just been raised. Notify the admins and warehouse
+   managers in-app, record it in the audit log, and - when a backend is present - ask
+   the server to email the same people (who requested, what, when, procedure date,
+   from where, to where). Called exactly once per patient, guarded by order.requestedBy. */
+function announceOrderRequest(p){
+  const o = p.anat.order, sc = p.anat.scheduling;
+  const rec = currentRecommendation(p);
+  const ds  = rec.size && window.DeviceQr ? window.DeviceQr.requiredDsSize(rec.size) : "";
+  const text = [
+    "Product order requested for " + p.patientCode + " by " + S.me.name,
+    "Unica " + (rec.size || "?") + " / DS " + (ds || "?"),
+    o.accessories ? "Accessories: " + o.accessories : "",
+    "Procedure: " + (fmtDate(p.procedureDate) || "—") + (sc.hospital ? " at " + sc.hospital : ""),
+    "From " + locName(p.siteId) + " to " + (o.shippingDest || "—"),
+    o.requestedDate ? "Requested delivery: " + fmtDate(o.requestedDate) : ""
+  ].filter(Boolean).join(" · ");
+
+  notify(text, ["ADMIN","WH_ADMIN"], [], p.siteId);
+  logAction("Product order requested for " + p.patientCode, { locationId:p.siteId, highPriority:true,
+    stateChanges:"Product Order Request raised", comments:text });
+
+  if(S.backend){
+    fetch("/api/orders/notify", { method:"POST", credentials:"same-origin",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({
+        patientCode: p.patientCode, requestedBy: S.me.name,
+        implantSize: rec.size || "", dsSize: ds || "", accessories: o.accessories || "",
+        procedureDate: fmtDate(p.procedureDate), hospital: sc.hospital || "",
+        fromSite: locName(p.siteId), shippingDest: o.shippingDest || "",
+        requestedDate: fmtDate(o.requestedDate) })
+    }).then(r => r.ok ? r.json() : null)
+      .then(res => { if(res && res.sent) toast("Order request emailed to " + res.count + " recipient(s).", "good"); })
+      .catch(() => { /* email is best-effort; the in-app notification already stands */ });
+  }
+}
 /* Queue-first: the local record is the durability guarantee, the upload is
    best-effort. Nothing is lost when the network is not there. */
 function queueBackup(path, filename, content){
@@ -11394,7 +11434,14 @@ function pill(map, key){
   const m = map[key] || { label:key, cls:"p-grey" };
   return '<span class="pill ' + m.cls + '">' + esc(m.label) + '</span>';
 }
-function fmtDate(s){ return s ? String(s).slice(0,10) : "—"; }
+function fmtDate(s){
+  if(!s) return "—";
+  const str = String(s);
+  /* A datetime-local value (YYYY-MM-DDTHH:mm) shows its time too; a plain date stays a date. */
+  return (str.length > 10 && str.charAt(10) === "T")
+    ? str.slice(0,10) + " " + str.slice(11,16)
+    : str.slice(0,10);
+}
 function fmtTs(s){
   if(!s) return "—";
   const d = new Date(s);
@@ -12076,7 +12123,8 @@ function render(){
 function daysUntil(d){
   if(!d) return null;
   const t = new Date(); t.setHours(0,0,0,0);
-  const x = new Date(d + "T00:00:00");
+  /* Take only the date part, so a datetime-local value (with a time) still parses. */
+  const x = new Date(String(d).slice(0,10) + "T00:00:00");
   return isNaN(x) ? null : Math.round((x - t) / 86400000);
 }
 function whenWord(n){
@@ -12167,7 +12215,22 @@ function todoItems(){
   if(unread.length) out.push({ ic:"alert", tone:"t-blue", view:"alerts",
     title: unread.length + " unread alert(s)", sub: unread[0].text });
 
-  /* 8 — anything still queued for upload. */
+  /* 8 — open product-order requests. Warehouse managers and admins see incoming demand
+     to fulfil; the clinical side sees what it has raised and is still waiting on. */
+  const openOrders = myPatients.filter(x =>
+    x.anat && x.anat.order && x.anat.order.requestedBy && x.anat.order.status !== "Completed");
+  if(openOrders.length){
+    const wh = ["WH_ADMIN","ADMIN"].includes(S.me.role);
+    out.push({ ic:"ship", tone:"t-amber",
+      view: wh ? "shipment" : "clinical",
+      patientId: wh ? undefined : openOrders[0].id,
+      title: openOrders.length + " open product order request(s)",
+      sub: openOrders.slice(0,3).map(x => x.patientCode + " · Unica " + x.unicaSize +
+           (x.anat.order.shippingDest ? " → " + x.anat.order.shippingDest : "")).join(" · ") +
+           (openOrders.length > 3 ? " …" : "") });
+  }
+
+  /* 9 — anything still queued for upload. */
   const pend = S.db.backupQueue.filter(r => !r.synced);
   if(pend.length) out.push({ ic:"cloud", tone:"t-amber", view:"backup",
     title: pend.length + " record(s) not yet uploaded",
@@ -12773,10 +12836,17 @@ VIEWS.screening = {
         clearWhy("scr-why");
         a[field] = el.type === "checkbox" ? el.checked : el.value;
 
+        /* Editing any field in a stage that is still "Not started" moves it to
+           "In progress", so the badge shows work is under way without a manual change.
+           Only "Not started" advances; Completed / In progress / Not required stay put. */
+        if(field !== "status" && a.status === "Not started"){
+          a.status = "In progress";
+        }
+
         /* Completing a stage stamps who and when, once. */
         if(field === "status" && a.status === "Completed" && !a.completedBy){
           a.completedBy = S.me.name;
-          if(!a.completionDate) a.completionDate = nowISO().slice(0,10);
+          if(!a.completionDate) a.completionDate = nowISO().slice(0,16);  // date + time (YYYY-MM-DDTHH:mm)
         }
         /* No pacemaker means PM insertion is not something anyone has to do. */
         if(key === "model3d" && field === "pmPresent"){
@@ -12785,6 +12855,14 @@ VIEWS.screening = {
         /* Scheduling is the one place a procedure date is set; the clinical workflow
            reads it from here rather than asking again. */
         if(key === "scheduling" && field === "completionDate") p.procedureDate = el.value;
+
+        /* The first time the Product Order stage leaves "Not started", the request has
+           gone out: stamp who raised it and notify admins + warehouse managers (in-app
+           now, email via the server). Guarded on requestedBy so it fires exactly once. */
+        if(key === "order" && a.status !== "Not started" && a.status !== "Not required" && !a.requestedBy){
+          a.requestedBy = S.me.name;
+          announceOrderRequest(p);
+        }
 
         p.status = recomputeWorkflow(p);
         logAction("Anatomical evaluation updated", { locationId:p.siteId,
@@ -12855,11 +12933,11 @@ function anatStageHtml(p, s, ctReady){
 
   /* Header summary, so a collapsed stage still answers "what was decided here". */
   let summary = "";
-  if(a.status === "Not required") summary = "Not required";
+  if(a.status === "Not required") summary = s.needsPm ? "N/A · Deemed (No PM)" : "Not required";
   else if(settled){
     summary = [s.kind === "eval" ? [a.size, a.angle ? a.angle + "\u00B0" : ""].filter(Boolean).join(", ") : "",
-               s.kind === "ops"  ? a.actualDate : "",
-               s.kind === "sched" ? [a.completionDate, a.hospital].filter(Boolean).join(" \u00B7 ") : "",
+               s.kind === "ops"  ? (a.actualDate ? fmtDate(a.actualDate) : "") : "",
+               s.kind === "sched" ? [a.completionDate ? fmtDate(a.completionDate) : "", a.hospital].filter(Boolean).join(" \u00B7 ") : "",
                s.kind === "order" ? a.shippingDest : "",
                a.completedBy].filter(Boolean).join(" \u00B7 ");
   }else if(a.status === "Completed" && missing.length){
@@ -12869,7 +12947,9 @@ function anatStageHtml(p, s, ctReady){
   const badgeCls = settled ? "p-green"
                  : a.status === "Completed" ? "p-red"
                  : a.status === "In progress" ? "p-orange" : "p-grey";
-  const badgeTxt = (a.status === "Completed" && !settled) ? "Incomplete" : a.status;
+  let badgeTxt = (a.status === "Completed" && !settled) ? "Incomplete" : a.status;
+  /* PM Insertion with no pacemaker reads as N/A rather than the internal "Not required". */
+  if(a.status === "Not required" && s.needsPm) badgeTxt = "N/A";
 
   const head = '<div class="card-hd acc-hd' + (open ? " is-clickable" : "") + '"' +
     (open ? ' data-acc="' + s.k + '" role="button" tabindex="0" aria-expanded="' + isOpen + '"' : "") + '>' +
@@ -12912,8 +12992,14 @@ function anatStageHtml(p, s, ctReady){
     .filter(u => s.kind !== "eval" || ["CPM","ADMIN"].includes(u.role))
     .map(u => u.name));
 
+  /* "Not required" is only meaningful for PM Insertion (no pacemaker) and for the
+     Product Order (a patient may need no product order). Every other stage must be
+     worked through, so it is not offered there. */
+  const statusOptions = (s.k === "pmins" || s.k === "order")
+    ? ANAT_STATUS : ANAT_STATUS.filter(x => x !== "Not required");
+
   let inner = '<div class="grid g3">' +
-    f("status","Status","select",{ options:ANAT_STATUS }) +
+    f("status","Status","select",{ options:statusOptions }) +
     f("assignedTo","Assigned to","select",{ options:users });
 
   if(s.kind === "eval"){
@@ -12932,22 +13018,22 @@ function anatStageHtml(p, s, ctReady){
         f("pmCrossingAngle","PM crossing angle","text") + '</div>';
     }
     if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
-    inner += '<div class="grid g2">' + f("completionDate","Completion date","date") +
+    inner += '<div class="grid g2">' + f("completionDate","Completion date","datetime-local") +
       '<div class="field"><label>Completed by</label><input value="' + esc(a.completedBy || "") +
       '" disabled></div></div>';
   }
   else if(s.kind === "ops"){
     inner += '</div><div class="grid g2">' +
-      f("estDate","Estimated completion date","date") +
-      f("actualDate","Actual completion date","date") + '</div>';
+      f("estDate","Estimated completion date","datetime-local") +
+      f("actualDate","Actual completion date","datetime-local") + '</div>';
     if(s.needsPm && a.status === "Not required"){
       inner += '<div class="info">No pacemaker recorded in the 3D model evaluation, so this ' +
-               'stage is automatically <b>Not Required (No PM)</b>.</div>';
+               'stage is deemed <b>N/A (No PM)</b> automatically.</div>';
     }
   }
   else if(s.kind === "sched"){
     inner += '</div><div class="grid g3">' +
-      f("completionDate","Procedure date","date") +
+      f("completionDate","Procedure date","datetime-local") +
       f("hospital","Hospital","text") +
       f("physician","Physician","text") + '</div>' +
       f("schedNotes","Notes","textarea") +
@@ -13362,15 +13448,12 @@ VIEWS.clinical = {
       let structural = false;
       if(t.dataset.cf){
         cf(p)[t.dataset.cf] = t.type === "checkbox" ? t.checked : t.value;
-        if(t.dataset.cf === "procDate"){
-          p.procedureDate = t.value;
-          if(t.value && p.status === "ELIGIBLE"){
-            p.status = "SCHEDULED";
-            logAction("Patient " + p.patientCode + " scheduled", { locationId:p.siteId,
-              stateChanges:"Eligible for Treatment → Scheduled" });
-            structural = true;
-          }
-        }
+        /* The case file keeps its own procedure date (c.procDate) but must NOT set the
+           workflow status or p.procedureDate. The anatomical Scheduling stage is the single
+           source of both (see recomputeWorkflow and the "one place" note on its handler).
+           Setting them here as well let a date typed with no hospital or physician force
+           SCHEDULED, which the next recomputeWorkflow reverted to ELIGIBLE - so the status
+           oscillated depending on which screen was touched last. */
         if(t.dataset.cf === "asExpected" || t.dataset.cf === "notExpectedBranch") structural = true;
       }else if(t.dataset.cfa){
         const k = t.dataset.cfa, i = +t.dataset.i;
