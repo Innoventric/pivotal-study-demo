@@ -1,0 +1,19 @@
+# =============================================================================
+# V1_DEMO is a GENERATED artefact and a PUBLIC repository.
+#
+# Do not edit index.html here - it is overwritten. Edit ..\V1\pivotal-app.html
+# and run:   cd ..\V1  &&  node scripts/build-demo.js
+#
+# Nothing but the built demo belongs in this folder. The rules below exist so
+# that a stray copy of a credential file can never be committed by accident.
+# =============================================================================
+
+.env
+.env.*
+role-store.json
+secrets/
+node_modules/
+*.log
+
+.DS_Store
+Thumbs.db

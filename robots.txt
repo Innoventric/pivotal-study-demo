@@ -1,0 +1,4 @@
+# GitHub Pages serves this from the site root.
+# The demo is meant for people you send the link to, not for search results.
+User-agent: *
+Disallow: /
