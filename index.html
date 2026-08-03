@@ -261,6 +261,15 @@ nav{flex:1; overflow-y:auto; padding:10px 8px;}
 .btn-now:hover{filter:brightness(1.08);}
 .btn-now:active{transform:translateY(1px);}
 
+/* ---- accordion stage header ----
+   The whole header is the hit target, not a small chevron, because this gets used on
+   a tablet. The caret is a hint about state, not the control. */
+.acc-hd.is-clickable{cursor:pointer; user-select:none;}
+.acc-hd.is-clickable:hover{background:var(--grey-bg);}
+.acc-hd.is-clickable:focus-visible{outline:2px solid var(--brand); outline-offset:-2px;}
+.acc-sum{font-weight:400; font-size:12.5px; color:var(--muted); margin-left:8px;}
+.acc-caret{font-size:17px; color:var(--muted); width:18px; text-align:center; flex:none;}
+
 /* An unconfirmed carton line is tinted, so "which row still needs me" is answerable
    at a glance instead of by reading every checkbox. */
 tr.row-unconfirmed > td{background:var(--warn-bg);}
@@ -10941,16 +10950,44 @@ function blankAnat(){
 }
 function anatDone(st){ return st === "Completed" || st === "Not required"; }
 
+/* What a stage must actually contain before it may be called Completed.
+   Without this, "Completed" is just a dropdown value: a stage could be marked done
+   with every field blank and the next one would unlock, which defeats the only thing
+   the gating exists to guarantee. */
+function stageRequired(s){
+  if(s.kind === "eval")  return [["suitability","Anatomical suitability"],
+                                 ["size","Recommended implant size"],
+                                 ["completionDate","Completion date"]];
+  if(s.kind === "ops")   return [["actualDate","Actual completion date"]];
+  if(s.kind === "sched") return [["completionDate","Procedure date"],
+                                 ["hospital","Hospital"],["physician","Physician"]];
+  if(s.kind === "order") return [["shippingDest","Shipping destination"],
+                                 ["requestedDate","Requested delivery date"]];
+  return [];
+}
+function stageMissing(p, s){
+  const a = p.anat[s.k];
+  return stageRequired(s).filter(([f]) => !String(a[f] || "").trim()).map(([,label]) => label);
+}
+/* A stage counts as settled only if it is Not required, or Completed AND populated.
+   Gating asks this rather than the raw status, so data that arrived from an import or
+   an older build cannot slip an empty stage past the sequence. */
+function stageComplete(p, s){
+  const st = p.anat[s.k].status;
+  if(st === "Not required") return true;
+  return st === "Completed" && stageMissing(p, s).length === 0;
+}
+
 /* A stage may only be worked on once every earlier stage is finished, unless an
    App Admin has recorded an override. */
 function anatUnlocked(p, key){
   const i = ANAT_STAGES.findIndex(s => s.k === key);
   if(i <= 0) return true;
   if(p.anatOverride) return true;
-  return ANAT_STAGES.slice(0, i).every(s => anatDone(p.anat[s.k].status));
+  return ANAT_STAGES.slice(0, i).every(s => stageComplete(p, s));
 }
 function anatIncomplete(p){
-  return ANAT_STAGES.filter(s => ANAT_MANDATORY.includes(s.k) && !anatDone(p.anat[s.k].status))
+  return ANAT_STAGES.filter(s => ANAT_MANDATORY.includes(s.k) && !stageComplete(p, s))
                     .map(s => s.n + ". " + s.label);
 }
 /* Each evaluation stage may revise the one before it, so the operative recommendation
@@ -10959,7 +10996,7 @@ function currentRecommendation(p){
   let out = { size:"", altSize:"", angle:"", from:"" };
   ANAT_STAGES.filter(s => s.kind === "eval").forEach(s => {
     const a = p.anat[s.k];
-    if(a.status === "Completed" && (a.size || a.angle)){
+    if(stageComplete(p, s) && (a.size || a.angle)){
       out = { size:a.size || out.size, altSize:a.altSize || "", angle:a.angle || out.angle,
               from:s.n + ". " + s.label };
     }
@@ -10975,8 +11012,9 @@ function recomputeWorkflow(p){
   if(["IN_TRANSIT","DELIVERED"].includes(p.status)) return p.status;
 
   const order = p.anat.order, sched = p.anat.scheduling;
+  const stageOf = k => ANAT_STAGES.find(x => x.k === k);
   if(anatDone(order.status) || order.status === "In progress") return "ORDER_REQUESTED";
-  if(anatDone(sched.status) && p.procedureDate) return "SCHEDULED";
+  if(stageComplete(p, stageOf("scheduling")) && p.procedureDate) return "SCHEDULED";
   if(anatIncomplete(p).length === 0) return "ELIGIBLE";
   if(ANAT_STAGES.some(s => p.anat[s.k].status !== "Not started")) return "ANATOMICAL";
   if(SCREENING_STEPS.some(s => p.screening[s.k].done)) return "SCREENING";
@@ -12556,7 +12594,18 @@ function sourceImages(p, key, label){
    locked until the previous one is finished, with a recorded override as the only
    way past. The output of this module - an eligible patient with a procedure date -
    is what starts the clinical workflow. */
-let SCR = { patientId:"", stage:"" };
+let SCR = { patientId:"", stage:"", open:"" };
+
+/* Re-render without throwing the user back to the top. A status change can unlock a
+   later stage, so the whole view has to be rebuilt - but on a long form, losing your
+   scroll position and your focus on every edit is worse than the stale markup. */
+function renderKeepingPlace(){
+  const y = window.scrollY;
+  const id = document.activeElement && document.activeElement.id;
+  render();
+  window.scrollTo(0, y);
+  if(id){ const el = document.getElementById(id); if(el && el.focus) el.focus({ preventScroll:true }); }
+}
 
 VIEWS.screening = {
   title:"Patient Screening & Evaluation",
@@ -12570,6 +12619,12 @@ VIEWS.screening = {
 
     const rec = currentRecommendation(p);
     const missing = anatIncomplete(p);
+    /* Open the first stage that is unlocked and not yet settled - the one place the
+       user can do something. Nothing to do anywhere means everything stays collapsed. */
+    if(!SCR.open || !p.anat[SCR.open] || !anatUnlocked(p, SCR.open)){
+      const next = ANAT_STAGES.find(st => anatUnlocked(p, st.k) && !stageComplete(p, st));
+      SCR.open = next ? next.k : "";
+    }
 
     let h = '<div class="card"><div class="card-bd"><div class="grid g2">' +
       '<div class="field"><label for="scr-pt">Patient</label><select id="scr-pt">' +
@@ -12622,6 +12677,7 @@ VIEWS.screening = {
 
     /* ---- Anatomical evaluation ---- */
     h += '<div class="card"><div class="card-hd"><h2>Anatomical Evaluation Workflow</h2>' +
+      '<span class="saved" id="sv-scr"></span>' +
       '<span class="hint">' + (ANAT_STAGES.length - missing.length) + '/' + ANAT_STAGES.length +
       ' stages settled</span></div><div class="card-bd">';
 
@@ -12642,6 +12698,7 @@ VIEWS.screening = {
         '</div>';
     }
 
+    h += whyBox("scr-why");
     h += ANAT_STAGES.map(s => anatStageHtml(p, s, ctReady)).join("");
     h += '</div></div>';
     return h;
@@ -12651,7 +12708,26 @@ VIEWS.screening = {
     const p = S.db.patients.find(x => x.id === SCR.patientId);
     if(!p) return;
     const sel = $("#scr-pt");
-    if(sel) sel.onchange = e => { SCR.patientId = e.target.value; render(); };
+    if(sel) sel.onchange = e => { SCR.patientId = e.target.value; SCR.open = ""; render(); };
+
+    /* Same "Saved" affordance as the case file next door, so the two screens behave
+       the same way. Without it every edit here was silent. */
+    function flashSaved(){
+      const el = $("#sv-scr");
+      if(!el) return;
+      el.textContent = "Saved";
+      clearTimeout(flashSaved._t);
+      flashSaved._t = setTimeout(() => { const e2 = $("#sv-scr"); if(e2) e2.textContent = ""; }, 1200);
+    }
+
+    /* Accordion: one stage open at a time. */
+    const toggle = key => { SCR.open = (SCR.open === key) ? "" : key; renderKeepingPlace(); };
+    $$("[data-acc]").forEach(hd => {
+      hd.onclick = () => toggle(hd.dataset.acc);
+      hd.onkeydown = e => {
+        if(e.key === "Enter" || e.key === " "){ e.preventDefault(); toggle(hd.dataset.acc); }
+      };
+    });
 
     /* Screening material received / not received. */
     $$("[data-scr]").forEach(cb => cb.onchange = () => {
@@ -12666,7 +12742,7 @@ VIEWS.screening = {
         stateChanges: cb.dataset.scr + " = " + (cb.checked ? "received" : "not received") +
           (before === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
         comments:"Patient " + p.patientCode });
-      commit(); render();
+      commit(); renderKeepingPlace(); flashSaved();
     });
 
     /* Every stage field writes straight through, then the status is re-derived. */
@@ -12676,6 +12752,25 @@ VIEWS.screening = {
         if(!anatUnlocked(p, key)) return;
         const a = p.anat[key];
         const before = { st:a.status, status:p.status };
+        const stage = ANAT_STAGES.find(x => x.k === key);
+
+        /* Refuse "Completed" while required content is missing. Reverting the select
+           rather than accepting it keeps the badge, the gate and the dropdown telling
+           the same story - a stage can never look done and not be. */
+        if(field === "status" && el.value === "Completed"){
+          const probe = Object.assign({}, a, { status:"Completed" });
+          const saved = p.anat[key];
+          p.anat[key] = probe;
+          const gaps = stageMissing(p, stage);
+          p.anat[key] = saved;
+          if(gaps.length){
+            el.value = a.status;
+            showWhy("scr-why", "Stage " + stage.n + " needs " + gaps.join(", ") +
+              " before it can be marked completed.");
+            return;
+          }
+        }
+        clearWhy("scr-why");
         a[field] = el.type === "checkbox" ? el.checked : el.value;
 
         /* Completing a stage stamps who and when, once. */
@@ -12697,7 +12792,13 @@ VIEWS.screening = {
             (before.status === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
           comments:"Patient " + p.patientCode });
         commit();
-        if(field === "status" || field === "pmPresent" || field === "completionDate") render();
+        flashSaved();
+        /* These three can unlock a later stage or change a summary line, so the view
+           is rebuilt - but in place. */
+        if(["status","pmPresent","completionDate","suitability","size","actualDate",
+            "hospital","physician","shippingDest","requestedDate"].includes(field)){
+          renderKeepingPlace();
+        }
       };
       el.addEventListener("change", h);
     });
@@ -12726,7 +12827,7 @@ VIEWS.screening = {
             comments:"Patient " + p.patientCode + " — " + why + " | incomplete: " + incomplete.join("; ") });
           notify("Anatomical evaluation override for " + p.patientCode + " by " + S.me.name +
                  " — " + why, ["ADMIN","CPM"], [], p.siteId);
-          commit(); closeModal(); render();
+          commit(); closeModal(); renderKeepingPlace();
       };
     };
 
@@ -12736,17 +12837,56 @@ VIEWS.screening = {
       p.status = recomputeWorkflow(p);
       logAction("Patient resumed after cancellation", { locationId:p.siteId,
         stateChanges:"→ " + PT_STATUS[p.status].label, comments:"Patient " + p.patientCode });
-      commit(); render();
+      commit(); renderKeepingPlace();
     };
   }
 };
 
-/* One stage, rendered from its declaration. */
+/* One stage, rendered from its declaration.
+   Collapsed by default: ten stages fully expanded is roughly seventy controls, and
+   nine of them are usually locked and irrelevant. The header alone tells you where
+   the stage stands; the body opens when you are actually working on it. */
 function anatStageHtml(p, s, ctReady){
   const a = p.anat[s.k];
   const open = ctReady && anatUnlocked(p, s.k);
-  const locked = !open;
-  const dis = (locked || !can("managePatients")) ? " disabled" : "";
+  const settled = stageComplete(p, s);
+  const missing = stageMissing(p, s);
+  const isOpen = SCR.open === s.k && open;
+
+  /* Header summary, so a collapsed stage still answers "what was decided here". */
+  let summary = "";
+  if(a.status === "Not required") summary = "Not required";
+  else if(settled){
+    summary = [s.kind === "eval" ? [a.size, a.angle ? a.angle + "\u00B0" : ""].filter(Boolean).join(", ") : "",
+               s.kind === "ops"  ? a.actualDate : "",
+               s.kind === "sched" ? [a.completionDate, a.hospital].filter(Boolean).join(" \u00B7 ") : "",
+               s.kind === "order" ? a.shippingDest : "",
+               a.completedBy].filter(Boolean).join(" \u00B7 ");
+  }else if(a.status === "Completed" && missing.length){
+    summary = missing.length + " required field(s) still empty";
+  }
+
+  const badgeCls = settled ? "p-green"
+                 : a.status === "Completed" ? "p-red"
+                 : a.status === "In progress" ? "p-orange" : "p-grey";
+  const badgeTxt = (a.status === "Completed" && !settled) ? "Incomplete" : a.status;
+
+  const head = '<div class="card-hd acc-hd' + (open ? " is-clickable" : "") + '"' +
+    (open ? ' data-acc="' + s.k + '" role="button" tabindex="0" aria-expanded="' + isOpen + '"' : "") + '>' +
+    '<h2><span class="stage-n">' + s.n + '</span>' + esc(s.label) +
+      (summary ? ' <span class="acc-sum">' + esc(summary) + '</span>' : "") + '</h2>' +
+    '<span class="badge ' + badgeCls + '">' + esc(badgeTxt) + '</span>' +
+    (open ? '<span class="acc-caret">' + (isOpen ? "\u2212" : "+") + '</span>' : "") +
+    '</div>';
+
+  if(!open){
+    return '<div class="card stage is-locked">' + head +
+      '<div class="card-bd"><div class="locked-ov">Locked until stage ' + s.n +
+      ' can be started \u2014 finish the stage before it, or record an override.</div></div></div>';
+  }
+  if(!isOpen) return '<div class="card stage">' + head + '</div>';
+
+  const dis = can("managePatients") ? "" : " disabled";
   const f = (field, label, type, opts) => {
     opts = opts || {};
     const id = "an-" + s.k + "-" + field;
@@ -12754,17 +12894,23 @@ function anatStageHtml(p, s, ctReady){
     let ctl;
     if(type === "select"){
       ctl = '<select id="' + id + '" data-anat="' + s.k + '|' + field + '"' + dis + '>' +
-        opts.options.map(o => '<option' + (String(v) === String(o) ? " selected" : "") + '>' +
-          esc(o) + '</option>').join("") + '</select>';
+        opts.options.map(x => '<option' + (String(v) === String(x) ? " selected" : "") + '>' +
+          esc(x) + '</option>').join("") + '</select>';
     }else if(type === "textarea"){
       ctl = '<textarea id="' + id + '" data-anat="' + s.k + '|' + field + '"' + dis + '>' + esc(v) + '</textarea>';
     }else{
       ctl = '<input type="' + type + '" id="' + id + '" data-anat="' + s.k + '|' + field +
             '" value="' + esc(v) + '"' + dis + '>';
     }
-    return '<div class="field"><label for="' + id + '">' + esc(label) + '</label>' + ctl + '</div>';
+    const req = stageRequired(s).some(([k]) => k === field);
+    return '<div class="field"><label class="' + (req ? "req" : "") + '" for="' + id + '">' +
+      esc(label) + '</label>' + ctl + '</div>';
   };
-  const users = [""].concat(S.db.users.map(u => u.name));
+  /* Clinical judgement is a CPM call, so evaluation stages only offer those names.
+     Operational stages can be assigned to anyone. */
+  const users = [""].concat(S.db.users
+    .filter(u => s.kind !== "eval" || ["CPM","ADMIN"].includes(u.role))
+    .map(u => u.name));
 
   let inner = '<div class="grid g3">' +
     f("status","Status","select",{ options:ANAT_STATUS }) +
@@ -12783,8 +12929,7 @@ function anatStageHtml(p, s, ctReady){
       inner += '<div class="grid g3">' +
         f("pmPresent","PM present","select",{ options:["","Yes","No"] }) +
         f("pmLeads","Number of PM leads","number") +
-        f("pmCrossingAngle","PM crossing angle","text") +
-        '</div>';
+        f("pmCrossingAngle","PM crossing angle","text") + '</div>';
     }
     if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
     inner += '<div class="grid g2">' + f("completionDate","Completion date","date") +
@@ -12796,7 +12941,6 @@ function anatStageHtml(p, s, ctReady){
       f("estDate","Estimated completion date","date") +
       f("actualDate","Actual completion date","date") + '</div>';
     if(s.needsPm && a.status === "Not required"){
-      inner = inner.replace('</div>', '</div>') ;
       inner += '<div class="info">No pacemaker recorded in the 3D model evaluation, so this ' +
                'stage is automatically <b>Not Required (No PM)</b>.</div>';
     }
@@ -12817,11 +12961,9 @@ function anatStageHtml(p, s, ctReady){
   else if(s.kind === "order"){
     const rec = currentRecommendation(p);
     inner += '</div><div class="grid g3">' +
-      '<div class="field"><label>Implant size</label><input value="' + esc(rec.size || "") +
-        '" disabled></div>' +
+      '<div class="field"><label>Implant size</label><input value="' + esc(rec.size || "") + '" disabled></div>' +
       '<div class="field"><label>Delivery system size</label><input value="' +
-        esc(rec.size ? (window.DeviceQr ? window.DeviceQr.requiredDsSize(rec.size) : "") : "") +
-        '" disabled></div>' +
+        esc(rec.size && window.DeviceQr ? window.DeviceQr.requiredDsSize(rec.size) : "") + '" disabled></div>' +
       f("requestedDate","Requested delivery date","date") + '</div>' +
       '<div class="hint">Both sizes are read-only: the implant size comes from the completed ' +
       'evaluation, and the delivery system follows from it (S/M need Short, L/XL need Long).</div>' +
@@ -12833,13 +12975,15 @@ function anatStageHtml(p, s, ctReady){
   }
   else inner += '</div>';
 
-  return '<div class="card stage' + (locked ? " is-locked" : "") + '">' +
-    '<div class="card-hd"><h2><span class="stage-n">' + s.n + '</span>' + esc(s.label) + '</h2>' +
-    '<span class="badge ' + (anatDone(a.status) ? "p-green" : a.status === "In progress" ? "p-orange" : "p-grey") +
-    '">' + esc(a.status) + '</span></div><div class="card-bd">' +
-    (locked ? '<div class="locked-ov">Locked until stage ' + s.n +
-      ' can be started — finish the stage before it, or record an override.</div>' : "") +
-    inner + '</div></div>';
+  /* Says what is stopping this stage from counting, before the user tries. */
+  if(missing.length && a.status !== "Not required"){
+    inner += '<div class="' + (a.status === "Completed" ? "warn" : "hint") + '" style="margin-top:4px">' +
+      (a.status === "Completed"
+        ? '<b>This stage cannot count as completed yet.</b> Still empty: '
+        : 'To complete this stage you will need: ') + esc(missing.join(", ")) + '.</div>';
+  }
+
+  return '<div class="card stage">' + head + '<div class="card-bd">' + inner + '</div></div>';
 }
 
 VIEWS.clinical = {
