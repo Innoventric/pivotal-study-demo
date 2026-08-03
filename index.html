@@ -261,6 +261,18 @@ nav{flex:1; overflow-y:auto; padding:10px 8px;}
 .btn-now:hover{filter:brightness(1.08);}
 .btn-now:active{transform:translateY(1px);}
 
+/* An unconfirmed carton line is tinted, so "which row still needs me" is answerable
+   at a glance instead of by reading every checkbox. */
+tr.row-unconfirmed > td{background:var(--warn-bg);}
+
+/* ---- locked anatomical stage ----
+   Dimmed rather than hidden: a field user needs to see that stage 6 exists and what
+   it will ask for, otherwise the workflow feels arbitrary. Inputs are disabled, so
+   the visual state and the actual state cannot disagree. */
+.stage.is-locked{opacity:.62;}
+.stage.is-locked .card-hd{background:var(--grey-bg);}
+.lbl-sm{font-size:11.5px; color:var(--muted); font-weight:600;}
+
 /* ---- pressure triple ---- */
 .pressure .readout{margin-top:5px; padding:5px 9px; border-radius:6px;
                    background:var(--grey-bg); border:1px solid var(--line);
@@ -10855,12 +10867,121 @@ const DEV_STATUS = {
   USED:      { label:"Used",                  cls:"p-grey",  stock:false },
   REJECTED:  { label:"Rejected",              cls:"p-red",   stock:false }
 };
+/* The patient workflow. CREATED..TREATED is a forward sequence and is DERIVED from
+   the screening record, not typed in - see recomputeWorkflow().
+
+   CANCELLED is deliberately kept in this map so existing screens keep rendering, but
+   it is not a position in the sequence: a patient can stop at any point, and the
+   stage they stopped at is the thing you are asked about afterwards. That is held
+   separately on p.cancelled, so "Cancelled during Anatomical Evaluation" survives.
+   TREATED keeps its key - it is referenced by the case-file lock - and only its
+   label becomes "Procedure Completed". */
 const PT_STATUS = {
-  ELIGIBLE:  { label:"Eligible for Treatment", cls:"p-grey"   },
-  SCHEDULED: { label:"Scheduled",              cls:"p-orange" },
-  TREATED:   { label:"Treated",                cls:"p-green"  },
-  CANCELLED: { label:"Cancelled",              cls:"p-red"    }
+  CREATED:         { label:"Patient Created",                    cls:"p-grey"   },
+  SCREENING:       { label:"Clinical Screening In Progress",     cls:"p-blue"   },
+  ANATOMICAL:      { label:"Anatomical Evaluation In Progress",  cls:"p-blue"   },
+  ELIGIBLE:        { label:"Eligible for Treatment",             cls:"p-grey"   },
+  SCHEDULED:       { label:"Procedure Scheduled",                cls:"p-orange" },
+  ORDER_REQUESTED: { label:"Product Order Requested",            cls:"p-orange" },
+  IN_TRANSIT:      { label:"Products In Transit",                cls:"p-blue"   },
+  DELIVERED:       { label:"Products Delivered",                 cls:"p-blue"   },
+  TREATED:         { label:"Procedure Completed",                cls:"p-green"  },
+  CANCELLED:       { label:"Cancelled",                          cls:"p-red"    }
 };
+const PT_FLOW = ["CREATED","SCREENING","ANATOMICAL","ELIGIBLE","SCHEDULED",
+                 "ORDER_REQUESTED","IN_TRANSIT","DELIVERED","TREATED"];
+
+/* ---- Clinical screening: six items of material to collect ---- */
+const SCREENING_STEPS = [
+  { k:"basic",     label:"Basic Clinical Data" },
+  { k:"discharge", label:"Discharge Letters" },
+  { k:"history",   label:"Medical History" },
+  { k:"echo",      label:"Echocardiography" },
+  { k:"rhc",       label:"Right Heart Catheterization (RHC)" },
+  { k:"ct",        label:"CT Scan", gate:"Marking this available opens the anatomical evaluation." }
+];
+
+/* ---- Anatomical evaluation: ten stages, strictly sequential ----
+   kind drives which fields render, so the ten stages are one generated form rather
+   than ten hand-written ones that drift apart. */
+const ANAT_STATUS  = ["Not started","In progress","Completed","Not required"];
+const SUITABILITY  = ["","Suitable","Borderline","Not suitable"];
+const ANAT_STAGES = [
+  { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval" },
+  { k:"model3d",   n:2,  label:"3D Model Evaluation",                kind:"eval", pm:true, sim:true },
+  { k:"printing",  n:3,  label:"Model Printing",                     kind:"ops"  },
+  { k:"casting",   n:4,  label:"Model Casting",                      kind:"ops"  },
+  { k:"pmins",     n:5,  label:"PM Insertion",                       kind:"ops",  needsPm:true },
+  { k:"flexible",  n:6,  label:"Flexible Model Evaluation",          kind:"eval" },
+  { k:"fluoro",    n:7,  label:"Fluoroscopy Implantation Simulation", kind:"eval", final:true },
+  { k:"roadmap",   n:8,  label:"Road Map",                           kind:"eval", final:true, strategy:true },
+  { k:"scheduling",n:9,  label:"Procedure Scheduling",               kind:"sched" },
+  { k:"order",     n:10, label:"Product Order Request",              kind:"order" }
+];
+/* Stages 1-8 must be finished (or Not required) before a procedure may be scheduled. */
+const ANAT_MANDATORY = ANAT_STAGES.filter(s => s.n <= 8).map(s => s.k);
+
+function blankScreening(){
+  const o = {};
+  SCREENING_STEPS.forEach(s => { o[s.k] = { done:false, by:"", at:"" }; });
+  return o;
+}
+function blankAnat(){
+  const o = {};
+  ANAT_STAGES.forEach(s => {
+    o[s.k] = { status:"Not started", suitability:"", size:"", altSize:"", angle:"",
+               assignedTo:"", completedBy:"", completionDate:"",
+               estDate:"", actualDate:"",
+               simAngle:"", pmPresent:"", pmLeads:"", pmCrossingAngle:"",
+               strategy:"", hospital:"", physician:"", schedNotes:"",
+               accessories:"", shippingDest:"", requestedDate:"",
+               requestedBy:"", approvedBy:"" };
+  });
+  return o;
+}
+function anatDone(st){ return st === "Completed" || st === "Not required"; }
+
+/* A stage may only be worked on once every earlier stage is finished, unless an
+   App Admin has recorded an override. */
+function anatUnlocked(p, key){
+  const i = ANAT_STAGES.findIndex(s => s.k === key);
+  if(i <= 0) return true;
+  if(p.anatOverride) return true;
+  return ANAT_STAGES.slice(0, i).every(s => anatDone(p.anat[s.k].status));
+}
+function anatIncomplete(p){
+  return ANAT_STAGES.filter(s => ANAT_MANDATORY.includes(s.k) && !anatDone(p.anat[s.k].status))
+                    .map(s => s.n + ". " + s.label);
+}
+/* Each evaluation stage may revise the one before it, so the operative recommendation
+   is whatever the LAST completed evaluation said - not the first. */
+function currentRecommendation(p){
+  let out = { size:"", altSize:"", angle:"", from:"" };
+  ANAT_STAGES.filter(s => s.kind === "eval").forEach(s => {
+    const a = p.anat[s.k];
+    if(a.status === "Completed" && (a.size || a.angle)){
+      out = { size:a.size || out.size, altSize:a.altSize || "", angle:a.angle || out.angle,
+              from:s.n + ". " + s.label };
+    }
+  });
+  return out;
+}
+/* Derive the workflow status. Never called for a cancelled or completed patient:
+   those are terminal and set explicitly elsewhere. */
+function recomputeWorkflow(p){
+  if(!p.screening || !p.anat) return p.status;
+  if(p.cancelled && p.cancelled.is) return "CANCELLED";
+  if(p.status === "TREATED") return "TREATED";
+  if(["IN_TRANSIT","DELIVERED"].includes(p.status)) return p.status;
+
+  const order = p.anat.order, sched = p.anat.scheduling;
+  if(anatDone(order.status) || order.status === "In progress") return "ORDER_REQUESTED";
+  if(anatDone(sched.status) && p.procedureDate) return "SCHEDULED";
+  if(anatIncomplete(p).length === 0) return "ELIGIBLE";
+  if(ANAT_STAGES.some(s => p.anat[s.k].status !== "Not started")) return "ANATOMICAL";
+  if(SCREENING_STEPS.some(s => p.screening[s.k].done)) return "SCREENING";
+  return "CREATED";
+}
 
 const UNICA_SIZES = ["S","M","L","XL"];
 const DS_SIZES = ["Short","Long"];
@@ -10987,7 +11108,9 @@ function seed(){
   ];
   const mkPatient = o => Object.assign({
     reminders:[], piNotes:"", customQuestions:[], caseFile:{}, images:[],
-    submitted:false, fileLocked:false, notes:""
+    submitted:false, fileLocked:false, notes:"",
+    screening:blankScreening(), anat:blankAnat(), anatOverride:null,
+    cancelled:{ is:false, reason:"", by:"", at:"", stage:"" }
   }, o);
   const P = [
     mkPatient({ id:"pat-1", patientCode:"NGM-014", siteId:"loc-site-a", procedureDate:daysFromNow(6),
@@ -11765,6 +11888,7 @@ const NAV = [
   { k:"stock",    ic:"stock",   label:"Stock by Location",  roles:["ADMIN","CPM","EMPLOYEE"] },
   { k:"stock",    ic:"stock",   label:"My Warehouse Stock", roles:["WH_ADMIN"] },
   { grp:"Procedures" },
+  { k:"screening",ic:"case",    label:"Patient Screening",  roles:["ADMIN","CPM","EMPLOYEE"] },
   { k:"clinical", ic:"case",    label:"Procedure Case File",roles:["ADMIN","CPM","EMPLOYEE"] },
   { k:"patients", ic:"people",  label:"Patient Register",   roles:["ADMIN","CPM"] },
   { grp:"Records" },
@@ -12427,6 +12551,297 @@ function sourceImages(p, key, label){
   '</div>';
 }
 
+/* ================================ PATIENT SCREENING & ANATOMICAL EVALUATION ===
+   Everything from taking a patient on to requesting the product. Ten stages, each
+   locked until the previous one is finished, with a recorded override as the only
+   way past. The output of this module - an eligible patient with a procedure date -
+   is what starts the clinical workflow. */
+let SCR = { patientId:"", stage:"" };
+
+VIEWS.screening = {
+  title:"Patient Screening & Evaluation",
+  sub:"Clinical screening, anatomical evaluation, scheduling and the product order request.",
+  body(){
+    const list = S.db.patients.filter(p => !scopedLocIds() || scopedLocIds().includes(p.siteId));
+    if(!list.length) return '<div class="empty">No patients yet. A CPM or App Admin can add one in the Patient Register.</div>';
+    if(!SCR.patientId || !list.some(p => p.id === SCR.patientId)) SCR.patientId = list[0].id;
+    const p = S.db.patients.find(x => x.id === SCR.patientId);
+    if(!p.screening) { p.screening = blankScreening(); p.anat = blankAnat(); }
+
+    const rec = currentRecommendation(p);
+    const missing = anatIncomplete(p);
+
+    let h = '<div class="card"><div class="card-bd"><div class="grid g2">' +
+      '<div class="field"><label for="scr-pt">Patient</label><select id="scr-pt">' +
+        list.map(x => '<option value="' + x.id + '"' + (x.id === SCR.patientId ? " selected" : "") + '>' +
+          esc(x.patientCode) + ' · ' + esc(locName(x.siteId)) + '</option>').join("") +
+      '</select></div>' +
+      '<div><label class="lbl-sm">Workflow status</label><div style="margin-top:5px">' +
+        pill(PT_STATUS, p.status) +
+        (p.cancelled && p.cancelled.is
+          ? ' <span class="hint">stopped during ' + esc(p.cancelled.stage || "screening") + '</span>' : "") +
+      '</div></div></div>';
+
+    /* The live recommendation, so nobody has to scroll ten stages to find the size
+       that is actually operative right now. */
+    h += '<div class="grid g3" style="margin-top:4px">' +
+      '<div class="calc"><small>Recommended implant size</small><b>' + esc(rec.size || "–") + '</b></div>' +
+      '<div class="calc"><small>Implantation angle</small><b>' + esc(rec.angle || "–") + '</b></div>' +
+      '<div class="calc"><small>Derived from</small><b style="font-size:13px">' +
+        esc(rec.from || "no completed evaluation yet") + '</b></div>' +
+      '</div>';
+    if(rec.altSize) h += '<div class="hint">Alternative size on record: ' + esc(rec.altSize) + '</div>';
+    h += '</div></div>';
+
+    if(p.cancelled && p.cancelled.is){
+      h += '<div class="warn"><b>This patient was cancelled.</b> ' + esc(p.cancelled.reason) +
+        ' — ' + esc(p.cancelled.by) + ', ' + esc(fmtDate(p.cancelled.at)) +
+        '. The stage they had reached is preserved, so the workflow can resume from there.' +
+        (can("managePatients") ? ' <button class="btn" id="scr-uncancel">Resume this patient</button>' : "") +
+        '</div>';
+    }
+
+    /* ---- Clinical screening ---- */
+    const scrDone = SCREENING_STEPS.filter(s => p.screening[s.k].done).length;
+    h += '<div class="card"><div class="card-hd"><h2>Clinical Screening</h2>' +
+      '<span class="hint">' + scrDone + '/' + SCREENING_STEPS.length + ' received</span></div><div class="card-bd">' +
+      '<p class="hint">Only a CPM updates whether the clinical material has arrived. ' +
+      'Marking the CT available opens the anatomical evaluation below.</p>' +
+      SCREENING_STEPS.map(s => {
+        const st = p.screening[s.k];
+        return '<label class="check' + (st.done ? " on" : "") + '">' +
+          '<input type="checkbox" data-scr="' + s.k + '"' + (st.done ? " checked" : "") +
+          (can("managePatients") ? "" : " disabled") + '><span>' + esc(s.label) +
+          (st.done && st.by ? ' <span class="hint">— ' + esc(st.by) + ', ' + esc(fmtDate(st.at)) + '</span>' : "") +
+          (s.gate ? ' <span class="hint">' + esc(s.gate) + '</span>' : "") +
+          '</span></label>';
+      }).join("") +
+      '</div></div>';
+
+    const ctReady = p.screening.ct.done;
+
+    /* ---- Anatomical evaluation ---- */
+    h += '<div class="card"><div class="card-hd"><h2>Anatomical Evaluation Workflow</h2>' +
+      '<span class="hint">' + (ANAT_STAGES.length - missing.length) + '/' + ANAT_STAGES.length +
+      ' stages settled</span></div><div class="card-bd">';
+
+    if(!ctReady){
+      h += '<div class="info">The CT scan is not marked as available yet, so stage 1 is not open. ' +
+           'Tick <b>CT Scan</b> above to begin.</div>';
+    }
+
+    if(missing.length && can("managePatients")){
+      h += '<div class="' + (p.anatOverride ? "warn" : "info") + '">' +
+        (p.anatOverride
+          ? '<b>Override recorded.</b> ' + esc(p.anatOverride.reason) + ' — ' +
+            esc(p.anatOverride.by) + ', ' + esc(fmtDate(p.anatOverride.at)) +
+            '. Incomplete at the time: ' + esc(p.anatOverride.incomplete.join("; ")) + '.'
+          : '<b>' + missing.length + ' mandatory stage(s) still open.</b> A procedure cannot ' +
+            'be scheduled until they are finished, unless an App Admin records an override.' +
+            (S.me.role === "ADMIN" ? ' <button class="btn" id="scr-override">Record an override</button>' : "")) +
+        '</div>';
+    }
+
+    h += ANAT_STAGES.map(s => anatStageHtml(p, s, ctReady)).join("");
+    h += '</div></div>';
+    return h;
+  },
+
+  wire(){
+    const p = S.db.patients.find(x => x.id === SCR.patientId);
+    if(!p) return;
+    const sel = $("#scr-pt");
+    if(sel) sel.onchange = e => { SCR.patientId = e.target.value; render(); };
+
+    /* Screening material received / not received. */
+    $$("[data-scr]").forEach(cb => cb.onchange = () => {
+      if(!can("managePatients")) return;
+      const st = p.screening[cb.dataset.scr];
+      st.done = cb.checked;
+      st.by = cb.checked ? S.me.name : "";
+      st.at = cb.checked ? nowISO().slice(0,10) : "";
+      const before = p.status;
+      p.status = recomputeWorkflow(p);
+      logAction("Screening material updated", { locationId:p.siteId,
+        stateChanges: cb.dataset.scr + " = " + (cb.checked ? "received" : "not received") +
+          (before === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
+        comments:"Patient " + p.patientCode });
+      commit(); render();
+    });
+
+    /* Every stage field writes straight through, then the status is re-derived. */
+    $$("[data-anat]").forEach(el => {
+      const h = () => {
+        const [key, field] = el.dataset.anat.split("|");
+        if(!anatUnlocked(p, key)) return;
+        const a = p.anat[key];
+        const before = { st:a.status, status:p.status };
+        a[field] = el.type === "checkbox" ? el.checked : el.value;
+
+        /* Completing a stage stamps who and when, once. */
+        if(field === "status" && a.status === "Completed" && !a.completedBy){
+          a.completedBy = S.me.name;
+          if(!a.completionDate) a.completionDate = nowISO().slice(0,10);
+        }
+        /* No pacemaker means PM insertion is not something anyone has to do. */
+        if(key === "model3d" && field === "pmPresent"){
+          p.anat.pmins.status = (el.value === "No") ? "Not required" : "Not started";
+        }
+        /* Scheduling is the one place a procedure date is set; the clinical workflow
+           reads it from here rather than asking again. */
+        if(key === "scheduling" && field === "completionDate") p.procedureDate = el.value;
+
+        p.status = recomputeWorkflow(p);
+        logAction("Anatomical evaluation updated", { locationId:p.siteId,
+          stateChanges: key + "." + field + " = " + String(a[field]).slice(0,60) +
+            (before.status === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
+          comments:"Patient " + p.patientCode });
+        commit();
+        if(field === "status" || field === "pmPresent" || field === "completionDate") render();
+      };
+      el.addEventListener("change", h);
+    });
+
+    const ov = $("#scr-override");
+    if(ov) ov.onclick = () => {
+      const incomplete = anatIncomplete(p);
+      modal("Record an override",
+        '<p>Scheduling normally requires every mandatory stage to be finished. ' +
+        'These are still open:</p><ul class="hint">' +
+        incomplete.map(x => '<li>' + esc(x) + '</li>').join("") + '</ul>' +
+        '<div class="field"><label class="req" for="ov-why">Reason for override</label>' +
+        '<textarea id="ov-why" placeholder="Why is it clinically acceptable to proceed without these?"></textarea>' +
+        '<div class="hint">Recorded against your account with the date, the reason, and ' +
+        'exactly which stages were incomplete.</div></div>',
+        '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
+        '<span class="spacer"></span>' +
+        '<button class="btn btn-pri" id="ov-go">Record override</button></div>');
+      $("#ov-go").onclick = () => {
+          const why = ($("#ov-why").value || "").trim();
+          if(why.length < 10){ $("#ov-why").focus(); return; }
+          p.anatOverride = { by:S.me.name, at:nowISO().slice(0,10), reason:why, incomplete };
+          p.status = recomputeWorkflow(p);
+          logAction("Anatomical evaluation OVERRIDE", { locationId:p.siteId, highPriority:true,
+            stateChanges:"override granted; " + incomplete.length + " stage(s) incomplete",
+            comments:"Patient " + p.patientCode + " — " + why + " | incomplete: " + incomplete.join("; ") });
+          notify("Anatomical evaluation override for " + p.patientCode + " by " + S.me.name +
+                 " — " + why, ["ADMIN","CPM"], [], p.siteId);
+          commit(); closeModal(); render();
+      };
+    };
+
+    const un = $("#scr-uncancel");
+    if(un) un.onclick = () => {
+      p.cancelled = { is:false, reason:"", by:"", at:"", stage:"" };
+      p.status = recomputeWorkflow(p);
+      logAction("Patient resumed after cancellation", { locationId:p.siteId,
+        stateChanges:"→ " + PT_STATUS[p.status].label, comments:"Patient " + p.patientCode });
+      commit(); render();
+    };
+  }
+};
+
+/* One stage, rendered from its declaration. */
+function anatStageHtml(p, s, ctReady){
+  const a = p.anat[s.k];
+  const open = ctReady && anatUnlocked(p, s.k);
+  const locked = !open;
+  const dis = (locked || !can("managePatients")) ? " disabled" : "";
+  const f = (field, label, type, opts) => {
+    opts = opts || {};
+    const id = "an-" + s.k + "-" + field;
+    const v = a[field] == null ? "" : a[field];
+    let ctl;
+    if(type === "select"){
+      ctl = '<select id="' + id + '" data-anat="' + s.k + '|' + field + '"' + dis + '>' +
+        opts.options.map(o => '<option' + (String(v) === String(o) ? " selected" : "") + '>' +
+          esc(o) + '</option>').join("") + '</select>';
+    }else if(type === "textarea"){
+      ctl = '<textarea id="' + id + '" data-anat="' + s.k + '|' + field + '"' + dis + '>' + esc(v) + '</textarea>';
+    }else{
+      ctl = '<input type="' + type + '" id="' + id + '" data-anat="' + s.k + '|' + field +
+            '" value="' + esc(v) + '"' + dis + '>';
+    }
+    return '<div class="field"><label for="' + id + '">' + esc(label) + '</label>' + ctl + '</div>';
+  };
+  const users = [""].concat(S.db.users.map(u => u.name));
+
+  let inner = '<div class="grid g3">' +
+    f("status","Status","select",{ options:ANAT_STATUS }) +
+    f("assignedTo","Assigned to","select",{ options:users });
+
+  if(s.kind === "eval"){
+    inner += f("suitability","Anatomical suitability","select",{ options:SUITABILITY }) +
+      '</div><div class="grid g3">' +
+      f("size", s.final ? "Final recommended implant size" : "Recommended implant size",
+        "select",{ options:[""].concat(UNICA_SIZES) }) +
+      (s.final ? "" : f("altSize","Alternative size (optional)","select",{ options:[""].concat(UNICA_SIZES) })) +
+      f("angle", s.final ? "Final recommended implantation angle" : "Recommended implantation angle","text");
+    if(s.sim) inner += f("simAngle","Implantation angle used in simulator","text");
+    inner += '</div>';
+    if(s.pm){
+      inner += '<div class="grid g3">' +
+        f("pmPresent","PM present","select",{ options:["","Yes","No"] }) +
+        f("pmLeads","Number of PM leads","number") +
+        f("pmCrossingAngle","PM crossing angle","text") +
+        '</div>';
+    }
+    if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
+    inner += '<div class="grid g2">' + f("completionDate","Completion date","date") +
+      '<div class="field"><label>Completed by</label><input value="' + esc(a.completedBy || "") +
+      '" disabled></div></div>';
+  }
+  else if(s.kind === "ops"){
+    inner += '</div><div class="grid g2">' +
+      f("estDate","Estimated completion date","date") +
+      f("actualDate","Actual completion date","date") + '</div>';
+    if(s.needsPm && a.status === "Not required"){
+      inner = inner.replace('</div>', '</div>') ;
+      inner += '<div class="info">No pacemaker recorded in the 3D model evaluation, so this ' +
+               'stage is automatically <b>Not Required (No PM)</b>.</div>';
+    }
+  }
+  else if(s.kind === "sched"){
+    inner += '</div><div class="grid g3">' +
+      f("completionDate","Procedure date","date") +
+      f("hospital","Hospital","text") +
+      f("physician","Physician","text") + '</div>' +
+      f("schedNotes","Notes","textarea") +
+      '<div class="hint">Setting the procedure date here is what moves the patient to ' +
+      '<b>Procedure Scheduled</b> and feeds the clinical workflow. It is not asked again there.</div>';
+    if(anatIncomplete(p).length && !p.anatOverride){
+      inner += '<div class="warn">Mandatory stages are still open, so scheduling is blocked. ' +
+               'An App Admin can record an override above.</div>';
+    }
+  }
+  else if(s.kind === "order"){
+    const rec = currentRecommendation(p);
+    inner += '</div><div class="grid g3">' +
+      '<div class="field"><label>Implant size</label><input value="' + esc(rec.size || "") +
+        '" disabled></div>' +
+      '<div class="field"><label>Delivery system size</label><input value="' +
+        esc(rec.size ? (window.DeviceQr ? window.DeviceQr.requiredDsSize(rec.size) : "") : "") +
+        '" disabled></div>' +
+      f("requestedDate","Requested delivery date","date") + '</div>' +
+      '<div class="hint">Both sizes are read-only: the implant size comes from the completed ' +
+      'evaluation, and the delivery system follows from it (S/M need Short, L/XL need Long).</div>' +
+      '<div class="grid g3">' + f("accessories","Required accessories","text") +
+      f("shippingDest","Shipping destination","text") +
+      '<div class="field"><label>Requested by</label><input value="' + esc(a.requestedBy || "") +
+      '" disabled></div></div>' +
+      f("approvedBy","Approved by","select",{ options:users });
+  }
+  else inner += '</div>';
+
+  return '<div class="card stage' + (locked ? " is-locked" : "") + '">' +
+    '<div class="card-hd"><h2><span class="stage-n">' + s.n + '</span>' + esc(s.label) + '</h2>' +
+    '<span class="badge ' + (anatDone(a.status) ? "p-green" : a.status === "In progress" ? "p-orange" : "p-grey") +
+    '">' + esc(a.status) + '</span></div><div class="card-bd">' +
+    (locked ? '<div class="locked-ov">Locked until stage ' + s.n +
+      ' can be started — finish the stage before it, or record an override.</div>' : "") +
+    inner + '</div></div>';
+}
+
 VIEWS.clinical = {
   title:"Procedure Case File",
   sub:"Pick the site, then the patient. Everything saves as you type.",
@@ -12958,7 +13373,8 @@ function lockCase(p){
 let SH = null;
 function resetShip(){
   SH = { originId: S.me.locationId || "", productType:"UNICA", size:"M",
-         destId:"", deviceId:"", shipper:S.me.name, override:false, initials:"", reason:"" };
+         destId:"", deviceId:"", shipper:S.me.name, override:false, initials:"", reason:"",
+         lines:[] };
   saveDrafts();
 }
 function restoreShip(){
@@ -12967,6 +13383,10 @@ function restoreShip(){
   if(d.originId && !loc(d.originId)) d.originId = "";
   if(d.destId && !loc(d.destId)) d.destId = "";
   if(d.deviceId && !device(d.deviceId)) d.deviceId = "";
+  if(!Array.isArray(d.lines)) d.lines = [];
+  /* A draft can outlive the units it referenced - a line whose device has since been
+     used or shipped must not silently ship again. */
+  d.lines = d.lines.filter(l => !l.deviceId || device(l.deviceId));
   SH = d;
   return true;
 }
@@ -13021,6 +13441,8 @@ VIEWS.shipment = {
         esc(chosen.ref + " · " + devName(chosen)) + ' · expires ' + esc(chosen.expiration) + '</div>' : "") +
     '</div></div>' +
 
+    masterPackCard() +
+
     '<div class="card"><div class="card-hd"><h2>Step 2 · Who is sending it</h2></div><div class="card-bd">' +
       '<div class="grid g2">' +
         '<div class="field"><label class="req" for="sh-by">Shipped by</label>' +
@@ -13066,10 +13488,123 @@ VIEWS.shipment = {
     on("#sh-by",  e => { SH.shipper  = e.target.value; });
     on("#sh-ini", e => { SH.initials = e.target.value; });
     on("#sh-rsn", e => { SH.reason   = e.target.value; });
+    wireMasterPack();
+    wireScanFields();
     $("#sh-clear").onclick = () => { resetShip(); render(); };
     $("#sh-go").onclick = doShip;
   }
 };
+/* ---------------------------------------------------------------- MASTER PACK ---
+   Up to two units travel in one master carton, so the screen has to accept two
+   labels and let the operator check each line before it is sent. Scanning fills the
+   row; the operator confirms or corrects it. Nothing is shipped from an unconfirmed
+   row - the whole point of showing the table is that a human agrees with it. */
+const MASTER_PACK_MAX = 2;
+
+SCANFIELDS["sh-scan"] = {
+  label:"device in the master pack",
+  onCode(code, wasManual){
+    if(!SH) return;
+    SH.lines = SH.lines || [];
+    if(SH.lines.length >= MASTER_PACK_MAX){
+      showWhy("sh-why", "A master pack holds " + MASTER_PACK_MAX + " units. Remove one first.");
+      return render();
+    }
+    let parsed = null, problem = "";
+    try{
+      parsed = window.DeviceQr.parseDeviceQr(code);
+    }catch(e){
+      /* A mismatched or unreadable label is refused outright rather than accepted as
+         a hand-typed value: a wrong size here is a wrong implant later. */
+      problem = e.message || "That label could not be read.";
+    }
+    if(!parsed){
+      showWhy("sh-why", problem);
+      return render();
+    }
+    if(SH.lines.some(l => l.sn === parsed.sn)){
+      showWhy("sh-why", "That unit is already in this master pack.");
+      return render();
+    }
+    const known = S.db.devices.find(d => String(d.sn).toUpperCase() === parsed.sn);
+    SH.lines.push({
+      sn: parsed.sn, ref: parsed.ref,
+      size: parsed.size, productType: parsed.productType,
+      expiration: parsed.expiryDate, mfgDate: parsed.mfgDate,
+      deviceId: known ? known.id : "",
+      expired: parsed.expired,
+      handEntered: !!wasManual,
+      confirmed: false
+    });
+    clearWhy("sh-why");
+    delete MANUAL_OPEN["sh-scan"];
+    render();
+  }
+};
+
+function masterPackCard(){
+  SH.lines = SH.lines || [];
+  const full = SH.lines.length >= MASTER_PACK_MAX;
+  const fromName = SH.originId ? locName(SH.originId) : "—";
+  const toName   = SH.destId   ? locName(SH.destId)   : "—";
+
+  let rows = "";
+  if(!SH.lines.length){
+    rows = '<tr><td colspan="7" class="hint" style="padding:14px">' +
+           'Nothing scanned yet. Scan the QR code on each unit going into this carton.</td></tr>';
+  }else{
+    rows = SH.lines.map((l, i) => {
+      const unknown = !l.deviceId;
+      return '<tr' + (l.confirmed ? '' : ' class="row-unconfirmed"') + '>' +
+        '<td class="mono">' + esc(l.sn) + (l.handEntered ?
+            ' <span class="badge p-orange">hand-entered</span>' : '') + '</td>' +
+        '<td>' + esc(l.productType + " " + l.size) +
+          '<div class="hint">' + esc(l.ref) + '</div></td>' +
+        '<td class="mono">' + esc(l.expiration) +
+          (l.expired ? ' <span class="badge p-red">expired</span>' : '') + '</td>' +
+        '<td>' + esc(fromName) + '</td>' +
+        '<td>' + esc(toName) + '</td>' +
+        '<td>' + (unknown
+            ? '<span class="badge p-orange">not in stock here</span>'
+            : '<label class="check' + (l.confirmed ? " on" : "") + '" style="margin:0">' +
+              '<input type="checkbox" data-mpc="' + i + '"' + (l.confirmed ? " checked" : "") + '>' +
+              '<span>Correct</span></label>') + '</td>' +
+        '<td><button class="btn btn-sm" data-mpx="' + i + '">Remove</button></td>' +
+        '</tr>';
+    }).join("");
+  }
+
+  return '<div class="card"><div class="card-hd"><h2>Step 1b · Devices in this master pack</h2>' +
+    '<span class="hint">' + SH.lines.length + ' of ' + MASTER_PACK_MAX + '</span></div>' +
+    '<div class="card-bd">' +
+    '<p class="hint">Two units may be packed in one master carton. Scanning reads the ' +
+    'REF and the serial number and checks them against each other — a label whose REF ' +
+    'and SN disagree about the size is refused, not guessed at.</p>' +
+    (full ? '<div class="info">The carton is full. Remove a line to scan a different unit.</div>'
+          : scanField("sh-scan", "Scan the device QR code", "", {})) +
+    '<div class="tbl-wrap" style="margin-top:10px"><table><thead><tr>' +
+      '<th>Device SN</th><th>Device Size</th><th>Expiration Date</th>' +
+      '<th>From</th><th>To</th><th>Confirmed</th><th></th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table></div>' +
+    (SH.lines.length && SH.lines.some(l => !l.confirmed)
+      ? '<div class="warn" style="margin-top:9px">Every line has to be confirmed before the ' +
+        'carton can be sent.</div>' : "") +
+    (SH.lines.some(l => l.expired)
+      ? '<div class="warn">A unit in this carton is past its expiry date. It cannot be sent.</div>' : "") +
+    '</div></div>';
+}
+
+function wireMasterPack(){
+  $$("[data-mpc]").forEach(cb => cb.onchange = () => {
+    SH.lines[+cb.dataset.mpc].confirmed = cb.checked;
+    clearWhy("sh-why"); saveDrafts(); render();
+  });
+  $$("[data-mpx]").forEach(b => b.onclick = () => {
+    SH.lines.splice(+b.dataset.mpx, 1);
+    clearWhy("sh-why"); saveDrafts(); render();
+  });
+}
+
 function inTransitTable(){
   const t = S.db.devices.filter(d => d.status === "ON_WAY" || d.status === "DELIVERED");
   if(!t.length) return '<div class="empty">Nothing in transit.</div>';
@@ -13098,30 +13633,64 @@ function doShip(){
       return showWhy("sh-why", "Step 2 — an override needs both your initials and a reason.");
   }
   if(!d) return showWhy("sh-why", "There is no unit available to send.");
+  /* When the carton has been scanned, it is the authority on what is being sent. */
+  const lines = (SH.lines || []);
+  if(lines.length){
+    if(lines.some(l => !l.deviceId))
+      return showWhy("sh-why", "A scanned unit is not in stock at this location. Remove it, " +
+        "or check it in on the Receive a Delivery screen first.");
+    if(lines.some(l => !l.confirmed))
+      return showWhy("sh-why", "Step 1b — confirm every line in the master pack.");
+    if(lines.some(l => l.expired))
+      return showWhy("sh-why", "Step 1b — a unit in this carton is past its expiry date.");
+  }
   clearWhy("sh-why");
 
-  const from = SH.originId, to = SH.destId, before = d.status;
-  d.status = "ON_WAY"; d.locationId = to;
-  d.shippedBy = SH.shipper.trim(); d.shippedFromId = from; d.shippedAt = nowISO();
+  const from = SH.originId, to = SH.destId;
+  const shipper = SH.shipper.trim();
+  const at = nowISO();
+  /* If the carton was scanned, every confirmed line ships. Otherwise the single
+     FIFO-proposed unit does. One code path either way, so the audit trail, the
+     notification and the backup record are identical in both cases. */
+  const units = lines.length ? lines.map(l => device(l.deviceId)).filter(Boolean) : [d];
+  const packId = units.length > 1 ? "MP-" + Date.now().toString(36).toUpperCase() : "";
 
-  logAction("Shipped " + d.ref + " (" + devName(d) + ") to " + locName(to), {
-    locationId: from,
-    stateChanges: DEV_STATUS[before].label + " → In Transit",
-    comments: bypassing ? ("FIFO OVERRIDE by " + S.me.email + " (initialled " +
-              SH.initials.trim().toUpperCase() + ") — " + SH.reason) : "FIFO proposal accepted",
-    highPriority: bypassing
+  units.forEach(u => {
+    const before = u.status;
+    u.status = "ON_WAY"; u.locationId = to;
+    u.shippedBy = shipper; u.shippedFromId = from; u.shippedAt = at;
+    if(packId) u.masterPackId = packId;
+
+    logAction("Shipped " + u.ref + " (" + devName(u) + ") to " + locName(to), {
+      locationId: from,
+      stateChanges: DEV_STATUS[before].label + " → In Transit",
+      comments: (packId ? "master pack " + packId + " (" + units.length + " units) — " : "") +
+        (bypassing ? ("FIFO OVERRIDE by " + S.me.email + " (initialled " +
+          SH.initials.trim().toUpperCase() + ") — " + SH.reason)
+        : lines.length ? "scanned and confirmed" : "FIFO proposal accepted"),
+      highPriority: bypassing
+    });
+    queueBackup(locName(from) + "/Inventory_Logs", "shipment_" + u.sn + "_" + Date.now() + ".json", {
+      type:"SHIPMENT_RECORD",
+      device:{ id:u.id, ref:u.ref, sn:u.sn, mfgDate:u.mfgDate, product:devName(u), expiration:u.expiration },
+      masterPackId: packId || null, unitsInPack: units.length,
+      from:locName(from), to:locName(to), shippedBy:shipper, shippedAt:at,
+      identifierSource: lines.length
+        ? ((lines.find(l => l.deviceId === u.id) || {}).handEntered ? "hand-entered" : "scanned")
+        : "fifo-proposed",
+      fifoOverride:bypassing, overrideReason: bypassing ? SH.reason : null,
+      overrideInitials: bypassing ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
+    });
   });
-  notify("Shipment inbound: " + devName(d) + " (" + d.ref + ") from " + locName(from) +
-         ", shipped by " + d.shippedBy + ".", ["ADMIN","CPM","EMPLOYEE"], [], to);
-  queueBackup(locName(from) + "/Inventory_Logs", "shipment_" + d.ref + "_" + Date.now() + ".json", {
-    type:"SHIPMENT_RECORD", device:{ id:d.id, ref:d.ref, sn:d.sn, mfgDate:d.mfgDate, product:devName(d), expiration:d.expiration },
-    from:locName(from), to:locName(to), shippedBy:d.shippedBy, shippedAt:d.shippedAt,
-    fifoOverride:bypassing, overrideReason: bypassing ? SH.reason : null,
-    overrideInitials: bypassing ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
-  });
+
+  notify("Shipment inbound: " + units.map(u => devName(u) + " (" + u.ref + ")").join(", ") +
+         " from " + locName(from) + ", shipped by " + shipper + ".",
+         ["ADMIN","CPM","EMPLOYEE"], [], to);
   commit();
   /* Amber, not red: an override shipment succeeded, it just carries a note. */
-  toast(bypassing ? "Sent, with the override recorded." : "Sent.", bypassing ? "warn" : "good");
+  toast(bypassing ? "Sent, with the override recorded."
+                  : units.length > 1 ? "Sent — " + units.length + " units in one carton." : "Sent.",
+        bypassing ? "warn" : "good");
   resetShip(); renderNav(); render();
 }
 
