@@ -10978,6 +10978,20 @@ function stageComplete(p, s){
   return st === "Completed" && stageMissing(p, s).length === 0;
 }
 
+/* A stage may not remain "Completed" once its required fields are gone - a field cleared
+   after completion, or data from an older build. It drops back to "In progress" so the
+   Status dropdown can never say "Completed" while the badge says "Incomplete". Returns
+   true if it changed anything. */
+function reconcileStageStatus(p, s){
+  const a = p.anat[s.k];
+  if(a.status === "Completed" && stageMissing(p, s).length){
+    a.status = "In progress";
+    a.completedBy = "";        // cleared so a later re-completion stamps the right person
+    return true;
+  }
+  return false;
+}
+
 /* A stage may only be worked on once every earlier stage is finished, unless an
    App Admin has recorded an override. */
 function anatUnlocked(p, key){
@@ -12762,6 +12776,14 @@ VIEWS.screening = {
     }
 
     h += whyBox("scr-why");
+    /* Self-heal any stage persisted as "Completed" without its required fields (e.g. a
+       field cleared after completion, or data from an older build): it drops to "In
+       progress" so the dropdown never contradicts the badge, even on a plain reload. */
+    if(can("managePatients")){
+      let healed = false;
+      ANAT_STAGES.forEach(s => { if(reconcileStageStatus(p, s)) healed = true; });
+      if(healed) commit();
+    }
     h += ANAT_STAGES.map(s => anatStageHtml(p, s, ctReady)).join("");
     h += '</div></div>';
     return h;
@@ -12836,11 +12858,13 @@ VIEWS.screening = {
         clearWhy("scr-why");
         a[field] = el.type === "checkbox" ? el.checked : el.value;
 
-        /* Editing any field in a stage that is still "Not started" moves it to
-           "In progress", so the badge shows work is under way without a manual change.
-           Only "Not started" advances; Completed / In progress / Not required stay put. */
-        if(field !== "status" && a.status === "Not started"){
-          a.status = "In progress";
+        /* Keep the dropdown and the badge telling one story as fields are edited:
+           a "Not started" stage that gets any input becomes "In progress", and a
+           "Completed" stage whose required fields are no longer all present drops back
+           to "In progress" - so a stage can never show "Completed" beside "Incomplete". */
+        if(field !== "status"){
+          if(a.status === "Not started") a.status = "In progress";
+          else reconcileStageStatus(p, stage);
         }
 
         /* Completing a stage stamps who and when, once. */
@@ -12873,7 +12897,8 @@ VIEWS.screening = {
         flashSaved();
         /* These three can unlock a later stage or change a summary line, so the view
            is rebuilt - but in place. */
-        if(["status","pmPresent","completionDate","suitability","size","actualDate",
+        if(a.status !== before.st ||
+           ["status","pmPresent","completionDate","suitability","size","actualDate",
             "hospital","physician","shippingDest","requestedDate"].includes(field)){
           renderKeepingPlace();
         }
