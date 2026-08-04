@@ -11140,6 +11140,14 @@ const S = {
 /* --------------------------------------------------------------- the store */
 function uid(p){ return p + "-" + Math.random().toString(36).slice(2,9); }
 function nowISO(){ return new Date().toISOString(); }
+/* Local wall-clock stamp "YYYY-MM-DDTHH:mm", for user-facing times (like the "Now"
+   buttons) so the hour shown is the clock on the wall, not UTC. fmtDate renders it as
+   date + time; a plain date still renders as a date, so old records are unaffected. */
+function nowLocalStamp(){
+  const d = new Date(), pad = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+         "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+}
 function daysFromNow(n){ const d=new Date(); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
 
 function seed(){
@@ -13102,7 +13110,7 @@ VIEWS.screening = {
       const st = p.screening[cb.dataset.scr];
       st.done = cb.checked;
       st.by = cb.checked ? S.me.name : "";
-      st.at = cb.checked ? nowISO().slice(0,10) : "";
+      st.at = cb.checked ? nowLocalStamp() : "";   // date + time of ticking, automatically
       const before = p.status;
       p.status = recomputeWorkflow(p);
       logAction("Screening material updated", { locationId:p.siteId,
