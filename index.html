@@ -375,6 +375,42 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
 .clear-day b{display:block; font-size:15px; margin-bottom:3px;}
 .clear-day span{color:var(--muted); font-size:13px;}
 
+/* ------------------------------------------------------------- home dashboard */
+.nav-cards{display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:16px;}
+.nav-card{display:flex; flex-direction:column; align-items:flex-start; gap:7px; text-align:left;
+          padding:15px; border:1px solid var(--line); border-radius:var(--radius); background:var(--card);
+          cursor:pointer; font:inherit; color:var(--ink);
+          transition:border-color .15s, box-shadow .15s, transform .04s;}
+.nav-card:hover{border-color:var(--brand); box-shadow:0 4px 14px rgba(20,32,43,.09);}
+.nav-card:active{transform:translateY(1px);}
+.nav-card:focus-visible{outline:2px solid var(--brand); outline-offset:2px;}
+.nav-card-ic{display:flex; align-items:center; justify-content:center; width:38px; height:38px;
+             border-radius:9px; background:var(--brand-wash); color:var(--brand-dk);}
+.nav-card-ic svg{width:20px; height:20px;}
+.nav-card-t{font-size:15px; font-weight:700;}
+.nav-card-d{font-size:12px; color:var(--muted); line-height:1.35;}
+.nav-card.is-disabled{cursor:not-allowed; opacity:.6; background:var(--bg);}
+.nav-card.is-disabled:hover{border-color:var(--line); box-shadow:none;}
+.nav-card-lock{font-size:10px; font-weight:650; color:var(--muted); background:var(--line-2);
+               border-radius:20px; padding:1px 8px;}
+.dash-grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px;}
+.dash-grid .card{margin:0;}
+.chip-wrap{display:flex; flex-wrap:wrap; gap:8px;}
+.stat-chip{display:inline-flex; flex-direction:column; gap:1px; padding:8px 12px; min-width:92px;
+           border:1px solid var(--line); border-radius:9px; background:var(--card); cursor:pointer;
+           text-align:left; font:inherit; color:var(--ink);}
+.stat-chip:hover{border-color:var(--brand);}
+.stat-chip.on{border-color:var(--brand); box-shadow:inset 0 0 0 1px var(--brand); background:var(--brand-wash);}
+.stat-chip .n{font-size:20px; font-weight:700; line-height:1.1; font-variant-numeric:tabular-nums;}
+.stat-chip .l{font-size:11px; color:var(--muted);}
+.filters{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:11px;}
+.filters .field{margin:0; min-width:128px; flex:1;}
+.filters .field label{font-size:11px;}
+.row-click{cursor:pointer;}
+.row-click:hover td{background:var(--brand-wash);}
+@media(max-width:900px){.nav-cards{grid-template-columns:repeat(2,1fr);} .dash-grid{grid-template-columns:1fr;}}
+@media(max-width:560px){.nav-cards{grid-template-columns:1fr;}}
+
 /* ------------------------------------------------------------ scan feedback */
 .scan-ok{display:flex; align-items:center; gap:9px; padding:10px 13px;
          border-radius:6px; background:var(--ok-bg); color:var(--ok-fg);
@@ -10944,7 +10980,7 @@ function blankAnat(){
                simAngle:"", pmPresent:"", pmLeads:"", pmCrossingAngle:"",
                strategy:"", hospital:"", physician:"", schedNotes:"",
                accessories:"", shippingDest:"", requestedDate:"",
-               requestedBy:"", approvedBy:"" };
+               requestedBy:"", requestedAt:"", approvedBy:"" };
   });
   return o;
 }
@@ -11980,7 +12016,7 @@ function icon(k){
    logistics screens that has never existed. */
 const NAV = [
   { grp:"Start here" },
-  { k:"today",    ic:"today",   label:"Today",              roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"], todo:true },
+  { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"], todo:true },
   { grp:"Devices" },
   { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
   { k:"shipment", ic:"ship",    label:"Send a Device Out",  roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
@@ -12253,6 +12289,230 @@ function todoItems(){
   return out;
 }
 
+/* ============================ HOME DASHBOARD ============================
+   The landing page after sign-in: role-aware module cards, three live dashboard
+   widgets, and the "needs your attention" list folded in from the old Today screen.
+
+   Every widget reads through the accessors below rather than poking S.db directly,
+   so when patient/device data moves to the SharePoint/OneDrive backend only these
+   functions change - the widgets do not. Role gating here is presentation only;
+   real authorization must be enforced by that backend when it exists. */
+const HOME_MODULES = [
+  { key:"stock",     ic:"stock",  title:"Warehouse",              desc:"Device inventory across warehouses and sites." },
+  { key:"patients",  ic:"people", title:"Patients Registration",  desc:"Register patients and set up the table." },
+  { key:"screening", ic:"case",   title:"Patient Screening",      desc:"Screening, evaluation, scheduling and orders." },
+  { key:"shipment",  ic:"ship",   title:"Send / Receive Devices", desc:"Ship a unit out, or check a delivery in." }
+];
+function canAccessView(key){ return NAV.some(i => i.k === key && i.roles.includes(S.me.role)); }
+
+/* ---- data-access seam: swap these for the backend later, not the widgets ---- */
+function homePatients(){ return S.db.patients.filter(p => inScope(p.siteId)); }
+function homeDevices(){ return visibleDevices(); }
+function patImplant(p){ return p.unicaSize || currentRecommendation(p).size || ""; }
+function patPhysician(p){ return (p.anat && p.anat.scheduling && p.anat.scheduling.physician) || ""; }
+function screenLevel(p){
+  const done = SCREENING_STEPS.filter(s => p.screening[s.k].done).length;
+  return done === 0 ? "Not started" : done === SCREENING_STEPS.length ? "Complete" : "In progress";
+}
+function orderRequests(){
+  return homePatients()
+    .filter(p => p.anat && p.anat.order && p.anat.order.requestedBy)
+    .map(p => {
+      const o = p.anat.order, rec = currentRecommendation(p);
+      const ds = rec.size && window.DeviceQr ? window.DeviceQr.requiredDsSize(rec.size) : "";
+      return { id:p.patientCode, patientId:p.id, siteId:p.siteId,
+               date:o.requestedAt || "", delivery:o.requestedDate || "",
+               devices:"Unica " + (rec.size || "?") + " / DS " + (ds || "?"),
+               dest:o.shippingDest || "", status:o.approvedBy ? "Approved" : (o.status || "Requested") };
+    });
+}
+
+/* Filter state for the three widgets. Kept on one object so a re-render preserves it. */
+let HOME = {
+  pStatus:null,
+  pf:{ site:"", phys:"", size:"", from:"", to:"", screen:"", proc:"" },
+  df:{ site:"", size:"" },
+  sf:{ site:"", date:"", status:"" }
+};
+
+function selField(id, label, value, options){
+  return '<div class="field"><label for="' + id + '">' + esc(label) + '</label>' +
+    '<select id="' + id + '">' + options.map(o => {
+      const v = Array.isArray(o) ? o[0] : o, t = Array.isArray(o) ? o[1] : o;
+      return '<option value="' + esc(v) + '"' + (String(value) === String(v) ? " selected" : "") +
+        '>' + esc(t) + '</option>';
+    }).join("") + '</select></div>';
+}
+function dateField(id, label, value){
+  return '<div class="field"><label for="' + id + '">' + esc(label) + '</label>' +
+    '<input type="date" id="' + id + '" value="' + esc(value || "") + '"></div>';
+}
+
+function homeNavCards(){
+  return '<div class="nav-cards">' + HOME_MODULES.map(m => {
+    const ok = canAccessView(m.key), tag = ok ? "button" : "div";
+    return '<' + tag + ' class="nav-card' + (ok ? '' : ' is-disabled') + '"' +
+      (ok ? ' data-nav="' + m.key + '"'
+          : ' aria-disabled="true" title="You do not have permission to access this module."') + '>' +
+      '<span class="nav-card-ic">' + icon(m.ic) + '</span>' +
+      '<span class="nav-card-t">' + esc(m.title) + '</span>' +
+      '<span class="nav-card-d">' + esc(m.desc) + '</span>' +
+      (ok ? '' : '<span class="nav-card-lock">No access</span>') +
+      '</' + tag + '>';
+  }).join("") + '</div>';
+}
+
+/* Shared cells for a patient table row (Code..Case file), so the Patient Register and
+   the Home patient-status table render identical columns from one definition. */
+function patientRowCells(p){
+  const q = (p.customQuestions || []).length;
+  const open = (p.customQuestions || []).filter(x => !String(x.a || "").trim()).length;
+  const rem = (p.reminders || []).filter(r => !r.done).length;
+  const follow = (!q && !rem) ? '<span class="hint">none</span>'
+    : (q ? '<span class="pill ' + (open ? "p-orange" : "p-green") + '">' +
+           (open ? open + " open" : q + " answered") + '</span> ' : "") +
+      (rem ? '<span class="pill p-blue">' + rem + ' reminder' + (rem > 1 ? "s" : "") + '</span>' : "");
+  const casefile = p.fileLocked ? '<span class="pill p-green">Locked</span>'
+                 : p.submitted ? '<span class="pill p-orange">Submitted</span>'
+                 : '<span class="pill p-grey">In progress</span>';
+  return '<td><b>' + esc(p.patientCode) + '</b></td><td>' + esc(locName(p.siteId)) + '</td>' +
+    '<td>' + esc(fmtDate(p.procedureDate)) + '</td><td>' + esc(p.unicaSize) + '</td>' +
+    '<td>' + esc(p.dsSize) + '</td><td>' + follow + '</td>' +
+    '<td>' + pill(PT_STATUS, p.status) + '</td><td>' + casefile + '</td>';
+}
+
+function patientStatusWidget(){
+  const sites = visibleLocations().filter(l => l.type === "SITE");
+  const physicians = [...new Set(homePatients().map(patPhysician).filter(Boolean))].sort();
+  const f = HOME.pf;
+  const list = homePatients().filter(p => {
+    if(f.site && p.siteId !== f.site) return false;
+    if(f.phys && patPhysician(p) !== f.phys) return false;
+    if(f.size && patImplant(p) !== f.size) return false;
+    if(f.screen && screenLevel(p) !== f.screen) return false;
+    if(f.proc === "Scheduled" && p.status !== "SCHEDULED") return false;
+    if(f.proc === "Completed" && p.status !== "TREATED") return false;
+    if(f.proc === "Cancelled" && !(p.cancelled && p.cancelled.is)) return false;
+    if(f.from && (!p.procedureDate || String(p.procedureDate).slice(0,10) < f.from)) return false;
+    if(f.to && (!p.procedureDate || String(p.procedureDate).slice(0,10) > f.to)) return false;
+    return true;
+  });
+  const statusOf = p => (p.cancelled && p.cancelled.is) ? "CANCELLED" : p.status;
+  const order = PT_FLOW.concat(["CANCELLED"]);
+  const counts = {}; order.forEach(k => counts[k] = 0);
+  list.forEach(p => { const st = statusOf(p); if(counts[st] == null) counts[st] = 0; counts[st]++; });
+
+  const filters = '<div class="filters">' +
+    selField("pf-site","Site", f.site, [["","All sites"]].concat(sites.map(l => [l.id, l.name]))) +
+    selField("pf-phys","Physician", f.phys, [["","All"]].concat(physicians.map(x => [x, x]))) +
+    selField("pf-size","Implant size", f.size, [["","All"]].concat(UNICA_SIZES.map(x => [x, "Unica " + x]))) +
+    selField("pf-screen","Screening", f.screen, ["","Not started","In progress","Complete"]) +
+    selField("pf-proc","Procedure", f.proc, ["","Scheduled","Completed","Cancelled"]) +
+    dateField("pf-from","From", f.from) + dateField("pf-to","To", f.to) + '</div>';
+
+  const chips = '<div class="chip-wrap">' + order.filter(k => counts[k] > 0 || HOME.pStatus === k).map(k =>
+    '<button class="stat-chip' + (HOME.pStatus === k ? " on" : "") + '" data-pstatus="' + k + '">' +
+      '<span class="n">' + counts[k] + '</span><span class="l">' + esc(PT_STATUS[k].label) + '</span>' +
+    '</button>').join("") + '</div>';
+
+  /* Always show the patient table (like the Patient Register), narrowed to the selected
+     status chip when one is active. Clicking a row opens that patient. */
+  const shown = HOME.pStatus ? list.filter(p => statusOf(p) === HOME.pStatus) : list;
+  const table = shown.length
+    ? '<div class="tbl-wrap" style="margin-top:11px"><table><thead><tr>' +
+      '<th>Code</th><th>Site</th><th>Procedure date</th><th>Unica</th><th>DS</th>' +
+      '<th>Follow-ups</th><th>Status</th><th>Case file</th></tr></thead><tbody>' +
+      shown.map(p => '<tr class="row-click" data-patient="' + p.id + '">' + patientRowCells(p) + '</tr>').join("") +
+      '</tbody></table></div>'
+    : '<div class="hint" style="margin-top:11px">No patients match the current filters.</div>';
+
+  return '<div class="card"><div class="card-hd"><h2>Patient status</h2>' +
+    '<span class="hint">' + shown.length + ' patient(s)</span></div><div class="card-bd">' +
+    filters + chips + table + '</div></div>';
+}
+
+function deviceInventoryWidget(){
+  const f = HOME.df;
+  /* Used units are consumed, not inventory, so they are excluded from this widget. */
+  const devs = homeDevices().filter(d => {
+    if(d.status === "USED") return false;
+    if(f.site && d.locationId !== f.site) return false;
+    if(f.size && String(d.size) !== f.size) return false;
+    return true;
+  });
+  const locType = id => { const l = loc(id); return l ? l.type : ""; };
+  const statusOf = d => (d.status === "IN_WH" || d.status === "IN_SITE") ? "avail"
+                      : (d.status === "ON_WAY" || d.status === "DELIVERED") ? "ship" : "other";
+
+  /* One row per size, split by status - Unica sizes and DS sizes both kept. */
+  const sizes = UNICA_SIZES.concat(DS_SIZES);
+  const mtx = {}; sizes.forEach(s => mtx[s] = { avail:0, ship:0, other:0, total:0 });
+  let wh = 0, site = 0;
+  devs.forEach(d => {
+    const t = locType(d.locationId); if(t === "WAREHOUSE") wh++; else if(t === "SITE") site++;
+    if(mtx[d.size] == null) mtx[d.size] = { avail:0, ship:0, other:0, total:0 };
+    mtx[d.size][statusOf(d)]++; mtx[d.size].total++;
+  });
+
+  const filters = '<div class="filters">' +
+    selField("df-site","Location", f.site, [["","All locations"]].concat(visibleLocations().map(l => [l.id, l.name]))) +
+    selField("df-size","Device size", f.size, [["","All sizes"]].concat(sizes.map(s => [s, s]))) + '</div>';
+
+  const rows = sizes.filter(s => mtx[s].total > 0);
+  const matrix = rows.length
+    ? '<div class="tbl-wrap"><table><thead><tr><th>Size</th><th class="num">Available</th>' +
+      '<th class="num">In transit</th><th class="num">Other</th><th class="num">Total</th></tr></thead><tbody>' +
+      rows.map(s => '<tr><td><b>' + esc(s) + '</b></td>' +
+        '<td class="num">' + mtx[s].avail + '</td><td class="num">' + mtx[s].ship + '</td>' +
+        '<td class="num">' + mtx[s].other + '</td><td class="num"><b>' + mtx[s].total + '</b></td></tr>').join("") +
+      '</tbody></table></div>'
+    : '<div class="hint">No devices match the current filters.</div>';
+
+  const locChips = '<div class="chip-wrap" style="margin-top:11px">' +
+    '<div class="stat-chip" style="cursor:default"><span class="n">' + wh + '</span><span class="l">In warehouses</span></div>' +
+    '<div class="stat-chip" style="cursor:default"><span class="n">' + site + '</span><span class="l">At hospital sites</span></div>' +
+    '</div>';
+
+  return '<div class="card"><div class="card-hd"><h2>Device inventory</h2>' +
+    '<span class="hint">' + devs.length + ' unit(s)</span></div><div class="card-bd">' +
+    filters + matrix + locChips +
+    '<div class="hint" style="margin-top:9px">Used units are excluded — they are consumed, not inventory. ' +
+    '“Other” means expired or rejected.</div></div></div>';
+}
+
+function shipmentRequestsWidget(){
+  const reqs = orderRequests();
+  const sites = visibleLocations().filter(l => l.type === "SITE");
+  const statuses = [...new Set(reqs.map(r => r.status))];
+  const f = HOME.sf;
+  const rows = reqs.filter(r => {
+    if(f.site && r.siteId !== f.site) return false;
+    if(f.status && r.status !== f.status) return false;
+    if(f.date && String(r.date || r.delivery).slice(0,10) !== f.date) return false;
+    return true;
+  });
+
+  const filters = '<div class="filters">' +
+    selField("sf-site","Site", f.site, [["","All sites"]].concat(sites.map(l => [l.id, l.name]))) +
+    selField("sf-status","Status", f.status, [["","All"]].concat(statuses.map(s => [s, s]))) +
+    dateField("sf-date","Date", f.date) + '</div>';
+
+  const table = rows.length
+    ? '<div class="tbl-wrap"><table><thead><tr><th>Request</th><th>Date</th><th>Site</th>' +
+      '<th>Devices</th><th>Destination</th><th>Status</th></tr></thead><tbody>' +
+      rows.map(r => '<tr class="row-click" data-req="' + r.patientId + '"><td><b>' + esc(r.id) + '</b></td>' +
+        '<td>' + esc(r.date ? fmtDate(r.date) : "—") + '</td><td>' + esc(locName(r.siteId)) + '</td>' +
+        '<td>' + esc(r.devices) + '</td><td>' + esc(r.dest || "—") + '</td>' +
+        '<td>' + esc(r.status) + '</td></tr>').join("") + '</tbody></table></div>'
+    : '<div class="hint">No shipment requests match the current filters.</div>';
+
+  return '<div class="card"><div class="card-hd"><h2>Shipment requests</h2>' +
+    '<span class="hint">' + rows.length + ' request(s)</span></div><div class="card-bd">' +
+    filters + table +
+    '<div class="hint" style="margin-top:9px">Requests are the product orders raised in Patient Screening ' +
+    '(stage 10). Selecting one opens its patient.</div></div></div>';
+}
+
 VIEWS.today = {
   title(){
     const h = new Date().getHours();
@@ -12266,23 +12526,13 @@ VIEWS.today = {
   },
   body(){
     const items = todoItems();
-    const mine = visibleDevices();
-    const live = mine.filter(d => DEV_STATUS[d.status].stock).length;
-    const transit = mine.filter(d => d.status === "ON_WAY").length;
-    const cases = S.db.patients.filter(p => inScope(p.siteId) && !p.fileLocked).length;
 
-    let h = '<div class="grid g3">' +
-      [["Usable stock", live, "Units checked in and available"],
-       ["In transit", transit, "Sent, not yet arrived"],
-       ["Open case files", cases, "Not yet permanently locked"]].map(([l,v,s]) =>
-        '<div class="card" style="margin:0"><div class="card-bd">' +
-          '<div class="hint" style="margin:0">' + esc(l) + '</div>' +
-          '<div style="font-size:27px;font-weight:700;line-height:1.2">' + v + '</div>' +
-          '<div class="hint" style="margin:0">' + esc(s) + '</div>' +
-        '</div></div>').join("") +
-      '</div><div style="height:14px"></div>';
+    let h = homeNavCards() +
+      patientStatusWidget() +
+      '<div class="dash-grid">' + deviceInventoryWidget() + shipmentRequestsWidget() + '</div>' +
+      '<div style="height:14px"></div>';
 
-    h += '<div class="card"><div class="card-hd"><h2>What needs doing</h2>' +
+    h += '<div class="card"><div class="card-hd"><h2>Needs your attention</h2>' +
       (items.length ? '<span class="pill p-pink">' + items.length + '</span>' : '') +
       '</div>';
 
@@ -12315,6 +12565,38 @@ VIEWS.today = {
       }
       S.view = it.view; renderNav(); render();
     });
+
+    /* Module cards. A disabled card renders as a <div> with no data-nav, so it is inert. */
+    $$("[data-nav]").forEach(b => b.onclick = () => { S.view = b.dataset.nav; renderNav(); render(); });
+
+    /* Open a patient in the screening module (or the case file if that is all the role
+       can reach), landing on a specific stage when asked. */
+    const openPatient = (id, stage) => {
+      const p = patient(id);
+      if(!p) return;
+      SITEID = p.siteId; PID = p.id;
+      if(typeof SCR !== "undefined"){ SCR.patientId = p.id; if(stage) SCR.open = stage; }
+      S.view = canAccessView("screening") ? "screening" : "clinical";
+      renderNav(); render();
+    };
+    $$("[data-patient]").forEach(r => r.onclick = () => openPatient(r.dataset.patient, ""));
+    $$("[data-req]").forEach(r => r.onclick = () => openPatient(r.dataset.req, "order"));
+
+    /* Patient-status chips: toggle the drill-down list for a status. */
+    $$("[data-pstatus]").forEach(b => b.onclick = () => {
+      HOME.pStatus = (HOME.pStatus === b.dataset.pstatus) ? null : b.dataset.pstatus;
+      renderKeepingPlace();
+    });
+
+    /* Dashboard filters: update state and re-render in place, so values refresh live. */
+    const onSel = (id, set) => { const el = $("#" + id); if(el) el.onchange = () => { set(el.value); renderKeepingPlace(); }; };
+    onSel("pf-site", v => HOME.pf.site = v);   onSel("pf-phys", v => HOME.pf.phys = v);
+    onSel("pf-size", v => HOME.pf.size = v);   onSel("pf-screen", v => HOME.pf.screen = v);
+    onSel("pf-proc", v => HOME.pf.proc = v);   onSel("pf-from", v => HOME.pf.from = v);
+    onSel("pf-to", v => HOME.pf.to = v);
+    onSel("df-site", v => HOME.df.site = v);   onSel("df-size", v => HOME.df.size = v);
+    onSel("sf-site", v => HOME.sf.site = v);   onSel("sf-status", v => HOME.sf.status = v);
+    onSel("sf-date", v => HOME.sf.date = v);
   }
 };
 
@@ -12885,6 +13167,7 @@ VIEWS.screening = {
            now, email via the server). Guarded on requestedBy so it fires exactly once. */
         if(key === "order" && a.status !== "Not started" && a.status !== "Not required" && !a.requestedBy){
           a.requestedBy = S.me.name;
+          a.requestedAt = nowISO();
           announceOrderRequest(p);
         }
 
@@ -14224,22 +14507,7 @@ VIEWS.patients = {
       '<div class="tbl-wrap"><table><thead><tr><th>Code</th><th>Site</th><th>Procedure date</th>' +
         '<th>Unica</th><th>DS</th><th>Follow-ups</th><th>Status</th><th>Case file</th><th></th>' +
         '</tr></thead><tbody>' +
-      list.map(p => '<tr><td><b>' + esc(p.patientCode) + '</b></td><td>' + esc(locName(p.siteId)) + '</td>' +
-        '<td>' + esc(fmtDate(p.procedureDate)) + '</td><td>' + esc(p.unicaSize) + '</td>' +
-        '<td>' + esc(p.dsSize) + '</td>' +
-        '<td>' + (() => {
-          const q = (p.customQuestions || []).length;
-          const open = (p.customQuestions || []).filter(x => !String(x.a||"").trim()).length;
-          const rem = (p.reminders || []).filter(r => !r.done).length;
-          if(!q && !rem) return '<span class="hint">none</span>';
-          return (q ? '<span class="pill ' + (open ? "p-orange" : "p-green") + '">' +
-                      (open ? open + " open" : q + " answered") + '</span> ' : "") +
-                 (rem ? '<span class="pill p-blue">' + rem + ' reminder' + (rem>1?"s":"") + '</span>' : "");
-        })() + '</td>' +
-        '<td>' + pill(PT_STATUS, p.status) + '</td>' +
-        '<td>' + (p.fileLocked ? '<span class="pill p-green">Locked</span>' :
-                  p.submitted ? '<span class="pill p-orange">Submitted</span>' :
-                  '<span class="pill p-grey">In progress</span>') + '</td>' +
+      list.map(p => '<tr>' + patientRowCells(p) +
         '<td class="row" style="gap:5px">' +
           '<button class="btn btn-sm" data-open="' + p.id + '">Open</button>' +
           (can("managePatients") ? '<button class="btn btn-sm" data-edit="' + p.id + '">Edit</button>' : "") +
