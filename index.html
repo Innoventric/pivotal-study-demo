@@ -11346,6 +11346,12 @@ function announceOrderRequest(p){
 }
 /* Queue-first: the local record is the durability guarantee, the upload is
    best-effort. Nothing is lost when the network is not there. */
+/* The single folder that holds everything for one patient in the output library:
+   collected files, redacted images, the locked case-file archive and (later) the
+   generated PDF summary all live here, so a patient's whole record is in one place.
+   This is the one definition the SharePoint patient-folder work will build on. */
+function patientFolder(p){ return locName(p.siteId) + "/Clinical_Procedures/" + p.patientCode; }
+
 function queueBackup(path, filename, content){
   const rec = { id:uid("bkp"), path, filename, content:JSON.stringify(content), ts:nowISO(),
                 synced:false, syncNote:"Queued" };
@@ -11828,7 +11834,7 @@ async function captureSourceImage(p, fieldKey, fieldLabel){
       const filename = p.patientCode + "_" + fieldKey + "_" + stamp + ".jpg";
       /* Filed under the patient's STUDY CODE, never a name. The code is a
          pseudonym, which is the point of using it here. */
-      const folder = locName(p.siteId) + "/Clinical_Procedures/" + p.patientCode + "/source_images";
+      const folder = patientFolder(p) + "/source_images";
 
       if(!p.images) p.images = [];
       p.images.push({ id:uid("img"), field:fieldKey, label:fieldLabel, filename, folder,
@@ -13899,7 +13905,7 @@ function lockCase(p){
       return showWhy("lk-why", "That does not match. Type " + p.patientCode + " exactly.");
     p.fileLocked = true;
     if(p.status !== "CANCELLED") p.status = "TREATED";
-    queueBackup(locName(p.siteId) + "/Clinical_Procedures",
+    queueBackup(patientFolder(p),
       "case_" + p.patientCode + "_locked.json",
       { type:"CLINICAL_CASE_FILE", patientCode:p.patientCode, site:locName(p.siteId),
         unicaSize:p.unicaSize, dsSize:p.dsSize, status:p.status,
