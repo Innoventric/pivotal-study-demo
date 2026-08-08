@@ -11279,8 +11279,130 @@ function saveDB(db){
   catch(e){ console.warn("[store] could not persist:", e); }
 }
 /* Autosave: every mutation goes through this, so a reload, a locked screen or
-   a crash restores the exact in-progress state. */
+   a crash restores the exact in-progress state. In backend mode this stays as a
+   local cache; the server is authoritative and re-supplies the data on next load. */
 function commit(){ saveDB(S.db); }
+
+/* Thin JSON fetch for the backend. Throws an Error carrying .code/.status from the
+   server's { error:{ code, message } } envelope, so callers can show a real reason. */
+async function api(method, path, body){
+  const opt = { method, credentials:"same-origin", headers:{} };
+  if(body !== undefined){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => null);
+  if(!r.ok){
+    const e = new Error((j && j.error && j.error.message) || ("HTTP " + r.status));
+    e.code = j && j.error && j.error.code; e.status = r.status;
+    throw e;
+  }
+  return j;
+}
+
+/* Backend mode: the live database comes from SharePoint via the server, in the same
+   shape as the local db. Collections not yet migrated to Lists arrive empty and are
+   filled in by later stages; until then they simply have nothing to show. */
+async function loadRemoteStore(){
+  const j = await api("GET", "/api/store");
+  return {
+    version: SCHEMA_VERSION,
+    users:         j.users         || [],
+    locations:     j.locations     || [],
+    devices:       j.devices       || [],
+    patients:      j.patients      || [],
+    logs:          j.logs          || [],
+    notifications: j.notifications || [],
+    backupQueue:   j.backupQueue   || []
+  };
+}
+
+/* ---- patient persistence (backend mode) ----
+   Each helper hits the matching server route and merges the returned patient (with
+   its fresh ETag) back into S.db, so the next edit carries the right concurrency
+   handle. Callers use these only when S.backend; the local path stays commit(). */
+function mergePatient(p){
+  if(!p || !p.id) return p;
+  const existing = S.db.patients.find(x => x.id === p.id);
+  if(!existing){ S.db.patients.push(p); return p; }
+  /* Update IN PLACE so an open editor's reference stays valid across a background
+     save. The server strips image thumbnails from storage, so carry the in-session
+     thumbs across rather than blanking the gallery. */
+  if(Array.isArray(p.images) && Array.isArray(existing.images)){
+    p.images.forEach(im => { if(!im.thumb){ const o = existing.images.find(x => x.id === im.id); if(o && o.thumb) im.thumb = o.thumb; } });
+  }
+  Object.keys(existing).forEach(k => { if(!(k in p)) delete existing[k]; });
+  Object.assign(existing, p);
+  return existing;
+}
+/* Debounced + serialised full-patient save (registration edit, screening, anat).
+   Coalesces rapid edits into one PUT and never runs two at once, so ETags never
+   collide with themselves. */
+let _pTimer = null, _pPending = null, _pSaving = false;
+function schedulePatientSave(p){
+  if(!S.backend || !p || !p.id) return;
+  _pPending = p.id;
+  clearTimeout(_pTimer);
+  _pTimer = setTimeout(runPatientSave, 900);
+}
+async function runPatientSave(){
+  if(_pSaving){ clearTimeout(_pTimer); _pTimer = setTimeout(runPatientSave, 300); return; }
+  const id = _pPending; if(!id) return;
+  _pPending = null;
+  const p = patient(id); if(!p) return;
+  _pSaving = true;
+  try{ await savePatientRemote(p); }
+  catch(e){ toast(e.code === "CONFLICT" ? "This patient changed elsewhere — reopen it."
+                 : "Save failed: " + (e.message || "unknown error"), "bad"); }
+  finally{ _pSaving = false; if(_pPending) runPatientSave(); }
+}
+async function savePatientRemote(p){ return mergePatient(await api("PUT", "/api/patients", p)); }
+async function checkoutPatientRemote(id){ return api("POST", "/api/patients/" + encodeURIComponent(id) + "/checkout", {}); }
+async function releasePatientRemote(id){ return api("POST", "/api/patients/" + encodeURIComponent(id) + "/release", {}); }
+async function saveCaseFileRemote(id, caseFile, customQuestions){
+  return mergePatient(await api("PATCH", "/api/patients/" + encodeURIComponent(id) + "/casefile", { caseFile, customQuestions }));
+}
+/* Debounced treatment-day autosave: keystrokes coalesce into one server write ~1.2s
+   after typing stops. The local commit() already happened, so the field is never lost;
+   this just publishes it. A refused save (locked / checked out by someone else) surfaces
+   as a toast rather than silently dropping. */
+let _cfTimer = null, _cfPending = null;
+function scheduleCaseFileSave(p){
+  if(!S.backend || !p || !p.id) return;
+  _cfPending = p.id;
+  clearTimeout(_cfTimer);
+  _cfTimer = setTimeout(async () => {
+    const pt = patient(_cfPending); _cfPending = null;
+    if(!pt) return;
+    try{ await saveCaseFileRemote(pt.id, pt.caseFile || {}, pt.customQuestions || []); }
+    catch(e){
+      toast(e.code === "CHECKED_OUT" ? "This file is open by someone else — your last change was not saved."
+          : e.code === "LOCKED" ? "This file is locked — changes are no longer saved."
+          : e.code === "CONFLICT" ? "This file changed elsewhere — reopen it."
+          : "Autosave failed: " + (e.message || "unknown error"), "bad");
+    }
+  }, 1200);
+}
+async function submitPatientRemote(id, body){ return mergePatient(await api("POST", "/api/patients/" + encodeURIComponent(id) + "/submit", body || {})); }
+async function lockPatientRemote(id, body){ return mergePatient(await api("POST", "/api/patients/" + encodeURIComponent(id) + "/lock", body || {})); }
+async function deletePatientRemote(id){ return api("DELETE", "/api/patients", { id }); }
+
+/* Soft check-out when a case file is opened / closed. Claiming is best-effort: if
+   someone else holds it the file still opens (read-mostly) - the server refuses the
+   other party's saves regardless - but we warn so it isn't a surprise. */
+async function claimCaseFile(id){
+  if(!S.backend || !id) return;
+  try{
+    const r = await checkoutPatientRemote(id);
+    if(r && r.patient) mergePatient(r.patient);
+    if(r && r.ok === false){
+      toast("This file is being edited by " + (r.lockedBy || "someone else") +
+            ". You can view it, but saving is blocked until they close it.", "bad");
+    }
+  }catch(e){ /* a failed claim must not stop the file opening */ }
+}
+async function unclaimCaseFile(id){
+  if(!S.backend || !id) return;
+  try{ await releasePatientRemote(id); }catch(e){}
+}
 
 /* Drafts are deliberately separate from the record store: they are one person's
    unfinished screen, not data anyone else should ever see or sync. */
@@ -11293,9 +11415,9 @@ function loadDrafts(){
 
 function logAction(action, opts){
   opts = opts || {};
+  const locationId = opts.locationId || (S.me && S.me.locationId) || null;
   S.db.logs.unshift({
-    id:uid("log"), timestamp:nowISO(), action,
-    locationId: opts.locationId || (S.me && S.me.locationId) || null,
+    id:uid("log"), timestamp:nowISO(), action, locationId,
     userName: (S.me && S.me.name) || "unknown",
     role: (S.me && S.me.role) || "unknown",
     stateChanges: opts.stateChanges || "",
@@ -11303,11 +11425,20 @@ function logAction(action, opts){
     highPriority: !!opts.highPriority
   });
   commit();
+  // Persist to the shared, append-only audit log. The server stamps who and when.
+  if(S.backend){
+    api("POST", "/api/audit", { action, stateChanges:opts.stateChanges || "", comments:opts.comments || "",
+      locationId, highPriority:!!opts.highPriority }).catch(() => {});
+  }
 }
 function notify(text, forRoles, forUserIds, locationId){
   S.db.notifications.unshift({ id:uid("ntf"), ts:nowISO(), text,
     forRoles:forRoles||[], forUserIds:forUserIds||[], locationId:locationId||null, read:false });
   commit();
+  if(S.backend){
+    api("POST", "/api/notifications", { text, forRoles:forRoles||[], forUserIds:forUserIds||[],
+      locationId:locationId||null }).catch(() => {});
+  }
 }
 /* A product-order request has just been raised. Notify the admins and warehouse
    managers in-app, record it in the audit log, and - when a backend is present - ask
@@ -11913,6 +12044,18 @@ async function boot(){
 
   if(me){
     S.me = me;
+    // Signed in against a live backend: replace the local/seed data with the shared
+    // database from SharePoint. On failure, keep the local db and say so, rather than
+    // leaving a blank app.
+    if(S.backend){
+      try{
+        // Expiry is a server-side transition now: run it, then load the shared db so
+        // the snapshot already reflects anything that just expired.
+        await api("POST", "/api/devices/apply-expiry").catch(() => {});
+        S.db = await loadRemoteStore();
+      }
+      catch(e){ toast("Could not load live data from the server: " + (e.message || "unknown error"), "bad"); }
+    }
     return enterApp();
   }
   // No server session. Fall back to a previously chosen local identity.
@@ -12839,39 +12982,67 @@ function submitArrival(){
 
   const target = loc(AR.siteId);
   const before = d.status;
-  d.locationId = AR.siteId;
-  d.condition  = AR.compromised ? "COMPROMISED" : "OK";
-  d.status     = AR.compromised ? "REJECTED" : (target.type === "WAREHOUSE" ? "IN_WH" : "IN_SITE");
+  const siteId = AR.siteId;
+  /* Snapshot the form now: resetArrival() below wipes AR, and the backend path
+     touches this after an await. */
+  const compromised = AR.compromised, note = AR.compromiseNote, idHandEntered = AR.idHandEntered;
+  const checks = Object.assign({}, AR.checks), scannedCode = AR.scannedCode || null, receiver = r;
 
-  logAction("Arrival & condition verification completed for " + d.ref, {
-    locationId:AR.siteId,
-    stateChanges: DEV_STATUS[before].label + " → " + DEV_STATUS[d.status].label,
-    comments: (AR.compromised ? ("COMPROMISED: " + AR.compromiseNote) : "All four checks passed") +
-              (AR.idHandEntered ? " | IDENTIFIER HAND-ENTERED, not scanned" : " | identifier scanned"),
-    highPriority: AR.compromised || AR.idHandEntered
-  });
-  if(AR.compromised){
-    notify("Compromised unit reported: " + d.ref + " (" + devName(d) + ") at " + target.name +
-           " — " + AR.compromiseNote, ["ADMIN","WH_ADMIN"], [], AR.siteId);
+  function recordArrival(dev){
+    logAction("Arrival & condition verification completed for " + dev.ref, {
+      locationId:siteId,
+      stateChanges: DEV_STATUS[before].label + " → " + DEV_STATUS[dev.status].label,
+      comments: (compromised ? ("COMPROMISED: " + note) : "All four checks passed") +
+                (idHandEntered ? " | IDENTIFIER HAND-ENTERED, not scanned" : " | identifier scanned"),
+      highPriority: compromised || idHandEntered
+    });
+    if(compromised){
+      notify("Compromised unit reported: " + dev.ref + " (" + devName(dev) + ") at " + target.name +
+             " — " + note, ["ADMIN","WH_ADMIN"], [], siteId);
+    }
+    queueBackup(target.name + "/Condition_Reports", "arrival_" + dev.ref + "_" + Date.now() + ".json", {
+      type:"ARRIVAL_CONDITION_REPORT", device:{ id:dev.id, ref:dev.ref, sn:dev.sn, mfgDate:dev.mfgDate,
+      product:devName(dev), expiration:dev.expiration }, location:target.name, checks:checks,
+      compromised:compromised, compromiseNote:note, receiver:receiver,
+      identifierSource: idHandEntered ? "HAND_ENTERED" : "SCANNED",
+      scannedCode: scannedCode,
+      verifiedBy:S.me.email, verifiedAt:nowISO()
+    });
   }
-  queueBackup(target.name + "/Condition_Reports", "arrival_" + d.ref + "_" + Date.now() + ".json", {
-    type:"ARRIVAL_CONDITION_REPORT", device:{ id:d.id, ref:d.ref, sn:d.sn, mfgDate:d.mfgDate, product:devName(d),
-    expiration:d.expiration }, location:target.name, checks:AR.checks,
-    compromised:AR.compromised, compromiseNote:AR.compromiseNote, receiver:r,
-    identifierSource: AR.idHandEntered ? "HAND_ENTERED" : "SCANNED",
-    scannedCode: AR.scannedCode || null,
-    verifiedBy:S.me.email, verifiedAt:nowISO()
-  });
-  commit();
-  toast(AR.compromised ? "Recorded as REJECTED and escalated." : "Checked in — now usable stock.",
-        AR.compromised ? "bad" : "good");
-  /* The outcome is kept on screen rather than vanishing with the toast. */
-  const wasManual = AR.idHandEntered;
-  resetArrival();
-  AR.done = { ref:d.ref, product:devName(d), location:target.name, status:d.status,
-              rejected:!!AR.compromised || d.status === "REJECTED", handEntered:wasManual };
-  AR.done.rejected = d.status === "REJECTED";
-  saveDrafts(); renderNav(); render();
+  function finishArrival(dev){
+    commit();
+    toast(dev.status === "REJECTED" ? "Recorded as REJECTED and escalated." : "Checked in — now usable stock.",
+          dev.status === "REJECTED" ? "bad" : "good");
+    resetArrival();
+    AR.done = { ref:dev.ref, product:devName(dev), location:target.name, status:dev.status,
+                rejected:dev.status === "REJECTED", handEntered:idHandEntered };
+    saveDrafts(); renderNav(); render();
+  }
+
+  if(S.backend){
+    /* The server sets the condition, status and location and owns the ETag. */
+    (async () => {
+      try{
+        const out = await api("POST", "/api/devices/" + encodeURIComponent(d.id) + "/verify-arrival",
+          { siteId, compromised, note });
+        const i = S.db.devices.findIndex(x => x.id === out.device.id);
+        if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
+        recordArrival(out.device);
+        finishArrival(out.device);
+      }catch(e){
+        try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+        showWhy("ar-why", e.message || "Check-in was refused by the server.");
+        renderNav(); render();
+      }
+    })();
+    return;
+  }
+
+  d.locationId = siteId;
+  d.condition  = compromised ? "COMPROMISED" : "OK";
+  d.status     = compromised ? "REJECTED" : (target.type === "WAREHOUSE" ? "IN_WH" : "IN_SITE");
+  recordArrival(d);
+  finishArrival(d);
 }
 
 /* =========================================== 2. CLINICAL PROCEDURE WORKFLOW */
@@ -13123,7 +13294,7 @@ VIEWS.screening = {
         stateChanges: cb.dataset.scr + " = " + (cb.checked ? "received" : "not received") +
           (before === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
         comments:"Patient " + p.patientCode });
-      commit(); renderKeepingPlace(); flashSaved();
+      commit(); schedulePatientSave(p); renderKeepingPlace(); flashSaved();
     });
 
     /* Every stage field writes straight through, then the status is re-derived. */
@@ -13191,6 +13362,7 @@ VIEWS.screening = {
             (before.status === p.status ? "" : "; status → " + PT_STATUS[p.status].label),
           comments:"Patient " + p.patientCode });
         commit();
+        schedulePatientSave(p);
         flashSaved();
         /* These three can unlock a later stage or change a summary line, so the view
            is rebuilt - but in place. */
@@ -13227,7 +13399,7 @@ VIEWS.screening = {
             comments:"Patient " + p.patientCode + " — " + why + " | incomplete: " + incomplete.join("; ") });
           notify("Anatomical evaluation override for " + p.patientCode + " by " + S.me.name +
                  " — " + why, ["ADMIN","CPM"], [], p.siteId);
-          commit(); closeModal(); renderKeepingPlace();
+          commit(); schedulePatientSave(p); closeModal(); renderKeepingPlace();
       };
     };
 
@@ -13237,7 +13409,7 @@ VIEWS.screening = {
       p.status = recomputeWorkflow(p);
       logAction("Patient resumed after cancellation", { locationId:p.siteId,
         stateChanges:"→ " + PT_STATUS[p.status].label, comments:"Patient " + p.patientCode });
-      commit(); renderKeepingPlace();
+      commit(); schedulePatientSave(p); renderKeepingPlace();
     };
   }
 };
@@ -13668,11 +13840,12 @@ VIEWS.clinical = {
   },
   wire(){
     const ss = $("#site-sel");
-    if(ss) ss.onchange = e => { SITEID = e.target.value || null; PID = null; render(); };
+    if(ss) ss.onchange = e => { const prev = PID; SITEID = e.target.value || null; PID = null; unclaimCaseFile(prev); render(); };
     const sel = $("#pt-sel");
-    if(sel) sel.onchange = e => { PID = e.target.value || null; render(); };
+    if(sel) sel.onchange = e => { const prev = PID; PID = e.target.value || null;
+      if(prev && prev !== PID) unclaimCaseFile(prev); if(PID) claimCaseFile(PID); render(); };
     const ch = $("#pt-change");
-    if(ch) ch.onclick = () => { PID = null; render(); };
+    if(ch) ch.onclick = () => { const prev = PID; PID = null; unclaimCaseFile(prev); render(); };
 
     /* The rail scrolls rather than hides: the operator can still see the whole file
        in one pass, which is what makes this efficient during a live procedure. */
@@ -13786,6 +13959,7 @@ VIEWS.clinical = {
         p.customQuestions[+t.dataset.cq].a = t.value;
       }else return;
       commit(); flash(); recalc();
+      scheduleCaseFileSave(p);
       if(structural) render();
     }
     const ma = $("#mark-all");
@@ -13793,7 +13967,7 @@ VIEWS.clinical = {
       const cur = cf(p).training || [];
       const all = cur.filter(Boolean).length === TRAINING_ITEMS.length;
       cf(p).training = TRAINING_ITEMS.map(() => !all);
-      commit(); render();
+      commit(); scheduleCaseFileSave(p); render();
     };
     const sv = $("#pt-save");   if(sv) sv.onclick = () => saveDraft(p);
     const sb = $("#pt-submit"); if(sb) sb.onclick = () => submitCase(p);
@@ -13853,9 +14027,15 @@ function outstandingList(p){
 }
 
 /* An explicit user save. Always succeeds, however much is still blank. */
-function saveDraft(p){
+async function saveDraft(p){
   commit();
   const m = missingForSubmit(p);
+  if(S.backend){
+    clearTimeout(_cfTimer);        // we are flushing now, cancel the pending debounce
+    try{ await saveCaseFileRemote(p.id, p.caseFile || {}, p.customQuestions || []); }
+    catch(e){ toast("Could not save to the server: " + (e.message || ""), "bad"); }
+    try{ await releasePatientRemote(p.id); }catch(_){}   // let go of the soft check-out
+  }
   logAction("Case file saved as a draft for " + p.patientCode, { locationId:p.siteId,
     stateChanges: m.length ? m.length + " item(s) still outstanding" : "complete, not yet submitted" });
   toast(m.length ? "Saved. " + m.length + " item(s) still outstanding." : "Saved.", "good");
@@ -13863,7 +14043,7 @@ function saveDraft(p){
   render();
 }
 
-function submitCase(p){
+async function submitCase(p){
   const c = cf(p);
   const m = missingForSubmit(p);
   if(m.length){
@@ -13873,15 +14053,29 @@ function submitCase(p){
     return;
   }
   clearWhy("pt-why");
+  const cancelled = c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED";
+  const newStatus = cancelled && p.status !== "CANCELLED" ? "CANCELLED" : p.status;
+
+  const logSubmit = () => {
+    if(cancelled && p.status === "CANCELLED") logAction("Procedure cancelled for " + p.patientCode,
+      { locationId:p.siteId, stateChanges:"→ Cancelled", highPriority:true });
+    logAction("Case file submitted for " + p.patientCode, { locationId:p.siteId,
+      stateChanges:"submitted = true", comments:"Editable until the final permanent lock" });
+  };
+
+  if(S.backend){
+    clearTimeout(_cfTimer);
+    try{
+      await submitPatientRemote(p.id, { status:newStatus, caseFile:p.caseFile || {}, customQuestions:p.customQuestions || [] });
+    }catch(e){ return showWhy("pt-why", e.message || "Submit failed on the server."); }
+    logSubmit();
+    toast("Case file submitted. Still editable until locked.", "good"); render();
+    return;
+  }
 
   p.submitted = true;
-  if(c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED" && p.status !== "CANCELLED"){
-    p.status = "CANCELLED";
-    logAction("Procedure cancelled for " + p.patientCode, { locationId:p.siteId,
-      stateChanges:"→ Cancelled", highPriority:true });
-  }
-  logAction("Case file submitted for " + p.patientCode, { locationId:p.siteId,
-    stateChanges:"submitted = true", comments:"Editable until the final permanent lock" });
+  if(newStatus === "CANCELLED") p.status = "CANCELLED";
+  logSubmit();
   commit(); toast("Case file submitted. Still editable until locked.", "good"); render();
 }
 function lockCase(p){
@@ -13899,12 +14093,24 @@ function lockCase(p){
     whyBox("lk-why"),
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn btn-dark" id="lk-go">Lock permanently</button></div>');
-  $("#lk-go").onclick = () => {
+  $("#lk-go").onclick = async () => {
     const typed = ($("#lk-code").value || "").trim();
     if(typed.toUpperCase() !== String(p.patientCode).toUpperCase())
       return showWhy("lk-why", "That does not match. Type " + p.patientCode + " exactly.");
-    p.fileLocked = true;
-    if(p.status !== "CANCELLED") p.status = "TREATED";
+    const status = p.status === "CANCELLED" ? "CANCELLED" : "TREATED";
+
+    if(S.backend){
+      const btn = $("#lk-go"); btn.disabled = true;
+      clearTimeout(_cfTimer);
+      try{
+        try{ await saveCaseFileRemote(p.id, p.caseFile || {}, p.customQuestions || []); }catch(_){}
+        Object.assign(p, await lockPatientRemote(p.id, { status }));   // server makes it terminal
+      }catch(e){ btn.disabled = false; return showWhy("lk-why", e.message || "Could not lock on the server."); }
+    }else{
+      p.fileLocked = true;
+      if(p.status !== "CANCELLED") p.status = "TREATED";
+    }
+
     queueBackup(patientFolder(p),
       "case_" + p.patientCode + "_locked.json",
       { type:"CLINICAL_CASE_FILE", patientCode:p.patientCode, site:locName(p.siteId),
@@ -14204,12 +14410,9 @@ function doShip(){
   const units = lines.length ? lines.map(l => device(l.deviceId)).filter(Boolean) : [d];
   const packId = units.length > 1 ? "MP-" + Date.now().toString(36).toUpperCase() : "";
 
-  units.forEach(u => {
-    const before = u.status;
-    u.status = "ON_WAY"; u.locationId = to;
-    u.shippedBy = shipper; u.shippedFromId = from; u.shippedAt = at;
-    if(packId) u.masterPackId = packId;
-
+  /* The audit line and the permanent archive record for one shipped unit. Identical
+     whether the state change happened locally or on the server, so both paths call it. */
+  function recordShipment(u, before){
     logAction("Shipped " + u.ref + " (" + devName(u) + ") to " + locName(to), {
       locationId: from,
       stateChanges: DEV_STATUS[before].label + " → In Transit",
@@ -14230,24 +14433,76 @@ function doShip(){
       fifoOverride:bypassing, overrideReason: bypassing ? SH.reason : null,
       overrideInitials: bypassing ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
     });
-  });
+  }
+  function finishShip(){
+    notify("Shipment inbound: " + units.map(u => devName(u) + " (" + u.ref + ")").join(", ") +
+           " from " + locName(from) + ", shipped by " + shipper + ".",
+           ["ADMIN","CPM","EMPLOYEE"], [], to);
+    commit();
+    /* Amber, not red: an override shipment succeeded, it just carries a note. */
+    toast(bypassing ? "Sent, with the override recorded."
+                    : units.length > 1 ? "Sent — " + units.length + " units in one carton." : "Sent.",
+          bypassing ? "warn" : "good");
+    resetShip(); renderNav(); render();
+  }
 
-  notify("Shipment inbound: " + units.map(u => devName(u) + " (" + u.ref + ")").join(", ") +
-         " from " + locName(from) + ", shipped by " + shipper + ".",
-         ["ADMIN","CPM","EMPLOYEE"], [], to);
-  commit();
-  /* Amber, not red: an override shipment succeeded, it just carries a note. */
-  toast(bypassing ? "Sent, with the override recorded."
-                  : units.length > 1 ? "Sent — " + units.length + " units in one carton." : "Sent.",
-        bypassing ? "warn" : "good");
-  resetShip(); renderNav(); render();
+  if(S.backend){
+    /* The server enforces FIFO/override/transitions and owns the ETag, so each unit
+       ships through the API; the local state is updated from what it returns. Units
+       ship sequentially - the FIFO pick shipping first makes the next unit the pick. */
+    const overrideReason = bypassing ? (SH.initials.trim().toUpperCase() + ": " + SH.reason) : undefined;
+    (async () => {
+      let done = 0;
+      try{
+        for(const u of units){
+          const before = u.status;
+          const out = await api("POST", "/api/devices/" + encodeURIComponent(u.id) + "/ship", {
+            destinationId: to, shipperName: shipper, masterPackId: packId || null,
+            override: bypassing, overrideReason
+          });
+          const i = S.db.devices.findIndex(x => x.id === out.device.id);
+          if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
+          recordShipment(out.device, before);
+          done++;
+        }
+        finishShip();
+      }catch(e){
+        // Re-sync from the server so the screen reflects any units that did ship.
+        try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+        showWhy("sh-why", (e.message || "The shipment was refused.") +
+          (done ? " (" + done + " of " + units.length + " already sent)" : ""));
+        renderNav(); render();
+      }
+    })();
+    return;
+  }
+
+  units.forEach(u => {
+    const before = u.status;
+    u.status = "ON_WAY"; u.locationId = to;
+    u.shippedBy = shipper; u.shippedFromId = from; u.shippedAt = at;
+    if(packId) u.masterPackId = packId;
+    recordShipment(u, before);
+  });
+  finishShip();
 }
 
 /* ============================== DELIVERY REPORTED BY A NON-EMPLOYEE ======= */
-function showDelivery(){
+async function showDelivery(){
   $("#app").hidden = true; $("#login").hidden = true; $("#delivery").hidden = false;
-  if(!S.db) S.db = loadDB();
   const b = $("#delivery-body");
+
+  /* The courier may not be signed in, so in backend mode the site list comes from
+     the public endpoint; standalone uses the local db. */
+  let locList = [];
+  if(S.backend){
+    try{ locList = await api("GET", "/api/public/locations"); }catch(e){ locList = []; }
+  }else{
+    if(!S.db) S.db = loadDB();
+    locList = S.db.locations;
+  }
+  const siteById = id => locList.find(l => l.id === id) || null;
+
   b.innerHTML =
     '<div class="login-h"><h1>Report a delivery</h1>' +
       '<p>One short screen. You do not need an account.</p></div>' +
@@ -14256,7 +14511,7 @@ function showDelivery(){
       '<div class="hint">Printed on the box, next to the QR code.</div></div>' +
     '<div class="field"><label class="req" for="dl-site">Which site are you at?</label><select id="dl-site">' +
       '<option value="">— choose —</option>' +
-      S.db.locations.map(l => '<option value="' + l.id + '">' + esc(l.name) + '</option>').join("") +
+      locList.map(l => '<option value="' + l.id + '">' + esc(l.name) + '</option>').join("") +
       '</select></div>' +
     '<div class="grid g2"><div class="field"><label class="req" for="dl-name">Your name</label>' +
       '<input type="text" id="dl-name" autocomplete="name"></div>' +
@@ -14268,19 +14523,48 @@ function showDelivery(){
     '<a href="#" id="dl-back" class="btn btn-block">Back to sign-in</a>';
 
   $("#dl-back").onclick = e => { e.preventDefault(); location.hash = ""; showLogin(); };
-  $("#dl-go").onclick = () => {
+
+  /* The recipient sees exactly one instruction and nothing else. */
+  function confirmScreen(site, matched){
+    site = site || {};
+    b.innerHTML =
+      '<div class="login-h"><h1>Thank you</h1></div>' +
+      '<div class="note" style="font-size:14px"><b>This is an Innoventric product.</b> ' +
+        'Please keep it at room temperature and notify the cath lab team that it has arrived.</div>' +
+      '<div class="card" style="margin:0"><div class="card-bd">' +
+        '<div class="kv"><b>Site</b> ' + esc(site.name || "") + '</div>' +
+        '<div class="kv"><b>Address</b> ' + esc(site.address || "") + '</div>' +
+        '<div class="kv"><b>Contact</b> ' + esc(site.contact || "") + '</div>' +
+        '<div class="kv"><b>Phone</b> ' + esc(site.phone || "") + '</div>' +
+        '<div class="kv"><b>Email</b> ' + esc(site.email || "") + '</div>' +
+      '</div></div>' +
+      (matched ? "" : '<div class="warn" style="margin-top:10px">We could not match that product ID ' +
+        'to a unit we were expecting. The site team has been alerted to check it by hand — ' +
+        'you do not need to do anything else.</div>') +
+      '<button class="btn btn-block" id="dl-again" style="margin-top:12px">Report another delivery</button>';
+    $("#dl-again").onclick = showDelivery;
+  }
+
+  $("#dl-go").onclick = async () => {
     const ref = $("#dl-ref").value.trim(), siteId = $("#dl-site").value;
     const name = $("#dl-name").value.trim(), phone = $("#dl-phone").value.trim();
-    const why = $("#dl-why");
     if(!ref || !siteId || !name || !phone) return showWhy("dl-why", "Every field is required.");
     clearWhy("dl-why");
-    const site = loc(siteId);
-    const d = findDeviceByCode(ref);
 
-    /* An unrecognised reference used to fall through this whole block, recording
-       nothing at all, while the confirmation screen still told the courier the team
-       had been notified. A device had physically arrived and the system did not know.
-       Both branches now write a notification, an audit line and a backup record. */
+    if(S.backend){
+      /* The public route matches the unit and, if found, marks it DELIVERED. The
+         team alert and archive record follow with the notifications stage. */
+      const go = $("#dl-go"); go.disabled = true;
+      try{
+        const out = await api("POST", "/api/deliveries/report", { code:ref, siteId });
+        confirmScreen(out.site || siteById(siteId), !!out.matched);
+      }catch(e){ go.disabled = false; showWhy("dl-why", e.message || "Could not report the delivery."); }
+      return;
+    }
+
+    // ---- standalone (local) ----
+    const site = siteById(siteId);
+    const d = findDeviceByCode(ref);
     if(!d){
       S.db.notifications.unshift({ id:uid("ntf"), ts:nowISO(),
         text:"Delivery reported at " + site.name + " for an UNRECOGNISED product ID “" + ref +
@@ -14298,7 +14582,6 @@ function showDelivery(){
         ts:nowISO(), synced:false, syncNote:"Queued" });
       saveDB(S.db);
     }
-
     if(d){
       d.locationId = siteId;
       /* Deliberately NOT usable stock: this person performs none of the sterile
@@ -14322,23 +14605,7 @@ function showDelivery(){
         ts:nowISO(), synced:false, syncNote:"Queued" });
       saveDB(S.db);
     }
-    /* The recipient sees exactly one instruction and nothing else. */
-    b.innerHTML =
-      '<div class="login-h"><h1>Thank you</h1></div>' +
-      '<div class="note" style="font-size:14px"><b>This is an Innoventric product.</b> ' +
-        'Please keep it at room temperature and notify the cath lab team that it has arrived.</div>' +
-      '<div class="card" style="margin:0"><div class="card-bd">' +
-        '<div class="kv"><b>Site</b> ' + esc(site.name) + '</div>' +
-        '<div class="kv"><b>Address</b> ' + esc(site.address) + '</div>' +
-        '<div class="kv"><b>Contact</b> ' + esc(site.contact) + '</div>' +
-        '<div class="kv"><b>Phone</b> ' + esc(site.phone) + '</div>' +
-        '<div class="kv"><b>Email</b> ' + esc(site.email) + '</div>' +
-      '</div></div>' +
-      (d ? "" : '<div class="warn" style="margin-top:10px">We could not match that product ID ' +
-        'to a unit we were expecting. The site team has been alerted to check it by hand — ' +
-        'you do not need to do anything else.</div>') +
-      '<button class="btn btn-block" id="dl-again" style="margin-top:12px">Report another delivery</button>';
-    $("#dl-again").onclick = showDelivery;
+    confirmScreen(site, !!d);
   };
 }
 
@@ -14503,7 +14770,13 @@ VIEWS.alerts = {
   },
   wire(){
     const b = $("#mark-read");
-    if(b) b.onclick = () => { myAlerts().forEach(n => n.read = true); commit(); renderNav(); render(); };
+    if(b) b.onclick = () => {
+      const mine = myAlerts().filter(n => !n.read);
+      mine.forEach(n => n.read = true); commit(); renderNav(); render();
+      if(S.backend && mine.length){
+        api("POST", "/api/notifications/read", { ids: mine.map(n => n.id) }).catch(() => {});
+      }
+    };
   }
 };
 
@@ -14533,6 +14806,7 @@ VIEWS.patients = {
     $$("[data-open]").forEach(b => b.onclick = () => {
       const p = patient(b.dataset.open);
       SITEID = p.siteId; PID = p.id;      // pre-fills both steps of the chooser
+      claimCaseFile(p.id);
       S.view = "clinical"; renderNav(); render();
     });
     $$("[data-edit]").forEach(b => b.onclick = () => patientForm(patient(b.dataset.edit)));
@@ -14542,7 +14816,12 @@ VIEWS.patients = {
         'This cannot be undone.</p>',
         '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
         '<button class="btn btn-danger" id="d-go">Delete</button></div>');
-      $("#d-go").onclick = () => {
+      $("#d-go").onclick = async () => {
+        if(S.backend){
+          const btn = $("#d-go"); btn.disabled = true;
+          try{ await deletePatientRemote(p.id); }
+          catch(e){ btn.disabled = false; return toast(e.message || "Could not delete on the server.", "bad"); }
+        }
         S.db.patients = S.db.patients.filter(x => x.id !== p.id);
         logAction("Deleted patient " + p.patientCode, { locationId:p.siteId, highPriority:true });
         commit(); closeModal(); render();
@@ -14641,7 +14920,7 @@ function patientFormRender(p, isNew){
     keep(); PFR.splice(+b.dataset.rdel, 1); redraw(); });
 
   $("#p-u").onchange = e => { $("#p-ds").value = dsForUnica(e.target.value); };
-  $("#p-save").onclick = () => {
+  $("#p-save").onclick = async () => {
     keep();
     const code = $("#p-code").value.trim();
     if(!code) return showWhy("p-why", "A patient code is required.");
@@ -14660,12 +14939,29 @@ function patientFormRender(p, isNew){
     p.reminders = PFR.filter(r => String(r.text).trim())
                      .map(r => ({ date:r.date || "", text:r.text.trim(), done:!!r.done }));
     if(!p.images) p.images = [];
-    if(isNew){ S.db.patients.push(p); logAction("Registered patient " + code, { locationId:p.siteId,
-      stateChanges:"→ " + PT_STATUS[p.status].label,
-      comments:p.customQuestions.length + " medical question(s), " +
-               p.reminders.length + " reminder(s)" }); }
-    else logAction("Edited patient " + code, { locationId:p.siteId,
-      stateChanges: before === p.status ? "" : PT_STATUS[before].label + " → " + PT_STATUS[p.status].label });
+    const logSave = () => isNew
+      ? logAction("Registered patient " + code, { locationId:p.siteId,
+          stateChanges:"→ " + PT_STATUS[p.status].label,
+          comments:p.customQuestions.length + " medical question(s), " + p.reminders.length + " reminder(s)" })
+      : logAction("Edited patient " + code, { locationId:p.siteId,
+          stateChanges: before === p.status ? "" : PT_STATUS[before].label + " → " + PT_STATUS[p.status].label });
+
+    if(S.backend){
+      const btn = $("#p-save"); btn.disabled = true;
+      try{
+        await savePatientRemote(p);            // creates or updates, merges into S.db
+        logSave(); closeModal(); toast("Saved.", "good"); render();
+      }catch(e){
+        btn.disabled = false;
+        showWhy("p-why", e.code === "CONFLICT"
+          ? "This patient was changed by someone else. Close and reopen it, then retry."
+          : (e.message || "Could not save to the server."));
+      }
+      return;
+    }
+
+    if(isNew) S.db.patients.push(p);
+    logSave();
     commit(); closeModal(); toast("Saved.", "good"); render();
   };
 }
@@ -14778,23 +15074,40 @@ VIEWS.admin = {
     $$("[data-ld]").forEach(b => b.onclick = () => removeLoc(loc(b.dataset.ld)));
 
     const ig = $("#imp-go");
-    if(ig) ig.onclick = () => {
+    if(ig) ig.onclick = async () => {
       const lines = $("#imp").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-      let ok = 0, bad = 0;
+      const rows = []; let badFormat = 0;
       for(const line of lines){
         const [pt,size,ref,sn,lname,exp] = line.split(",").map(s => (s||"").trim());
         const l = S.db.locations.find(x => x.name === lname);
         const prod = PRODUCTS.find(p => p.key === pt);
-        if(!prod || !prod.sizes.includes(size) || !ref || !l || !/^\d{4}-\d{2}-\d{2}$/.test(exp||"")){ bad++; continue; }
-        S.db.devices.push({ id:uid("dev"), sn:sn||"", ref, productType:pt, size,
+        if(!prod || !prod.sizes.includes(size) || !ref || !l || !/^\d{4}-\d{2}-\d{2}$/.test(exp||"")){ badFormat++; continue; }
+        rows.push({ id:uid("dev"), sn:sn||"", ref, productType:pt, size,
           locationId:l.id, status:l.type === "WAREHOUSE" ? "IN_WH" : "IN_SITE",
           expiration:exp, condition:"OK", shippedBy:null, shippedFromId:null, shippedAt:null });
-        ok++;
       }
-      logAction("Bulk device import", { stateChanges:ok + " added, " + bad + " rejected" });
+
+      if(S.backend){
+        const btn = $("#imp-go"); btn.disabled = true;
+        try{
+          const out = await api("POST", "/api/devices/import", { devices: rows });
+          try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+          const rejected = (out.failed || 0) + badFormat;
+          logAction("Bulk device import", { stateChanges: out.created + " added, " + rejected + " rejected" });
+          showWhy("imp-why", rejected ? (rejected + " line(s) rejected, " + out.created +
+            " imported. Check the format of the rejected lines.") : "");
+          toast(out.created + " device(s) imported.", rejected ? "bad" : "good");
+          render();
+        }catch(e){ btn.disabled = false; showWhy("imp-why", e.message || "Import failed on the server."); }
+        return;
+      }
+
+      let ok = 0;
+      for(const r of rows){ S.db.devices.push(r); ok++; }
+      logAction("Bulk device import", { stateChanges:ok + " added, " + badFormat + " rejected" });
       commit();
-      showWhy("imp-why", bad ? (bad + " line(s) rejected, " + ok + " imported. Check the format of the rejected lines.") : "");
-      toast(ok + " device(s) imported.", bad ? "bad" : "good");
+      showWhy("imp-why", badFormat ? (badFormat + " line(s) rejected, " + ok + " imported. Check the format of the rejected lines.") : "");
+      toast(ok + " device(s) imported.", badFormat ? "bad" : "good");
       render();
     };
   }
@@ -14904,18 +15217,41 @@ function locForm(l){
     '<button class="btn btn-primary" id="l-save">' + (isNew ? "Add" : "Save") + '</button>' +
     '</div>' + whyBox("l-why"));
 
-  $("#l-save").onclick = () => {
+  $("#l-save").onclick = async () => {
     const name = $("#l-n").value.trim();
     if(!name) return showWhy("l-why", "A name is required.");
     Object.assign(l, { name, type:$("#l-t").value, address:$("#l-a").value.trim(),
       contact:$("#l-c").value.trim(), phone:$("#l-p").value.trim(),
       email:$("#l-e").value.trim(), cpmUserId:$("#l-cpm").value || null });
+
+    if(S.backend){
+      /* Live database: the server writes the Lists row and returns it with a fresh
+         ETag. Send the ETag we last read so a concurrent edit is refused (409/412)
+         rather than silently overwritten. */
+      const btn = $("#l-save"); btn.disabled = true;
+      try{
+        const saved = await api("PUT", "/api/locations", {
+          id:l.id, name:l.name, type:l.type, address:l.address, contact:l.contact,
+          phone:l.phone, email:l.email, cpmUserId:l.cpmUserId, _etag:l._etag });
+        const i = S.db.locations.findIndex(x => x.id === saved.id);
+        if(i >= 0) S.db.locations[i] = saved; else S.db.locations.push(saved);
+        logAction((isNew ? "Added " : "Edited ") + "location " + name, { locationId:saved.id });
+        closeModal(); toast("Saved.", "good"); render();
+      }catch(e){
+        btn.disabled = false;
+        showWhy("l-why", e.code === "PRECONDITION_FAILED"
+          ? "Someone else changed this location. Close and reopen it to see their version, then retry."
+          : (e.message || "Could not save to the server."));
+      }
+      return;
+    }
+
     if(isNew) S.db.locations.push(l);
     logAction((isNew ? "Added " : "Edited ") + "location " + name, { locationId:l.id });
     commit(); closeModal(); toast("Saved.", "good"); render();
   };
 }
-function removeLoc(l){
+async function removeLoc(l){
   /* Referential guard: a location still holding anything cannot be deleted. */
   const d = S.db.devices.filter(x => x.locationId === l.id).length;
   const p = S.db.patients.filter(x => x.siteId === l.id).length;
@@ -14923,6 +15259,17 @@ function removeLoc(l){
   if(d || p || u)
     return toast("Still assigned: " + d + " device(s), " + p + " patient(s), " + u +
                  " user(s). Reassign them first.", "bad");
+
+  if(S.backend){
+    try{
+      await api("DELETE", "/api/locations", { id:l.id });
+      S.db.locations = S.db.locations.filter(x => x.id !== l.id);
+      logAction("Removed location " + l.name, { highPriority:true });
+      toast("Removed.", "good"); render();
+    }catch(e){ toast(e.message || "Could not remove on the server.", "bad"); }
+    return;
+  }
+
   S.db.locations = S.db.locations.filter(x => x.id !== l.id);
   logAction("Removed location " + l.name, { highPriority:true });
   commit(); render();
