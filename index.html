@@ -11243,7 +11243,7 @@ function seed(){
     { id:uid("bkp"), path:"Innoventric WH — Israel/Inventory_Logs",   filename:"shipment_dev-1011.json",  content:"{}", ts:nowISO(), synced:false, syncNote:"Queued — no backend reachable" }
   ];
   return { version:SCHEMA_VERSION, users:U, locations:L, devices:D, patients:P,
-           logs:G, notifications:N, backupQueue:B };
+           logs:G, notifications:N, notifyRecipients:[], backupQueue:B };
 }
 
 /* Structural + referential validation. A half-migrated clinical store is worse
@@ -11311,6 +11311,7 @@ async function loadRemoteStore(){
     patients:      j.patients      || [],
     logs:          j.logs          || [],
     notifications: j.notifications || [],
+    notifyRecipients: j.notifyRecipients || [],
     backupQueue:   j.backupQueue   || []
   };
 }
@@ -15010,13 +15011,42 @@ VIEWS.backup = {
 };
 
 /* ================================================================= ADMIN = */
+/* ---- extra order-notification recipients (admin) ---- */
+function upsertLocalRecipient(r){
+  if(!S.db.notifyRecipients) S.db.notifyRecipients = [];
+  const i = S.db.notifyRecipients.findIndex(x => x.email === r.email);
+  if(i >= 0) S.db.notifyRecipients[i] = r; else S.db.notifyRecipients.push(r);
+}
+async function saveNotifyRecipient(email, label, active){
+  email = String(email || "").trim().toLowerCase();
+  if(!email.includes("@")) return showWhy("nr-why", "A valid email address is required.");
+  clearWhy("nr-why");
+  if(S.backend){
+    try{ upsertLocalRecipient(await api("PUT", "/api/admin/notify-recipients", { email, label, active })); }
+    catch(e){ return showWhy("nr-why", e.message || "Could not save on the server."); }
+  }else{
+    upsertLocalRecipient({ email, label, active });
+  }
+  logAction("Notification recipient " + (active ? "set" : "disabled") + ": " + email);
+  render();
+}
+async function removeNotifyRecipient(email){
+  if(S.backend){
+    try{ await api("DELETE", "/api/admin/notify-recipients", { email }); }
+    catch(e){ return toast(e.message || "Could not remove on the server.", "bad"); }
+  }
+  S.db.notifyRecipients = (S.db.notifyRecipients || []).filter(x => x.email !== email);
+  logAction("Notification recipient removed: " + email);
+  render();
+}
+
 let ADMTAB = "users";
 VIEWS.admin = {
   title:"Administration",
   sub:"Who can sign in, where the study operates, and bulk device import.",
   body(){
     let h = '<div class="row" style="margin-bottom:14px">' +
-      [["users","Users"],["locations","Locations"],["import","Master data import"]].map(([k,l]) =>
+      [["users","Users"],["locations","Locations"],["notify","Notifications"],["import","Master data import"]].map(([k,l]) =>
         '<button class="btn' + (ADMTAB === k ? " btn-dark" : "") + '" data-tab="' + k + '">' +
         esc(l) + '</button>').join("") + '</div>';
 
@@ -15067,6 +15097,29 @@ VIEWS.admin = {
         '<button class="btn btn-primary" id="imp-go">Import</button> ' +
         whyBox("imp-why") + '</div></div>';
     }
+
+    if(ADMTAB === "notify"){
+      const recips = S.db.notifyRecipients || [];
+      h += '<div class="info">These people also receive the <b>product order-request</b> notification email, ' +
+        'in addition to admins and warehouse managers. They do not need an app account.</div>' +
+        '<div class="grid g3" style="margin-bottom:6px">' +
+          '<div class="field"><label class="req" for="nr-email">Email</label>' +
+            '<input type="email" id="nr-email" placeholder="name@example.com"></div>' +
+          '<div class="field"><label for="nr-label">Name (optional)</label><input type="text" id="nr-label"></div>' +
+          '<div class="field" style="align-self:end"><button class="btn btn-primary" id="nr-add">Add recipient</button></div>' +
+        '</div>' + whyBox("nr-why") +
+        (!recips.length ? '<div class="empty">No extra recipients yet.</div>' :
+        '<div class="tbl-wrap"><table><thead><tr><th>Email</th><th>Name</th><th>Status</th><th></th></tr></thead><tbody>' +
+        recips.map(r => '<tr><td class="mono">' + esc(r.email) + '</td>' +
+          '<td>' + esc(r.label || "—") + '</td>' +
+          '<td>' + (r.active !== false ? '<span class="pill p-green">Active</span>'
+                                       : '<span class="pill p-grey">Disabled</span>') + '</td>' +
+          '<td class="row" style="gap:5px">' +
+            '<button class="btn btn-sm" data-nr-toggle="' + esc(r.email) + '">' +
+              (r.active !== false ? "Disable" : "Enable") + '</button>' +
+            '<button class="btn btn-sm btn-danger" data-nr-del="' + esc(r.email) + '">Remove</button>' +
+          '</td></tr>').join("") + '</tbody></table></div>');
+    }
     return h;
   },
   wire(){
@@ -15079,6 +15132,14 @@ VIEWS.admin = {
     const ln = $("#l-new"); if(ln) ln.onclick = () => locForm(null);
     $$("[data-le]").forEach(b => b.onclick = () => locForm(loc(b.dataset.le)));
     $$("[data-ld]").forEach(b => b.onclick = () => removeLoc(loc(b.dataset.ld)));
+
+    const nr = $("#nr-add");
+    if(nr) nr.onclick = () => saveNotifyRecipient($("#nr-email").value, $("#nr-label").value, true);
+    $$("[data-nr-toggle]").forEach(b => b.onclick = () => {
+      const r = (S.db.notifyRecipients || []).find(x => x.email === b.dataset.nrToggle);
+      saveNotifyRecipient(b.dataset.nrToggle, r ? r.label : "", !(r && r.active !== false));
+    });
+    $$("[data-nr-del]").forEach(b => b.onclick = () => removeNotifyRecipient(b.dataset.nrDel));
 
     const ig = $("#imp-go");
     if(ig) ig.onclick = async () => {
