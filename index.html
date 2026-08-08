@@ -12506,17 +12506,15 @@ function dateField(id, label, value){
 }
 
 function homeNavCards(){
-  return '<div class="nav-cards">' + HOME_MODULES.map(m => {
-    const ok = canAccessView(m.key), tag = ok ? "button" : "div";
-    return '<' + tag + ' class="nav-card' + (ok ? '' : ' is-disabled') + '"' +
-      (ok ? ' data-nav="' + m.key + '"'
-          : ' aria-disabled="true" title="You do not have permission to access this module."') + '>' +
+  /* Show only the modules this user may actually open. Previously the inaccessible
+     ones were rendered greyed-out ("No access"); the clearer behaviour is to omit
+     them entirely, so each person sees a home screen of only what they can reach. */
+  return '<div class="nav-cards">' + HOME_MODULES.filter(m => canAccessView(m.key)).map(m =>
+    '<button class="nav-card" data-nav="' + m.key + '">' +
       '<span class="nav-card-ic">' + icon(m.ic) + '</span>' +
       '<span class="nav-card-t">' + esc(m.title) + '</span>' +
       '<span class="nav-card-d">' + esc(m.desc) + '</span>' +
-      (ok ? '' : '<span class="nav-card-lock">No access</span>') +
-      '</' + tag + '>';
-  }).join("") + '</div>';
+    '</button>').join("") + '</div>';
 }
 
 /* Shared cells for a patient table row (Code..Case file), so the Patient Register and
@@ -13683,10 +13681,9 @@ VIEWS.clinical = {
 
     /* ---- Stage 1 ---- */
     h += '<div class="card stage" id="stage-0"><div class="card-hd"><h2><span class="stage-n">1</span>' +
-      'Eligibility &amp; patient matching</h2><span class="saved" id="sv1"></span></div><div class="card-bd">' +
+      'Procedure info</h2><span class="saved" id="sv1"></span></div><div class="card-bd">' +
       '<div class="grid g2">' +
         tf(p,"procDate","Date of procedure","date",{req:true}) +
-        tf(p,"teamNames","Procedure team (names)","text") +
       '</div><div class="grid g4">' +
         tf(p,"proctor","Proctor","text") + tf(p,"tech1","Tech 1st","text") +
         tf(p,"tech2","Tech 2nd","text")  + tf(p,"clinical","Clinical","text") +
@@ -13741,38 +13738,48 @@ VIEWS.clinical = {
         (c.procDate || p.procedureDate ? '' : ' — not set yet, enter it in stage 1.') +
         ' Every field below is hour-only, so nothing is typed twice, and the durations ' +
         'handle a procedure running past midnight.</div>' +
-      '<div class="grid g4">' +
-        tf(p,"deployStart","Deployment initiation","time") + tf(p,"deployEnd","Deployment end","time") +
-        tf(p,"dsIn","DS insertion","time") + tf(p,"dsOut","DS is out","time") +
-      '</div>' +
-      '<div class="grid g2" style="margin-bottom:12px">' +
+      /* Chronological procedure timeline. Order follows how the case actually runs;
+         each event has a free-text note beside it for anything the standard field
+         does not capture. Note fields are ordinary data-cf inputs, so the existing
+         autosave persists them with no extra wiring. */
+      '<h3 style="margin:6px 0 8px">Procedure timeline</h3>' +
+      '<div class="grid g2">' + tf(p,"introducerTime","Introducer insertion time","time") + tf(p,"introducerTimeNote","Notes","text") + '</div>' +
+      '<div class="grid g2">' + tf(p,"actTime","ACT >250s achieved","time") + tf(p,"actTimeNote","Notes","text") + '</div>' +
+      /* IVC pressure PRE - taken before DS insertion. */
+      '<div class="grid g2">' + pressureField(p,"ivcPre","IVC pressure PRE (mmHg)") + tf(p,"ivcPreNote","IVC PRE notes","text") + '</div>' +
+      sourceImages(p, "ivcPre", "IVC pressure PRE") +
+      '<div class="grid g2">' + tf(p,"dsIn","DS insertion","time") + tf(p,"dsInNote","Notes","text") + '</div>' +
+      /* Optional additional PRE measurement, taken before deployment starts. */
+      '<div class="grid g2">' + pressureField(p,"ivcPre2","IVC pressure PRE — additional (optional, mmHg)") + tf(p,"ivcPre2Note","Additional PRE notes","text") + '</div>' +
+      sourceImages(p, "ivcPre2", "IVC pressure PRE (additional)") +
+      '<div class="grid g2">' + tf(p,"deployStart","Deployment initiation","time") + tf(p,"deployStartNote","Notes","text") + '</div>' +
+      '<div class="grid g2">' + tf(p,"deployEnd","Deployment end","time") + tf(p,"deployEndNote","Notes","text") + '</div>' +
+      /* IVC pressure POST - taken after deployment ends. */
+      '<div class="grid g2">' + pressureField(p,"ivcPost","IVC pressure POST (mmHg)") + tf(p,"ivcPostNote","IVC POST notes","text") + '</div>' +
+      sourceImages(p, "ivcPost", "IVC pressure POST") +
+      '<div class="grid g2">' + tf(p,"dsOut","DS extraction","time") + tf(p,"dsOutNote","Notes","text") + '</div>' +
+      '<div class="grid g2" style="margin:4px 0 12px">' +
         '<div class="calc"><small>Deployment Duration (computed)</small><b id="calc-dep">' + fmtDur(dep) + '</b></div>' +
         '<div class="calc"><small>Skin to Skin time (computed)</small><b id="calc-sts">' + fmtDur(sts) + '</b></div>' +
       '</div>' +
-      '<div class="grid g2">' +
-        pressureField(p,"ivcPre","IVC pressure pre (mmHg)") +
-        pressureField(p,"ivcPost","IVC pressure post (mmHg)") +
-      '</div>' +
-      '<div class="grid g2">' +
-        tf(p,"introducerTime","Introducer insertion time","time") +
-        tf(p,"actTime","ACT time (above 250sec)","time") +
-      '</div>' +
-      '<div class="grid g2">' +
-        sourceImages(p, "ivcPre",  "IVC pressure pre") +
-        sourceImages(p, "ivcPost", "IVC pressure post") +
-      '</div><div class="grid g4">' +
-        tf(p,"contrast","Total contrast volume (mL)","number") +
-        '<div class="field"><label for="cf-contrastForm">Contrast form</label>' +
-          '<select id="cf-contrastForm" data-cf="contrastForm"' + ro(p) + '>' +
-          ["","Pure","Diluted"].map(o =>
-            '<option' + (c.contrastForm === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
-          '</select></div>' +
+      '<div class="grid g3">' +
         '<div class="field"><label for="cf-closingMethod">Closing method</label>' +
           '<select id="cf-closingMethod" data-cf="closingMethod"' + ro(p) + '>' +
           ["","Suture-mediated","Collagen plug","Manual compression","Surgical cutdown"].map(o =>
             '<option' + (c.closingMethod === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
           '</select></div>' +
         tf(p,"closingTime","Closing time","time") +
+        tf(p,"closingNote","Closing notes","text") +
+      '</div>' +
+      '<h3 style="margin:14px 0 8px">Contrast &amp; echo</h3>' +
+      '<div class="grid g3">' +
+        tf(p,"contrast","Total contrast volume (mL)","number") +
+        '<div class="field"><label for="cf-contrastForm">Contrast form</label>' +
+          '<select id="cf-contrastForm" data-cf="contrastForm"' + ro(p) + '>' +
+          ["","Pure","Diluted"].map(o =>
+            '<option' + (c.contrastForm === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
+          '</select></div>' +
+        tf(p,"contrastNote","Contrast notes","text") +
       '</div>' +
       tf(p,"echoParams","Echo parameter collection","textarea",{hint:"Free text; structured capture is a later change."}) +
       sourceImages(p, "echoParams", "Echo parameters") +
