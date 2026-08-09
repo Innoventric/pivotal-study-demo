@@ -10896,7 +10896,8 @@ const CAPABILITIES = {
   manageUsers:     ["ADMIN"],
   deletePatients:  ["ADMIN"],
   lockCaseFile:    ["ADMIN","CPM"],
-  overrideFifo:    ["ADMIN","CPM"]
+  overrideFifo:    ["ADMIN","CPM"],
+  registerDevice:  ["ADMIN","EMPLOYEE"]   // produce new devices at an HQ location
 };
 function can(cap){
   const a = CAPABILITIES[cap];
@@ -11127,6 +11128,14 @@ const ARRIVAL_CHECKS = [
   { k:"expiry",    t:"Expiration date check — within its safe operational lifecycle" }
 ];
 
+/* The three batch-level approvals for producing new devices at HQ. They cover the
+   whole production batch, not each unit, and all three are required to register. */
+const REG_CHECKS = [
+  { k:"batchRelease", t:"Batch release is complete" },
+  { k:"dmrSigned",    t:"DMR documents are signed" },
+  { k:"qaApproval",   t:"QA approval granted" }
+];
+
 /* ------------------------------------------------------------------ state */
 const S = {
   me:null,            // { email, name, role, locationId, guest }
@@ -11152,6 +11161,7 @@ function daysFromNow(n){ const d=new Date(); d.setDate(d.getDate()+n); return d.
 
 function seed(){
   const L = [
+    { id:"loc-hq",    name:"HQ — Production",           type:"HQ",        address:"10 Depot Lane, Demo City", contact:"Production", phone:"+1-555-0109", email:"hq@example.com", cpmUserId:null },
     { id:"loc-wh-1", name:"Main Warehouse",  type:"WAREHOUSE", address:"10 Depot Lane, Demo City", contact:"Jordan Meyer",  phone:"+1-555-0100", email:"warehouse1@example.com", cpmUserId:null },
     { id:"loc-wh-2", name:"EU Warehouse",      type:"WAREHOUSE", address:"22 Airport Road, Demo City", contact:"Kim Novak",phone:"+1-555-0101",email:"warehouse2@example.com", cpmUserId:null },
     { id:"loc-site-a",   name:"Northgate Medical Center",    type:"SITE",      address:"1 Northgate Way, Demo City",contact:"Dr. A. Reed",phone:"+1-555-0102",email:"cathlab@northgate.example",cpmUserId:"usr-cpm" },
@@ -11162,6 +11172,7 @@ function seed(){
     { id:"usr-admin", name:"Dana Admin",        email:"admin@example.com",   role:"ADMIN",    locationId:null,      title:"App Admin",          phone:"+1-555-0105" },
     { id:"usr-cpm",   name:"Riley Clarke",   email:"clinical.pm@example.com", role:"CPM",   locationId:null,      title:"Clinical Project Manager", phone:"+1-555-0106" },
     { id:"usr-emp",   name:"Sam Patel",    email:"employee@example.com",  role:"EMPLOYEE", locationId:"loc-site-a", title:"Clinical Specialist", phone:"+1-555-0107" },
+    { id:"usr-prod",  name:"Alex Morgan", email:"production@example.com", role:"EMPLOYEE", locationId:"loc-hq", title:"Production Specialist", phone:"+1-555-0110" },
     { id:"usr-wh",    name:"Jordan Meyer",   email:"warehouse@example.com", role:"WH_ADMIN", locationId:"loc-wh-1", title:"Warehouse Manager", phone:"+1-555-0108" }
   ];
   let n = 1000;
@@ -11408,7 +11419,7 @@ async function unclaimCaseFile(id){
 /* Drafts are deliberately separate from the record store: they are one person's
    unfinished screen, not data anyone else should ever see or sync. */
 function saveDrafts(){
-  try{ localStorage.setItem(DRAFT_KEY, JSON.stringify({ ar:AR, sh:SH })); }catch(e){}
+  try{ localStorage.setItem(DRAFT_KEY, JSON.stringify({ ar:AR, sh:SH, reg:REG })); }catch(e){}
 }
 function loadDrafts(){
   try{ return JSON.parse(localStorage.getItem(DRAFT_KEY) || "{}") || {}; }catch(e){ return {}; }
@@ -12176,6 +12187,7 @@ const NAV = [
   { grp:"Start here" },
   { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"], todo:true },
   { grp:"Devices" },
+  { k:"register", ic:"receive", label:"New Device Registration", roles:["ADMIN","EMPLOYEE"] },
   { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
   { k:"shipment", ic:"ship",    label:"Send a Device Out",  roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
   { k:"stock",    ic:"stock",   label:"Stock by Location",  roles:["ADMIN","CPM","EMPLOYEE"] },
@@ -12456,6 +12468,7 @@ function todoItems(){
    functions change - the widgets do not. Role gating here is presentation only;
    real authorization must be enforced by that backend when it exists. */
 const HOME_MODULES = [
+  { key:"register",  ic:"receive",title:"New Device Registration",desc:"Produce new units into stock at Innoventric HQ." },
   { key:"stock",     ic:"stock",  title:"Warehouse",              desc:"Device inventory across warehouses and sites." },
   { key:"patients",  ic:"people", title:"Patients Registration",  desc:"Register patients and set up the table." },
   { key:"screening", ic:"case",   title:"Patient Screening",      desc:"Screening, evaluation, scheduling and orders." },
@@ -12615,7 +12628,7 @@ function deviceInventoryWidget(){
   const mtx = {}; sizes.forEach(s => mtx[s] = { avail:0, ship:0, other:0, total:0 });
   let wh = 0, site = 0;
   devs.forEach(d => {
-    const t = locType(d.locationId); if(t === "WAREHOUSE") wh++; else if(t === "SITE") site++;
+    const t = locType(d.locationId); if(t === "WAREHOUSE" || t === "HQ") wh++; else if(t === "SITE") site++;
     if(mtx[d.size] == null) mtx[d.size] = { avail:0, ship:0, other:0, total:0 };
     mtx[d.size][statusOf(d)]++; mtx[d.size].total++;
   });
@@ -12783,6 +12796,236 @@ function fmtDur(m){
   return Math.floor(m/60) + "h " + String(m % 60).padStart(2,"0") + "m";
 }
 
+/* ============================================ 0. NEW DEVICE REGISTRATION (HQ)
+   Producing brand-new units into stock. Unlike every other device screen, which
+   moves a unit that already exists, this one CREATES units from their label QR. It
+   is therefore the most tightly fenced: only at an HQ-type location, only for users
+   with the registerDevice capability, and only once the three batch approvals are
+   ticked. The server re-checks all of this and stamps who/when itself. */
+let REG = null;
+
+function hqLocations(){ return visibleLocations().filter(l => l.type === "HQ"); }
+
+function resetRegister(){
+  const hq = hqLocations();
+  const pref = (S.me && S.me.locationId && hq.some(l => l.id === S.me.locationId)) ? S.me.locationId
+             : (hq.length === 1 ? hq[0].id : "");
+  REG = { locationId:pref, units:[], checks:{ batchRelease:false, dmrSigned:false, qaApproval:false }, done:null };
+  saveDrafts();
+}
+function restoreRegister(){
+  const d = loadDrafts().reg;
+  if(!d || typeof d !== "object") return false;
+  if(d.locationId && !(loc(d.locationId) && loc(d.locationId).type === "HQ")) d.locationId = "";
+  if(!Array.isArray(d.units)) d.units = [];
+  if(!d.checks) d.checks = { batchRelease:false, dmrSigned:false, qaApproval:false };
+  d.done = null;
+  REG = d;
+  return true;
+}
+
+/* Parse one scanned label into a new unit and add it to the batch. Refuses a label
+   that fails the REF/SN cross-check, a serial already in this batch or already in the
+   system, or an already-expired unit — a freshly produced device is never past its
+   expiry, so that is a labelling defect. */
+function regAddScan(code){
+  let parsed;
+  try{ parsed = window.DeviceQr.parseDeviceQr(code); }
+  catch(e){ return toast(e.message || "That does not look like an Innoventric device label.", "bad"); }
+  const sn = String(parsed.sn).toUpperCase();
+  if(REG.units.some(u => String(u.sn).toUpperCase() === sn))
+    return toast("That unit (" + parsed.sn + ") is already in this batch.", "warn");
+  if(S.db.devices.some(d => String(d.sn || "").toUpperCase() === sn))
+    return toast("A device with serial " + parsed.sn + " already exists in the system.", "bad");
+  if(parsed.expired)
+    return toast("That label is already past its expiry date — a new unit should not be. Quarantine it.", "bad");
+  REG.units.push({ id:uid("dev"), ref:parsed.ref, sn:parsed.sn, productType:parsed.productType,
+    size:parsed.size, mfgDate:parsed.mfgDate, expiryDate:parsed.expiryDate });
+  saveDrafts();
+  toast("Added " + parsed.ref + " · " + parsed.sn, "good");
+  render();
+}
+
+VIEWS.register = {
+  title:"New Device Registration",
+  sub:"Produce new units into stock. Only possible at Innoventric HQ.",
+  body(){
+    if(!REG && !restoreRegister()) resetRegister();
+    const hq = hqLocations();
+    if(!hq.length){
+      return '<div class="card"><div class="card-bd"><div class="warn">' +
+        '<b>No Innoventric HQ location is available to you.</b> New devices can only be ' +
+        'registered at an HQ-type location. Ask an administrator to create one ' +
+        '(Administration → Locations, type “Innoventric HQ (production)”) or to assign you to it.' +
+        '</div></div></div>';
+    }
+
+    if(REG.done){
+      const w = REG.done;
+      return '<div class="card"><div class="card-bd">' +
+        '<div class="' + (w.failed ? "warn" : "okbox") + '" style="font-size:14px"><b>' +
+          w.created + ' device(s) registered into stock' +
+          (w.failed ? ' — ' + w.failed + ' rejected' : '') + '.</b></div>' +
+        '<div class="grid g3" style="margin-top:8px">' +
+          '<div class="kv"><b>Batch</b> <span class="mono">' + esc(w.batchId) + '</span></div>' +
+          '<div class="kv"><b>Location</b> ' + esc(w.location) + '</div>' +
+          '<div class="kv"><b>Registered by</b> ' + esc(w.by) + '</div>' +
+        '</div>' +
+        (w.errors && w.errors.length ? '<div class="warn" style="margin-top:10px">' +
+          w.errors.map(e => esc((e.ref || "") + " " + (e.sn || "") + " — " + e.message)).join("<br>") + '</div>' : '') +
+        '</div><div class="card-ft"><div class="row">' +
+          '<button class="btn btn-primary" id="reg-again">Register another batch</button>' +
+          '<button class="btn" id="reg-toaudit">See it in Activity History</button>' +
+        '</div></div></div>';
+    }
+
+    const units = REG.units;
+    const done3 = Object.values(REG.checks).filter(Boolean).length;
+    SCANFIELDS["reg-scan"] = { label:"device label", onCode:(code) => regAddScan(code) };
+
+    let h = '<div class="card"><div class="card-hd"><h2>Step 1 · Where &amp; scan the units</h2></div><div class="card-bd">' +
+      '<div class="field" style="max-width:420px"><label class="req" for="reg-loc">Producing location (HQ)</label>' +
+        '<select id="reg-loc">' + (hq.length === 1 ? "" : '<option value="">— choose —</option>') +
+        hq.map(l => '<option value="' + l.id + '"' + (l.id === REG.locationId ? " selected" : "") + '>' +
+          esc(l.name) + '</option>').join("") + '</select></div>' +
+      scanField("reg-scan", "Scan a device label QR", "", {}) +
+      '<div class="row" style="margin-top:8px">' +
+        '<button class="btn btn-primary" id="reg-more">Scan more devices</button>' +
+        '<span class="hint">Each scan reads REF, serial, size and dates straight off the label.</span>' +
+      '</div>' +
+      (units.length ?
+        '<div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>#</th><th>REF</th><th>Serial</th>' +
+          '<th>Product</th><th>Size</th><th>Mfg</th><th>Expiry</th><th></th></tr></thead><tbody>' +
+        units.map((u,i) => '<tr><td>' + (i+1) + '</td><td class="mono">' + esc(u.ref) + '</td>' +
+          '<td class="mono">' + esc(u.sn) + '</td><td>' + esc(u.productType) + '</td>' +
+          '<td>' + esc(u.size) + '</td><td>' + esc(fmtDate(u.mfgDate)) + '</td>' +
+          '<td>' + esc(fmtDate(u.expiryDate)) + '</td>' +
+          '<td><button class="btn btn-sm btn-danger" data-reg-rm="' + i + '">Remove</button></td></tr>').join("") +
+        '</tbody></table></div>' +
+        '<div class="hint" style="margin-top:6px">' + units.length + ' unit(s) scanned.</div>'
+        : '<div class="empty" style="margin-top:12px">No units scanned yet.</div>') +
+    '</div></div>' +
+
+    '<div class="card"><div class="card-hd"><h2>Step 2 · Batch approvals</h2>' +
+      '<span class="pill ' + (done3 === 3 ? "p-green" : "p-grey") + '">' + done3 + ' of 3 done</span>' +
+      '</div><div class="card-bd">' +
+      '<div class="note" style="margin-bottom:8px">These apply to the whole batch, not to each unit.</div>' +
+      REG_CHECKS.map(c =>
+        '<label class="check' + (REG.checks[c.k] ? " on" : "") + '" for="reg-c-' + c.k + '">' +
+          '<input type="checkbox" id="reg-c-' + c.k + '" data-reg-chk="' + c.k + '"' +
+          (REG.checks[c.k] ? " checked" : "") + '><span>' + esc(c.t) + '</span></label>').join("") +
+    '</div></div>' +
+
+    '<div class="card"><div class="card-hd"><h2>Step 3 · Confirm &amp; register</h2></div><div class="card-bd">' +
+      '<p>Registering <b>' + units.length + '</b> new unit(s) as usable stock at <b>' +
+        esc((loc(REG.locationId) || {}).name || "—") + '</b>. The system records you and the ' +
+        'time against every unit and the batch.</p>' +
+      whyBox("reg-why") +
+    '</div><div class="card-ft"><div class="row">' +
+      '<button class="btn btn-primary btn-lg" id="reg-go">Register ' + units.length + ' device(s)</button>' +
+      '<button class="btn" id="reg-clear">Start over</button>' +
+      '<span class="spacer"></span>' +
+      '<span class="hint">Your progress is kept if you leave this screen.</span>' +
+    '</div></div>';
+    return h;
+  },
+  wire(){
+    if(REG && REG.done){
+      $("#reg-again").onclick = () => { resetRegister(); render(); };
+      $("#reg-toaudit").onclick = () => { S.view = "audit"; renderNav(); render(); };
+      return;
+    }
+    const ls = $("#reg-loc");
+    if(ls) ls.onchange = e => { REG.locationId = e.target.value; saveDrafts(); clearWhy("reg-why"); };
+    const more = $("#reg-more");
+    if(more) more.onclick = () => startScan("reg-scan", "device label");
+    $$("[data-reg-rm]").forEach(b => b.onclick = () => {
+      REG.units.splice(+b.dataset.regRm, 1); saveDrafts(); render();
+    });
+    /* Update the counter pill in place, like the arrival checks, so ticking a box
+       does not re-render the page and lose the operator's scroll position. */
+    $$("[data-reg-chk]").forEach(c => c.onchange = e => {
+      REG.checks[e.target.dataset.regChk] = e.target.checked;
+      e.target.closest(".check").classList.toggle("on", e.target.checked);
+      const n = Object.values(REG.checks).filter(Boolean).length;
+      const pillEl = $$(".card-hd .pill").find(p => /^\d+ of 3 done$/.test(p.textContent));
+      if(pillEl){ pillEl.textContent = n + " of 3 done"; pillEl.className = "pill " + (n === 3 ? "p-green" : "p-grey"); }
+      saveDrafts(); clearWhy("reg-why");
+    });
+    $("#reg-clear").onclick = () => { resetRegister(); render(); };
+    $("#reg-go").onclick = submitRegister;
+  }
+};
+function submitRegister(){
+  if(!REG.locationId) return showWhy("reg-why", "Step 1 — choose the producing HQ location.");
+  const l = loc(REG.locationId);
+  if(!l || l.type !== "HQ") return showWhy("reg-why", "Step 1 — new devices can only be registered at an HQ location.");
+  if(!REG.units.length)  return showWhy("reg-why", "Step 1 — scan at least one device.");
+  if(!(REG.checks.batchRelease && REG.checks.dmrSigned && REG.checks.qaApproval))
+    return showWhy("reg-why", "Step 2 — all three batch approvals are required before registering.");
+  clearWhy("reg-why");
+
+  const locationId = REG.locationId;
+  const units = REG.units.map(u => Object.assign({}, u));
+
+  function finish(res){
+    const l2 = loc(locationId) || {};
+    logAction("Registered " + res.created + " new device(s) into stock at " + l2.name, {
+      locationId,
+      stateChanges: res.created + " unit(s) added as In WH · batch " + res.batchId,
+      comments: "Batch approvals: batch release ✓, DMR signed ✓, QA approval ✓ | Serials: " +
+        units.map(u => u.sn).join(", ") + (res.failed ? " | " + res.failed + " rejected" : "")
+    });
+    queueBackup(l2.name + "/Device_Registrations", "registration_" + res.batchId + ".json", {
+      type:"NEW_DEVICE_REGISTRATION", batchId:res.batchId, location:l2.name,
+      approvals:{ batchRelease:true, dmrSigned:true, qaApproval:true },
+      units: units.map(u => ({ id:u.id, ref:u.ref, sn:u.sn, productType:u.productType,
+        size:u.size, mfgDate:u.mfgDate, expiryDate:u.expiryDate })),
+      registeredBy: res.registeredBy || (S.me && S.me.email),
+      registeredAt: res.registeredAt || nowISO()
+    });
+    if(!S.backend) commit();
+    resetRegister();
+    REG.done = { created:res.created, failed:res.failed || 0, batchId:res.batchId,
+      location:l2.name, by:res.registeredBy || (S.me && S.me.email), errors:res.errors || [] };
+    saveDrafts(); renderNav(); render();
+    toast(res.created + " device(s) registered.", res.failed ? "bad" : "good");
+  }
+
+  if(S.backend){
+    const btn = $("#reg-go"); if(btn) btn.disabled = true;
+    (async () => {
+      try{
+        const res = await api("POST", "/api/devices/register",
+          { locationId, checks:Object.assign({}, REG.checks), units });
+        try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+        finish(res);
+      }catch(e){
+        if(btn) btn.disabled = false;
+        showWhy("reg-why", e.message || "Registration was refused by the server.");
+      }
+    })();
+    return;
+  }
+
+  // standalone / demo
+  const batchId = "BATCH-" + nowISO().replace(/[^0-9]/g, "").slice(0, 14);
+  const registeredAt = nowISO(), registeredBy = (S.me && S.me.email) || "unknown";
+  let created = 0; const errors = [];
+  for(const u of units){
+    const sn = String(u.sn).toUpperCase();
+    if(S.db.devices.some(d => String(d.sn || "").toUpperCase() === sn)){
+      errors.push({ ref:u.ref, sn:u.sn, message:"Duplicate serial." }); continue;
+    }
+    S.db.devices.push({ id:u.id, ref:u.ref, sn:u.sn, productType:u.productType, size:u.size,
+      mfgDate:u.mfgDate, expiration:u.expiryDate, locationId, status:"IN_WH", condition:"OK",
+      shippedBy:null, shippedFromId:null, shippedAt:null, masterPackId:null,
+      registeredBy, registeredAt, batchId });
+    created++;
+  }
+  finish({ created, failed:errors.length, errors, batchId, registeredBy, registeredAt });
+}
+
 /* ============================================ 1. ARRIVAL & CONDITION CHECK */
 let AR = null;
 /* Match a code against a unit. The serial number is the identity, so it is tried
@@ -12809,63 +13052,72 @@ function findDeviceByScan(rawQr){
 function resetArrival(){
   const me = S.db.users.find(u => u.email === S.me.email) || {};
   AR = {
-    deviceId:"", scannedCode:"", idHandEntered:false,
-    siteId: S.me.locationId || "", checks:{}, compromised:false,
-    compromiseNote:"", manual:!(me.title && me.phone), done:null,
+    siteId: S.me.locationId || "",
+    units: [],              // [{deviceId, scannedCode, idHandEntered, compromised, compromiseNote}]
+    checks:{}, manual:!(me.title && me.phone), done:null,
     receiver: me.title && me.phone ? { name:S.me.name, title:me.title, phone:me.phone }
                                    : { name:"", title:"", phone:"" }
   };
   saveDrafts();
 }
-/** Restore an interrupted inspection, discarding anything that no longer exists. */
+/** Restore an interrupted inspection, discarding any unit that no longer exists.
+    Migrates an older single-unit draft into the batch shape. */
 function restoreArrival(){
   const d = loadDrafts().ar;
   if(!d || typeof d !== "object") return false;
-  if(d.deviceId && !device(d.deviceId)) d.deviceId = "";
+  if(!Array.isArray(d.units)){
+    d.units = d.deviceId ? [{ deviceId:d.deviceId, scannedCode:d.scannedCode || "",
+      idHandEntered:!!d.idHandEntered, compromised:!!d.compromised,
+      compromiseNote:d.compromiseNote || "" }] : [];
+  }
+  d.units = d.units.filter(u => device(u.deviceId));
   if(d.siteId && !loc(d.siteId)) d.siteId = "";
+  if(!d.checks) d.checks = {};
   d.done = null;
   AR = d;
   return true;
 }
 VIEWS.arrival = {
   title:"Receive a Delivery",
-  sub:"Scan the unit's QR code, run the four checks, and it becomes usable stock.",
+  sub:"Scan every unit in the delivery, run the four checks, and they become usable stock.",
   body(){
     if(!AR && !restoreArrival()) resetArrival();
 
-    /* After a successful check-in the form used to blank itself and rely on a toast
-       that is gone in under four seconds. Now the result stays on screen until the
-       operator starts the next unit. */
+    /* After a successful check-in the result stays on screen (with every unit's
+       outcome) until the operator starts the next delivery. */
     if(AR.done){
       const w = AR.done;
+      const rej = w.results.filter(r => r.rejected).length;
       return '<div class="card"><div class="card-bd">' +
-        '<div class="' + (w.rejected ? "warn" : "okbox") + '" style="font-size:14px">' +
-          '<b>' + (w.rejected ? "Recorded as REJECTED and escalated."
-                              : "Checked in — this unit is now usable stock.") + '</b></div>' +
-        '<div class="grid g4">' +
-          '<div class="kv"><b>Unit</b> <span class="mono">' + esc(w.ref) + '</span></div>' +
-          '<div class="kv"><b>Product</b> ' + esc(w.product) + '</div>' +
-          '<div class="kv"><b>Location</b> ' + esc(w.location) + '</div>' +
-          '<div class="kv"><b>Now</b> ' + pill(DEV_STATUS, w.status) + '</div>' +
-        '</div>' +
-        (w.handEntered ? '<div class="warn" style="margin-top:10px">The identifier was ' +
-          'hand-entered rather than scanned. That is recorded against this inspection.</div>' : '') +
+        '<div class="' + (rej ? "warn" : "okbox") + '" style="font-size:14px"><b>' +
+          (w.results.length - rej) + ' unit(s) checked in as usable stock' +
+          (rej ? ', ' + rej + ' REJECTED and escalated' : '') + '.</b></div>' +
+        '<div class="tbl-wrap" style="margin-top:8px"><table><thead><tr><th>Unit</th><th>Product</th>' +
+          '<th>Result</th></tr></thead><tbody>' +
+        w.results.map(r => '<tr><td class="mono">' + esc(r.ref) + '</td><td>' + esc(r.product) + '</td>' +
+          '<td>' + pill(DEV_STATUS, r.status) + '</td></tr>').join("") +
+        '</tbody></table></div>' +
+        '<div class="hint" style="margin-top:6px">Received at ' + esc(w.location) + '.</div>' +
+        (w.handEntered ? '<div class="warn" style="margin-top:10px">One or more identifiers were ' +
+          'hand-entered rather than scanned. That is recorded against the inspection.</div>' : '') +
         '</div><div class="card-ft"><div class="row">' +
-          '<button class="btn btn-primary" id="ar-next">Receive another unit</button>' +
+          '<button class="btn btn-primary" id="ar-next">Receive another delivery</button>' +
           '<button class="btn" id="ar-toaudit">See it in Activity History</button>' +
         '</div></div></div>';
     }
 
     const unver = S.db.devices.filter(d => d.status === "DELIVERED" && inScope(d.locationId));
-    const d = device(AR.deviceId);
     const passed = ARRIVAL_CHECKS.filter(c => AR.checks[c.k]).length;
     SCANFIELDS["ar-scan"] = { label:"device label", onCode:(code, manual) => {
       const hit = findDeviceByCode(code);
       if(!hit) return toast("No unit matches “" + code + "”.", "bad");
       if(!inScope(hit.locationId)) return toast("That unit is outside your location scope.", "bad");
-      AR.deviceId = hit.id; AR.scannedCode = code; AR.idHandEntered = !!manual;
+      if(AR.units.some(u => u.deviceId === hit.id))
+        return toast(hit.ref + " is already in this delivery.", "warn");
+      AR.units.push({ deviceId:hit.id, scannedCode:code, idHandEntered:!!manual,
+        compromised:false, compromiseNote:"" });
       if(!AR.siteId) AR.siteId = hit.locationId;
-      render();
+      saveDrafts(); render();
     }};
 
     return (unver.length ?
@@ -12873,41 +13125,52 @@ VIEWS.arrival = {
       'They have physically arrived, but until these four checks are done they are not ' +
       'usable stock and cannot be assigned to a patient.</div>' : "") +
 
-    '<div class="card"><div class="card-hd"><h2>Step 1 · Which unit?</h2></div><div class="card-bd">' +
+    '<div class="card"><div class="card-hd"><h2>Step 1 · Scan the units</h2></div><div class="card-bd">' +
       '<div class="grid g2">' +
-        scanField("ar-scan", "Unit QR code", AR.scannedCode, { req:true }) +
+        scanField("ar-scan", "Unit QR code", "", {}) +
         '<div class="field"><label class="req" for="ar-site">Receiving location</label>' +
           '<select id="ar-site"><option value="">— choose —</option>' +
           visibleLocations().map(l => '<option value="' + l.id + '"' + (l.id === AR.siteId ? " selected" : "") + '>' +
             esc(l.name) + '</option>').join("") + '</select></div>' +
       '</div>' +
-      (d ? '<div class="scan-ok"><b>Matched ' + esc(d.ref) + '</b>' +
-        (AR.idHandEntered ? ' — hand-entered, which is recorded against this inspection.' : '') + '</div>' +
-        '<div class="grid g4" style="margin-top:8px">' +
-        '<div class="kv"><b>Product</b> ' + esc(devName(d)) + '</div>' +
-        '<div class="kv"><b>Device SN</b> <span class="mono">' + esc(d.sn) + '</span></div>' +
-        '<div class="kv"><b>Expiry</b> ' + esc(fmtDate(d.expiration)) + '</div>' +
-        '<div class="kv"><b>Status</b> ' + pill(DEV_STATUS, d.status) + '</div></div>' : "") +
+      '<div class="row" style="margin-top:8px">' +
+        '<button class="btn btn-primary" id="ar-more">Scan more devices</button>' +
+        '<span class="hint">Scan each unit in the delivery; the four checks below apply to all of them.</span>' +
+      '</div>' +
+      (AR.units.length ?
+        '<div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>#</th><th>Unit</th><th>Product</th>' +
+          '<th>Expiry</th><th>Condition</th><th></th></tr></thead><tbody>' +
+        AR.units.map((u,i) => {
+          const dv = device(u.deviceId) || {};
+          return '<tr><td>' + (i+1) + '</td>' +
+            '<td class="mono">' + esc(dv.ref || "?") +
+              (u.idHandEntered ? ' <span class="pill p-grey">hand</span>' : '') + '</td>' +
+            '<td>' + esc(devName(dv)) + '</td>' +
+            '<td>' + esc(fmtDate(dv.expiration)) + '</td>' +
+            '<td><label style="display:inline-flex;align-items:center;gap:4px;font-size:12px">' +
+              '<input type="checkbox" data-ar-bad="' + i + '"' + (u.compromised ? " checked" : "") +
+              '> compromised</label>' +
+              (u.compromised ? '<input type="text" data-ar-note="' + i + '" placeholder="what is wrong" ' +
+                'value="' + esc(u.compromiseNote) + '" style="margin-top:4px;width:100%;font-size:12px">' : '') +
+            '</td>' +
+            '<td><button class="btn btn-sm btn-danger" data-ar-rm="' + i + '">Remove</button></td></tr>';
+        }).join("") +
+        '</tbody></table></div>' +
+        '<div class="hint" style="margin-top:6px">' + AR.units.length + ' unit(s) scanned.</div>'
+        : '<div class="empty" style="margin-top:12px">No units scanned yet.</div>') +
     '</div></div>' +
 
     '<div class="card"><div class="card-hd"><h2>Step 2 · The four checks</h2>' +
       '<span class="pill ' + (passed === ARRIVAL_CHECKS.length ? "p-green" : "p-grey") + '">' +
         passed + ' of ' + ARRIVAL_CHECKS.length + ' done</span></div><div class="card-bd">' +
+      '<div class="note" style="margin-bottom:8px">These apply to the whole delivery. Mark an individual ' +
+        'unit compromised in the list above if only some units are affected — that rejects just that unit ' +
+        'and raises a high-priority alert to the WH Admin and App Admin.</div>' +
       ARRIVAL_CHECKS.map((c,i) =>
         '<label class="check' + (AR.checks[c.k] ? " on" : "") + '" for="ar-c-' + c.k + '">' +
           '<input type="checkbox" id="ar-c-' + c.k + '" data-chk="' + c.k + '"' +
           (AR.checks[c.k] ? " checked" : "") + '>' +
           '<span><b>' + (i+1) + '.</b> ' + esc(c.t) + '</span></label>').join("") +
-      '<div class="note" style="margin-top:12px">The control below is not a pass/fail item — ' +
-        'ticking it rejects the unit and raises a high-priority alert to the WH Admin and ' +
-        'App Admin.</div>' +
-      '<label class="check" for="ar-bad" style="border-color:var(--bad-line);' +
-        (AR.compromised ? "background:var(--bad-bg)" : "") + '">' +
-        '<input type="checkbox" id="ar-bad"' + (AR.compromised ? " checked" : "") + '>' +
-        '<span><b>Something is not good — the unit is compromised</b></span></label>' +
-      (AR.compromised ? '<div class="field" style="margin-top:8px">' +
-        '<label class="req" for="ar-note">Describe what is wrong</label>' +
-        '<textarea id="ar-note">' + esc(AR.compromiseNote) + '</textarea></div>' : "") +
     '</div></div>' +
 
     '<div class="card"><div class="card-hd"><h2>Step 3 · Who received it</h2>' +
@@ -12924,7 +13187,7 @@ VIEWS.arrival = {
     '</div><div class="card-ft">' +
       whyBox("ar-why") +
       '<div class="row">' +
-        '<button class="btn btn-primary btn-lg" id="ar-go">Check this unit in</button>' +
+        '<button class="btn btn-primary btn-lg" id="ar-go">Check ' + AR.units.length + ' unit(s) in</button>' +
         '<button class="btn" id="ar-clear">Start over</button>' +
         '<span class="spacer"></span>' +
         '<span class="hint">Your progress is kept if you leave this screen.</span>' +
@@ -12938,11 +13201,20 @@ VIEWS.arrival = {
       return;
     }
     $("#ar-site").onchange = e => { AR.siteId = e.target.value; saveDrafts(); clearWhy("ar-why"); };
+    const more = $("#ar-more"); if(more) more.onclick = () => startScan("ar-scan", "device label");
 
-    /* Ticking a box used to re-render the whole screen, which reset the scroll — four
-       checks, four trips back down the page. The class and the counter are updated
-       in place instead; only the compromised box changes the shape of the form and
-       therefore still re-renders. */
+    $$("[data-ar-rm]").forEach(b => b.onclick = () => {
+      AR.units.splice(+b.dataset.arRm, 1); saveDrafts(); render();
+    });
+    $$("[data-ar-bad]").forEach(c => c.onchange = e => {
+      AR.units[+e.target.dataset.arBad].compromised = e.target.checked; saveDrafts(); render();
+    });
+    $$("[data-ar-note]").forEach(inp => inp.oninput = e => {
+      AR.units[+e.target.dataset.arNote].compromiseNote = e.target.value; saveDrafts();
+    });
+
+    /* Ticking a check updates the counter pill in place, so the operator's scroll
+       position is kept rather than jumping on every tick. */
     $$("[data-chk]").forEach(c => c.onchange = e => {
       AR.checks[e.target.dataset.chk] = e.target.checked;
       e.target.closest(".check").classList.toggle("on", e.target.checked);
@@ -12955,16 +13227,13 @@ VIEWS.arrival = {
       saveDrafts(); clearWhy("ar-why");
     });
 
-    $("#ar-bad").onchange = e => { AR.compromised = e.target.checked; saveDrafts(); render(); };
-    const n = $("#ar-note");
-    if(n) n.oninput = e => { AR.compromiseNote = e.target.value; saveDrafts(); };
     const el = $("#ar-else");
     if(el) el.onclick = () => {
       AR.manual = true; AR.receiver = { name:"", title:"", phone:"" }; saveDrafts(); render();
     };
     ["rn","rt","rp"].forEach((k,i) => {
       const f = $("#ar-" + k);
-      f.oninput = e => {
+      if(f) f.oninput = e => {
         AR.receiver[["name","title","phone"][i]] = e.target.value; saveDrafts(); clearWhy("ar-why");
       };
     });
@@ -12973,85 +13242,105 @@ VIEWS.arrival = {
   }
 };
 function submitArrival(){
-  const d = device(AR.deviceId);
   const missing = ARRIVAL_CHECKS.filter(c => !AR.checks[c.k]);
-  /* Each refusal names the step it belongs to, so the operator knows where to look
-     on a form that is now three labelled steps long. */
-  if(!d)             return showWhy("ar-why", "Step 1 — scan the QR code on the unit you are receiving.");
-  if(!AR.siteId)     return showWhy("ar-why", "Step 1 — choose the receiving location.");
-  if(missing.length) return showWhy("ar-why", "Step 2 — " + missing.length + " of the four checks " +
-                       "are still outstanding: " + missing.map(c => c.t.split(" — ")[0]).join(", ") + ".");
-  if(AR.compromised && !AR.compromiseNote.trim())
-                     return showWhy("ar-why", "Step 2 — you marked this unit compromised, so describe " +
-                       "what is wrong before checking it in.");
+  /* Each refusal names the step it belongs to, so the operator knows where to look. */
+  if(!AR.units.length) return showWhy("ar-why", "Step 1 — scan at least one unit you are receiving.");
+  if(!AR.siteId)       return showWhy("ar-why", "Step 1 — choose the receiving location.");
+  if(missing.length)   return showWhy("ar-why", "Step 2 — " + missing.length + " of the four checks " +
+                         "are still outstanding: " + missing.map(c => c.t.split(" — ")[0]).join(", ") + ".");
+  const badNote = AR.units.find(u => u.compromised && !String(u.compromiseNote).trim());
+  if(badNote){
+    const bd = device(badNote.deviceId) || {};
+    return showWhy("ar-why", "Step 1 — " + (bd.ref || "a unit") + " is marked compromised, so describe " +
+      "what is wrong before checking it in.");
+  }
   const r = AR.receiver;
   if(!r.name.trim() || !r.title.trim() || !r.phone.trim())
-                     return showWhy("ar-why", "Step 3 — receiver name, title and phone are all required.");
+                       return showWhy("ar-why", "Step 3 — receiver name, title and phone are all required.");
   clearWhy("ar-why");
 
   const target = loc(AR.siteId);
-  const before = d.status;
   const siteId = AR.siteId;
   /* Snapshot the form now: resetArrival() below wipes AR, and the backend path
      touches this after an await. */
-  const compromised = AR.compromised, note = AR.compromiseNote, idHandEntered = AR.idHandEntered;
-  const checks = Object.assign({}, AR.checks), scannedCode = AR.scannedCode || null, receiver = r;
+  const checks = Object.assign({}, AR.checks), receiver = Object.assign({}, r);
+  const units = AR.units.map(u => Object.assign({}, u));
+  const anyHand = units.some(u => u.idHandEntered);
 
-  function recordArrival(dev){
+  function recordOne(dev, before, u){
     logAction("Arrival & condition verification completed for " + dev.ref, {
       locationId:siteId,
-      stateChanges: DEV_STATUS[before].label + " → " + DEV_STATUS[dev.status].label,
-      comments: (compromised ? ("COMPROMISED: " + note) : "All four checks passed") +
-                (idHandEntered ? " | IDENTIFIER HAND-ENTERED, not scanned" : " | identifier scanned"),
-      highPriority: compromised || idHandEntered
+      stateChanges: (DEV_STATUS[before] ? DEV_STATUS[before].label : before) + " → " + DEV_STATUS[dev.status].label,
+      comments: (u.compromised ? ("COMPROMISED: " + u.compromiseNote) : "All four checks passed") +
+                (u.idHandEntered ? " | IDENTIFIER HAND-ENTERED, not scanned" : " | identifier scanned"),
+      highPriority: u.compromised || u.idHandEntered
     });
-    if(compromised){
+    if(u.compromised){
       notify("Compromised unit reported: " + dev.ref + " (" + devName(dev) + ") at " + target.name +
-             " — " + note, ["ADMIN","WH_ADMIN"], [], siteId);
+             " — " + u.compromiseNote, ["ADMIN","WH_ADMIN"], [], siteId);
     }
     queueBackup(target.name + "/Condition_Reports", "arrival_" + dev.ref + "_" + Date.now() + ".json", {
       type:"ARRIVAL_CONDITION_REPORT", device:{ id:dev.id, ref:dev.ref, sn:dev.sn, mfgDate:dev.mfgDate,
       product:devName(dev), expiration:dev.expiration }, location:target.name, checks:checks,
-      compromised:compromised, compromiseNote:note, receiver:receiver,
-      identifierSource: idHandEntered ? "HAND_ENTERED" : "SCANNED",
-      scannedCode: scannedCode,
+      compromised:u.compromised, compromiseNote:u.compromiseNote, receiver:receiver,
+      identifierSource: u.idHandEntered ? "HAND_ENTERED" : "SCANNED",
+      scannedCode: u.scannedCode || null,
       verifiedBy:S.me.email, verifiedAt:nowISO()
     });
   }
-  function finishArrival(dev){
+  function finishArrival(results){
     commit();
-    toast(dev.status === "REJECTED" ? "Recorded as REJECTED and escalated." : "Checked in — now usable stock.",
-          dev.status === "REJECTED" ? "bad" : "good");
+    const rej = results.filter(x => x.rejected).length;
+    toast(rej ? (rej + " rejected, " + (results.length - rej) + " checked in.")
+              : (results.length + " unit(s) checked in — now usable stock."),
+          rej ? "bad" : "good");
     resetArrival();
-    AR.done = { ref:dev.ref, product:devName(dev), location:target.name, status:dev.status,
-                rejected:dev.status === "REJECTED", handEntered:idHandEntered };
+    AR.done = { results, location:target.name, handEntered:anyHand };
     saveDrafts(); renderNav(); render();
   }
 
   if(S.backend){
-    /* The server sets the condition, status and location and owns the ETag. */
+    /* The server sets the condition, status and location and owns the ETag, one unit
+       at a time. If one is refused mid-batch, the ones already checked in stand and
+       the message says how many. */
+    const btn = $("#ar-go"); if(btn) btn.disabled = true;
     (async () => {
+      const results = [];
       try{
-        const out = await api("POST", "/api/devices/" + encodeURIComponent(d.id) + "/verify-arrival",
-          { siteId, compromised, note });
-        const i = S.db.devices.findIndex(x => x.id === out.device.id);
-        if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
-        recordArrival(out.device);
-        finishArrival(out.device);
+        for(const u of units){
+          const dev0 = device(u.deviceId); const before = dev0 ? dev0.status : "";
+          const out = await api("POST", "/api/devices/" + encodeURIComponent(u.deviceId) + "/verify-arrival",
+            { siteId, compromised:u.compromised, note:u.compromiseNote });
+          const i = S.db.devices.findIndex(x => x.id === out.device.id);
+          if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
+          recordOne(out.device, before, u);
+          results.push({ ref:out.device.ref, product:devName(out.device), status:out.device.status,
+            rejected:out.device.status === "REJECTED" });
+        }
+        finishArrival(results);
       }catch(e){
+        if(btn) btn.disabled = false;
         try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
-        showWhy("ar-why", e.message || "Check-in was refused by the server.");
+        showWhy("ar-why", (results.length ? results.length + " unit(s) were checked in before an error. " : "") +
+          (e.message || "Check-in was refused by the server."));
         renderNav(); render();
       }
     })();
     return;
   }
 
-  d.locationId = siteId;
-  d.condition  = compromised ? "COMPROMISED" : "OK";
-  d.status     = compromised ? "REJECTED" : (target.type === "WAREHOUSE" ? "IN_WH" : "IN_SITE");
-  recordArrival(d);
-  finishArrival(d);
+  const results = [];
+  for(const u of units){
+    const d = device(u.deviceId); if(!d) continue;
+    const before = d.status;
+    d.locationId = siteId;
+    d.condition  = u.compromised ? "COMPROMISED" : "OK";
+    d.status     = u.compromised ? "REJECTED"
+                   : ((target.type === "WAREHOUSE" || target.type === "HQ") ? "IN_WH" : "IN_SITE");
+    recordOne(d, before, u);
+    results.push({ ref:d.ref, product:devName(d), status:d.status, rejected:d.status === "REJECTED" });
+  }
+  finishArrival(results);
 }
 
 /* =========================================== 2. CLINICAL PROCEDURE WORKFLOW */
@@ -14670,7 +14959,7 @@ VIEWS.stock = {
 
     h += '<div class="card"><div class="card-bd"><div class="grid g4" style="margin:0">' +
       '<div class="field" style="margin:0"><label for="f-lt">Location type</label><select id="f-lt">' +
-        [["","All"],["WAREHOUSE","Warehouses"],["SITE","Hospital sites"]].map(([v,l]) =>
+        [["","All"],["HQ","HQ — Production"],["WAREHOUSE","Warehouses"],["SITE","Hospital sites"]].map(([v,l]) =>
           '<option value="' + v + '"' + (FL.locType === v ? " selected" : "") + '>' + l + '</option>').join("") +
         '</select></div>' +
       '<div class="field" style="margin:0"><label for="f-p">Product</label><select id="f-p">' +
@@ -15115,7 +15404,8 @@ VIEWS.admin = {
         const n = S.db.devices.filter(d => d.locationId === l.id).length;
         return '<tr><td><b>' + esc(l.name) + '</b></td>' +
           '<td>' + (l.type === "WAREHOUSE" ? '<span class="pill p-blue">Warehouse</span>'
-                                           : '<span class="pill p-pink">Hospital site</span>') + '</td>' +
+                    : l.type === "HQ"     ? '<span class="pill p-green">Innoventric HQ</span>'
+                                          : '<span class="pill p-pink">Hospital site</span>') + '</td>' +
           '<td>' + esc(l.address) + '</td>' +
           '<td>' + esc(l.contact) + '<div class="hint">' + esc(l.phone) + '</div></td>' +
           '<td>' + esc(l.cpmUserId ? (user(l.cpmUserId) || {}).name || "—" : "—") + '</td>' +
@@ -15187,7 +15477,7 @@ VIEWS.admin = {
         const prod = PRODUCTS.find(p => p.key === pt);
         if(!prod || !prod.sizes.includes(size) || !ref || !l || !/^\d{4}-\d{2}-\d{2}$/.test(exp||"")){ badFormat++; continue; }
         rows.push({ id:uid("dev"), sn:sn||"", ref, productType:pt, size,
-          locationId:l.id, status:l.type === "WAREHOUSE" ? "IN_WH" : "IN_SITE",
+          locationId:l.id, status:(l.type === "WAREHOUSE" || l.type === "HQ") ? "IN_WH" : "IN_SITE",
           expiration:exp, condition:"OK", shippedBy:null, shippedFromId:null, shippedAt:null });
       }
 
@@ -15305,6 +15595,7 @@ function locForm(l){
       '<div class="field"><label class="req" for="l-t">Type</label><select id="l-t">' +
         '<option value="WAREHOUSE"' + (l.type === "WAREHOUSE" ? " selected" : "") + '>Warehouse</option>' +
         '<option value="SITE"' + (l.type === "SITE" ? " selected" : "") + '>Hospital site</option>' +
+        '<option value="HQ"' + (l.type === "HQ" ? " selected" : "") + '>Innoventric HQ (production)</option>' +
       '</select></div></div>' +
     '<div class="field"><label for="l-a">Address</label><input type="text" id="l-a" value="' + esc(l.address) + '"></div>' +
     '<div class="grid g3"><div class="field"><label for="l-c">Contact person</label>' +
