@@ -12502,6 +12502,11 @@ function renderSideFoot(){
 const VIEWS = {};
 let LAST_VIEW = null;
 function render(){
+  /* The app render only applies once signed in. The public delivery page and the
+     login screen reuse shared helpers (e.g. the scanner) whose fallbacks may call
+     render(); guard so those calls are harmless no-ops rather than rendering an app
+     view with no user. */
+  if(!S.me) return;
   const v = VIEWS[S.view];
   $("#top-actions").innerHTML = "";
   if(!v){ $("#view").innerHTML = '<div class="empty">Nothing here.</div>'; return; }
@@ -15018,110 +15023,173 @@ async function showDelivery(){
   }
   const siteById = id => locList.find(l => l.id === id) || null;
 
-  b.innerHTML =
-    '<div class="login-h"><h1>Report a delivery</h1>' +
-      '<p>One short screen. You do not need an account.</p></div>' +
-    '<div class="field"><label class="req" for="dl-ref">Product ID</label>' +
-      '<input type="text" id="dl-ref" placeholder="e.g. UNI-M-1010" autocomplete="off">' +
-      '<div class="hint">Printed on the box, next to the QR code.</div></div>' +
-    '<div class="field"><label class="req" for="dl-site">Which site are you at?</label><select id="dl-site">' +
-      '<option value="">— choose —</option>' +
-      locList.map(l => '<option value="' + l.id + '">' + esc(l.name) + '</option>').join("") +
-      '</select></div>' +
-    '<div class="grid g2"><div class="field"><label class="req" for="dl-name">Your name</label>' +
-      '<input type="text" id="dl-name" autocomplete="name"></div>' +
-      '<div class="field"><label class="req" for="dl-phone">Your phone</label>' +
-      '<input type="tel" id="dl-phone" autocomplete="tel"></div></div>' +
-    whyBox("dl-why") +
-    '<button class="btn btn-primary btn-block btn-lg" id="dl-go">Report it</button>' +
-    '<div class="sep"></div>' +
-    '<a href="#" id="dl-back" class="btn btn-block">Back to sign-in</a>';
+  /* One delivery can contain several units, so this screen collects a list, an
+     optional note, and optional photos of what arrived — then reports them together. */
+  const DL = { items:[], note:"", photos:[], siteId:"", name:"", phone:"" };
 
-  $("#dl-back").onclick = e => { e.preventDefault(); location.hash = ""; showLogin(); };
-
-  /* The recipient sees exactly one instruction and nothing else. */
-  function confirmScreen(site, matched){
+  function confirmScreen(site, results){
     site = site || {};
+    const unmatched = results.filter(r => !r.matched).length;
     b.innerHTML =
       '<div class="login-h"><h1>Thank you</h1></div>' +
       '<div class="note" style="font-size:14px"><b>This is an Innoventric product.</b> ' +
         'Please keep it at room temperature and notify the cath lab team that it has arrived.</div>' +
       '<div class="card" style="margin:0"><div class="card-bd">' +
         '<div class="kv"><b>Site</b> ' + esc(site.name || "") + '</div>' +
-        '<div class="kv"><b>Address</b> ' + esc(site.address || "") + '</div>' +
+        '<div class="kv"><b>Reported</b> ' + results.length + ' device(s)' +
+          (unmatched ? ' · ' + unmatched + ' not recognised' : '') + '</div>' +
         '<div class="kv"><b>Contact</b> ' + esc(site.contact || "") + '</div>' +
         '<div class="kv"><b>Phone</b> ' + esc(site.phone || "") + '</div>' +
-        '<div class="kv"><b>Email</b> ' + esc(site.email || "") + '</div>' +
       '</div></div>' +
-      (matched ? "" : '<div class="warn" style="margin-top:10px">We could not match that product ID ' +
-        'to a unit we were expecting. The site team has been alerted to check it by hand — ' +
-        'you do not need to do anything else.</div>') +
+      (unmatched ? '<div class="warn" style="margin-top:10px">Some product IDs could not be matched to ' +
+        'units we were expecting. The site team has been alerted to check them by hand — you do not ' +
+        'need to do anything else.</div>' : "") +
       '<button class="btn btn-block" id="dl-again" style="margin-top:12px">Report another delivery</button>';
     $("#dl-again").onclick = showDelivery;
   }
 
-  $("#dl-go").onclick = async () => {
-    const ref = $("#dl-ref").value.trim(), siteId = $("#dl-site").value;
-    const name = $("#dl-name").value.trim(), phone = $("#dl-phone").value.trim();
-    if(!ref || !siteId || !name || !phone) return showWhy("dl-why", "Every field is required.");
+  function addCode(code){
+    code = String(code || "").trim();
+    if(!code) return;
+    if(DL.items.some(x => x.code.toUpperCase() === code.toUpperCase()))
+      return toast("That device is already in the list.", "warn");
+    DL.items.push({ code }); paint();
+  }
+  function addCurrent(){ const el = $("#dl-code"); if(el){ addCode(el.value); el.value = ""; } }
+  SCANFIELDS["dl-scan"] = { label:"product label", onCode:(code) => addCode(code) };
+
+  /* Shrink a captured photo to keep the upload small (public form, ~4MB body cap). */
+  function resizePhoto(file, cb){
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const max = 1280, scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+      const w = Math.max(1, Math.round(img.naturalWidth * scale));
+      const h = Math.max(1, Math.round(img.naturalHeight * scale));
+      const c = document.createElement("canvas"); c.width = w; c.height = h;
+      c.getContext("2d").drawImage(img, 0, 0, w, h);
+      URL.revokeObjectURL(url);
+      cb(c.toDataURL("image/jpeg", 0.7));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); toast("Could not read that photo.", "bad"); };
+    img.src = url;
+  }
+
+  function paint(){
+    b.innerHTML =
+      '<div class="login-h"><h1>Report a delivery</h1>' +
+        '<p>One short screen. You do not need an account.</p></div>' +
+      '<div class="field"><label class="req" for="dl-code">Product ID / label code</label>' +
+        '<div class="row" style="gap:7px;flex-wrap:nowrap">' +
+          '<input type="text" id="dl-code" placeholder="scan or type, e.g. DS-S-210726-0001" autocomplete="off">' +
+          '<button type="button" class="btn btn-primary" id="dl-scanbtn" style="flex:none">Scan</button>' +
+        '</div>' +
+        '<div class="hint">Scan the square code on the box, or type the ID printed next to it, ' +
+          'then <a href="#" id="dl-add">add it</a>.</div></div>' +
+      (DL.items.length ?
+        '<div class="card" style="margin:0 0 10px"><div class="card-bd">' +
+          '<b>' + DL.items.length + ' device(s) to report</b>' +
+          '<div class="tbl-wrap" style="margin-top:6px"><table><tbody>' +
+          DL.items.map((it,i) => '<tr><td class="mono">' + esc(it.code) + '</td>' +
+            '<td style="text-align:right"><button class="btn btn-sm btn-danger" data-dl-rm="' + i + '">Remove</button></td></tr>').join("") +
+          '</tbody></table></div></div></div>' : '') +
+      '<button class="btn btn-block" id="dl-more" style="margin-bottom:14px">Scan another device</button>' +
+      '<div class="field"><label class="req" for="dl-site">Which site are you at?</label><select id="dl-site">' +
+        '<option value="">— choose —</option>' +
+        locList.map(l => '<option value="' + l.id + '"' + (l.id === DL.siteId ? " selected" : "") + '>' +
+          esc(l.name) + '</option>').join("") + '</select></div>' +
+      '<div class="grid g2"><div class="field"><label class="req" for="dl-name">Your name</label>' +
+        '<input type="text" id="dl-name" autocomplete="name" value="' + esc(DL.name) + '"></div>' +
+        '<div class="field"><label class="req" for="dl-phone">Your phone</label>' +
+        '<input type="tel" id="dl-phone" autocomplete="tel" value="' + esc(DL.phone) + '"></div></div>' +
+      '<div class="field"><label for="dl-note">Problems or extra info (optional)</label>' +
+        '<textarea id="dl-note" placeholder="e.g. box was damaged, temperature indicator triggered, wrong quantity…">' +
+          esc(DL.note) + '</textarea></div>' +
+      '<div class="field"><label>Photos of what arrived (optional)</label>' +
+        '<input type="file" accept="image/*" capture="environment" id="dl-photo-input" style="display:none">' +
+        '<button type="button" class="btn" id="dl-photo-btn">Add a photo</button>' +
+        (DL.photos.length ? '<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:8px">' +
+          DL.photos.map((p,i) => '<div style="position:relative">' +
+            '<img src="' + p + '" alt="" style="width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid var(--line)">' +
+            '<button class="btn btn-sm btn-danger" data-dl-photo-rm="' + i + '" ' +
+              'style="position:absolute;top:-8px;right:-8px;padding:1px 7px;line-height:1.4">×</button></div>').join("") +
+          '</div>' : '') +
+        '<div class="hint">Up to 5 photos. Helpful if anything looks wrong.</div></div>' +
+      whyBox("dl-why") +
+      '<button class="btn btn-primary btn-block btn-lg" id="dl-go">Report it</button>' +
+      '<div class="sep"></div>' +
+      '<a href="#" id="dl-back" class="btn btn-block">Back to sign-in</a>';
+    wire();
+  }
+
+  function wire(){
+    $("#dl-back").onclick = e => { e.preventDefault(); location.hash = ""; showLogin(); };
+    $("#dl-scanbtn").onclick = () => startScan("dl-scan", "product label");
+    $("#dl-more").onclick = () => startScan("dl-scan", "product label");
+    $("#dl-add").onclick = e => { e.preventDefault(); addCurrent(); };
+    const codeEl = $("#dl-code");
+    if(codeEl) codeEl.onkeydown = e => { if(e.key === "Enter"){ e.preventDefault(); addCurrent(); } };
+    $$("[data-dl-rm]").forEach(bn => bn.onclick = () => { DL.items.splice(+bn.dataset.dlRm, 1); paint(); });
+    $("#dl-site").onchange = e => { DL.siteId = e.target.value; clearWhy("dl-why"); };
+    $("#dl-name").oninput = e => { DL.name = e.target.value; };
+    $("#dl-phone").oninput = e => { DL.phone = e.target.value; };
+    $("#dl-note").oninput = e => { DL.note = e.target.value; };
+    const pin = $("#dl-photo-input"), pbtn = $("#dl-photo-btn");
+    if(pbtn) pbtn.onclick = () => { if(DL.photos.length >= 5) return toast("Up to 5 photos.", "warn"); pin.click(); };
+    if(pin) pin.onchange = () => { const f = pin.files && pin.files[0]; pin.value = ""; if(f) resizePhoto(f, du => { DL.photos.push(du); paint(); }); };
+    $$("[data-dl-photo-rm]").forEach(bn => bn.onclick = () => { DL.photos.splice(+bn.dataset.dlPhotoRm, 1); paint(); });
+    $("#dl-go").onclick = submit;
+  }
+
+  async function submit(){
+    const codeEl = $("#dl-code"); if(codeEl && codeEl.value.trim()) addCurrent();
+    if(!DL.items.length) return showWhy("dl-why", "Scan or enter at least one product ID.");
+    if(!DL.siteId)       return showWhy("dl-why", "Choose which site you are at.");
+    if(!DL.name.trim() || !DL.phone.trim()) return showWhy("dl-why", "Your name and phone are required.");
     clearWhy("dl-why");
+    const codes = DL.items.map(x => x.code);
+    const site = siteById(DL.siteId);
 
     if(S.backend){
-      /* The public route matches the unit and, if found, marks it DELIVERED. The
-         team alert and archive record follow with the notifications stage. */
-      const go = $("#dl-go"); go.disabled = true;
+      const go = $("#dl-go"); if(go) go.disabled = true;
       try{
-        const out = await api("POST", "/api/deliveries/report", { code:ref, siteId });
-        confirmScreen(out.site || siteById(siteId), !!out.matched);
-      }catch(e){ go.disabled = false; showWhy("dl-why", e.message || "Could not report the delivery."); }
+        const out = await api("POST", "/api/deliveries/report",
+          { codes, siteId:DL.siteId, reporterName:DL.name.trim(), reporterPhone:DL.phone.trim(),
+            note:DL.note.trim(), photos:DL.photos });
+        confirmScreen(out.site || site, out.results || codes.map(c => ({ code:c, matched:false })));
+      }catch(e){ if(go) go.disabled = false; showWhy("dl-why", e.message || "Could not report the delivery."); }
       return;
     }
 
-    // ---- standalone (local) ----
-    const site = siteById(siteId);
-    const d = findDeviceByCode(ref);
-    if(!d){
-      S.db.notifications.unshift({ id:uid("ntf"), ts:nowISO(),
-        text:"Delivery reported at " + site.name + " for an UNRECOGNISED product ID “" + ref +
-             "” by " + name + " (" + phone + "). Nothing was matched in inventory — check " +
-             "what physically arrived.",
-        forRoles:["ADMIN","CPM","WH_ADMIN"], locationId:siteId, read:false, forUserIds:[] });
-      S.db.logs.unshift({ id:uid("log"), timestamp:nowISO(),
-        action:"Delivery reported for an unrecognised product ID “" + ref + "”",
-        locationId:siteId, userName:name + " (no account)", role:"DELIVERY_RECIPIENT",
-        stateChanges:"no inventory match", comments:"Phone " + phone, highPriority:true });
-      S.db.backupQueue.unshift({ id:uid("bkp"), path:site.name + "/Condition_Reports",
-        filename:"delivery_report_UNMATCHED_" + Date.now() + ".json",
-        content:JSON.stringify({ type:"CASUAL_DELIVERY_REPORT", ref, matched:false,
-          site:site.name, reportedBy:name, phone, at:nowISO() }),
-        ts:nowISO(), synced:false, syncNote:"Queued" });
-      saveDB(S.db);
+    // ---- standalone (local) — photos are not persisted without a server ----
+    const results = [];
+    for(const code of codes){
+      const d = findDeviceByCode(code);
+      if(d){ d.locationId = DL.siteId; d.status = "DELIVERED"; }
+      results.push({ code, matched: !!d });
     }
-    if(d){
-      d.locationId = siteId;
-      /* Deliberately NOT usable stock: this person performs none of the sterile
-         barrier, expiry or ID-match checks. */
-      d.status = "DELIVERED";
-      const shipper = S.db.users.find(u => u.name === d.shippedBy);
-      const cpm = site.cpmUserId ? user(site.cpmUserId) : null;
-      S.db.notifications.unshift({ id:uid("ntf"), ts:nowISO(),
-        text:"Delivery reported at " + site.name + " for " + d.ref + " by " + name + " (" + phone +
-             "). Formal Arrival & Condition Verification is still required.",
-        forRoles:["ADMIN","CPM"], locationId:siteId, read:false,
-        forUserIds:[shipper && shipper.id, cpm && cpm.id].filter(Boolean) });
-      S.db.logs.unshift({ id:uid("log"), timestamp:nowISO(),
-        action:"Delivery reported by a non-employee for " + d.ref, locationId:siteId,
-        userName:name + " (no account)", role:"DELIVERY_RECIPIENT",
-        stateChanges:"→ Delivered (unverified)", comments:"Phone " + phone, highPriority:false });
-      S.db.backupQueue.unshift({ id:uid("bkp"), path:site.name + "/Condition_Reports",
-        filename:"delivery_report_" + d.ref + "_" + Date.now() + ".json",
-        content:JSON.stringify({ type:"CASUAL_DELIVERY_REPORT", ref:d.ref, site:site.name,
-          reportedBy:name, phone, at:nowISO() }),
-        ts:nowISO(), synced:false, syncNote:"Queued" });
-      saveDB(S.db);
-    }
-    confirmScreen(site, !!d);
-  };
+    const matched = results.filter(r => r.matched).length;
+    S.db.notifications.unshift({ id:uid("ntf"), ts:nowISO(),
+      text:"Delivery reported at " + site.name + " by " + DL.name + " (" + DL.phone + "): " +
+           results.length + " device(s), " + matched + " matched" +
+           (DL.note ? " — note: " + DL.note : "") + (DL.photos.length ? " — " + DL.photos.length + " photo(s)" : "") + ".",
+      forRoles:["ADMIN","CPM","WH_ADMIN"], locationId:DL.siteId, read:false, forUserIds:[] });
+    S.db.logs.unshift({ id:uid("log"), timestamp:nowISO(),
+      action:"Delivery reported (public form) — " + results.length + " device(s)", locationId:DL.siteId,
+      userName:DL.name + " (no account)", role:"DELIVERY_RECIPIENT",
+      stateChanges:matched + " matched → Delivered (unverified)",
+      comments:"Codes: " + codes.join(", ") + (DL.note ? " | note: " + DL.note : "") + " | phone " + DL.phone,
+      highPriority: matched < results.length });
+    S.db.backupQueue.unshift({ id:uid("bkp"), path:site.name + "/Condition_Reports",
+      filename:"delivery_report_" + Date.now() + ".json",
+      content:JSON.stringify({ type:"CASUAL_DELIVERY_REPORT", site:site.name, siteId:DL.siteId,
+        reportedBy:{ name:DL.name, phone:DL.phone }, results, note:DL.note, photos:DL.photos.length, at:nowISO() }),
+      ts:nowISO(), synced:false, syncNote:"Queued" });
+    saveDB(S.db);
+    confirmScreen(site, results);
+  }
+
+  paint();
 }
 
 /* ========================================================================= */
