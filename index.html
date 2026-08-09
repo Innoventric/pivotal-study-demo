@@ -14858,9 +14858,13 @@ let PFQ = [], PFR = [];
 function patientForm(p){
   const isNew = !p;
   p = p || { id:uid("pat"), patientCode:"", siteId:visibleLocations().filter(l => l.type === "SITE")[0]?.id || "",
-             procedureDate:"", unicaSize:"", dsSize:"", status:"ELIGIBLE",
+             procedureDate:"", unicaSize:"", dsSize:"", status:"CREATED",
              submitted:false, fileLocked:false, notes:"", piNotes:"",
              customQuestions:[], reminders:[], images:[], caseFile:{} };
+  /* The screening checkboxes are editable here too, so make sure the structure
+     exists (older form-created patients may not have it). */
+  if(!p.screening) p.screening = blankScreening();
+  if(!p.anat) p.anat = blankAnat();
   PFQ = (p.customQuestions || []).map(q => ({ q:q.q, a:q.a || "" }));
   PFR = (p.reminders || []).map(r => ({ date:r.date, text:r.text, done:!!r.done }));
   patientFormRender(p, isNew);
@@ -14890,6 +14894,20 @@ function remindersBlock(){
     '<button type="button" class="btn btn-sm" id="r-add" style="margin-top:6px">Add a reminder</button>';
 }
 
+/* The same clinical-screening checklist shown on the Screening screen, rendered
+   here from p.screening so ticks made in either place are one and the same. */
+function screeningChecksBlock(p){
+  return '<h3 style="margin:16px 0 7px">Clinical screening material received</h3>' +
+    '<div class="hint" style="margin-bottom:8px">The same checklist as the Screening screen — ' +
+    'a tick here (or there) is shared.</div>' +
+    SCREENING_STEPS.map(s => {
+      const st = (p.screening && p.screening[s.k]) || { done:false };
+      return '<label class="check' + (st.done ? " on" : "") + '" style="margin-bottom:6px">' +
+        '<input type="checkbox" data-pscr="' + s.k + '"' + (st.done ? " checked" : "") + '>' +
+        '<span>' + esc(s.label) + '</span></label>';
+    }).join("");
+}
+
 function patientFormRender(p, isNew){
   modal(isNew ? "Register a patient" : "Edit " + p.patientCode,
     '<div class="field"><label class="req" for="p-code">Patient code</label>' +
@@ -14910,7 +14928,7 @@ function patientFormRender(p, isNew){
     '<div class="field"><label for="p-pi">To discuss with the PI</label>' +
       '<textarea id="p-pi">' + esc(p.piNotes || "") + '</textarea>' +
       '<div class="hint">Shown prominently in the briefing before the case file opens.</div></div>' +
-    questionsBlock() + remindersBlock(),
+    screeningChecksBlock(p) + questionsBlock() + remindersBlock(),
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn btn-primary" id="p-save">' + (isNew ? "Register" : "Save") + '</button>' +
     '</div>' + whyBox("p-why"));
@@ -14937,6 +14955,15 @@ function patientFormRender(p, isNew){
     keep(); PFQ.splice(+b.dataset.qdel, 1); redraw(); });
   $$("[data-rdel]").forEach(b => b.onclick = () => {
     keep(); PFR.splice(+b.dataset.rdel, 1); redraw(); });
+
+  /* Screening ticks write straight onto p.screening — the very object the Screening
+     screen reads and writes — so the two views are always in agreement. */
+  $$("[data-pscr]").forEach(cb => cb.onchange = () => {
+    const k = cb.dataset.pscr;
+    if(!p.screening) p.screening = blankScreening();
+    p.screening[k] = { done: cb.checked, by: cb.checked ? S.me.name : "", at: cb.checked ? nowLocalStamp() : "" };
+    const lbl = cb.closest(".check"); if(lbl) lbl.classList.toggle("on", cb.checked);
+  });
 
   $("#p-save").onclick = async () => {
     keep();
