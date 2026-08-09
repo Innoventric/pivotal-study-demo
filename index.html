@@ -10912,7 +10912,8 @@ const CAPABILITIES = {
   deletePatients:  ["ADMIN"],
   lockCaseFile:    ["ADMIN","CPM"],
   overrideFifo:    ["ADMIN","CPM"],
-  registerDevice:  ["ADMIN","EMPLOYEE"]   // produce new devices at an HQ location
+  registerDevice:  ["ADMIN","EMPLOYEE"],  // produce new devices at an HQ location
+  editAnatomical:  ["ADMIN","CPM","EMPLOYEE"]  // edit ONLY the anatomical-evaluation fields
 };
 function can(cap){
   const a = CAPABILITIES[cap];
@@ -13755,7 +13756,7 @@ VIEWS.screening = {
     /* Self-heal any stage persisted as "Completed" without its required fields (e.g. a
        field cleared after completion, or data from an older build): it drops to "In
        progress" so the dropdown never contradicts the badge, even on a plain reload. */
-    if(can("managePatients")){
+    if(can("editAnatomical")){
       let healed = false;
       ANAT_STAGES.forEach(s => { if(reconcileStageStatus(p, s)) healed = true; });
       if(healed) commit();
@@ -13974,7 +13975,7 @@ function anatStageHtml(p, s, ctReady){
   }
   if(!isOpen) return '<div class="card stage">' + head + '</div>';
 
-  const dis = can("managePatients") ? "" : " disabled";
+  const dis = can("editAnatomical") ? "" : " disabled";
   const f = (field, label, type, opts) => {
     opts = opts || {};
     const id = "an-" + s.k + "-" + field;
