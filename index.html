@@ -11851,15 +11851,26 @@ function startScan(id, label){
     stream = null;
   };
 
-  /* jsQR needs pixels, so frames go through a canvas. 900px on the long edge: the
-     four-line Innoventric label is a dense QR, and the previous 480px downscale left
-     too few pixels per module to decode on phones without a native detector (e.g.
-     Samsung Internet), which showed as a camera that opens but never reads. 900px
-     resolves it while staying inside the per-frame budget on modern hardware. */
+  /* jsQR needs pixels. The Innoventric label QR is small on the label, so downscaling
+     the WHOLE frame (the old approach) left far too few pixels per module and it never
+     read. Instead decode a HIGH-RES CROP of the centre square (the on-screen box) so a
+     QR placed in the box gets almost the full sensor resolution, then fall back to a
+     moderate full-frame pass in case the operator left the code outside the box. */
+  function decodeRegion(sx, sy, side, target){
+    cv.width = target; cv.height = target;
+    cx.drawImage(video, sx, sy, side, side, 0, 0, target, target);
+    return PivotalScanner.decodeImageData(cx.getImageData(0, 0, target, target));
+  }
   function decodeFrame(){
     const vw = video.videoWidth, vh = video.videoHeight;
     if(!vw || !vh) return null;
-    const scale = Math.min(1, 900 / Math.max(vw, vh));
+    // 1) centre square (~72%, matches the aperture) at up to 1000px — the strong path.
+    const side = Math.round(Math.min(vw, vh) * 0.72);
+    const sx = Math.round((vw - side) / 2), sy = Math.round((vh - side) / 2);
+    let code = decodeRegion(sx, sy, side, Math.min(side, 1000));
+    if(code) return code;
+    // 2) whole frame at ~1000px — catches a code the operator left outside the box.
+    const scale = Math.min(1, 1000 / Math.max(vw, vh));
     cv.width = Math.round(vw * scale); cv.height = Math.round(vh * scale);
     cx.drawImage(video, 0, 0, cv.width, cv.height);
     return PivotalScanner.decodeImageData(cx.getImageData(0, 0, cv.width, cv.height));
@@ -11869,7 +11880,7 @@ function startScan(id, label){
     /* Ask for continuous autofocus from the start: a label is held close, and many
        Android cameras otherwise open at a fixed/far focus so the QR is blurry and
        nothing decodes. advanced constraints are hints — ignored where unsupported. */
-    video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1280 }, height:{ ideal:960 },
+    video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1920 }, height:{ ideal:1080 },
             advanced:[{ focusMode:"continuous" }] }
   }).then(async s => {
     if(stopped){ s.getTracks().forEach(t => t.stop()); return; }
