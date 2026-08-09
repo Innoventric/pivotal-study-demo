@@ -11825,7 +11825,14 @@ function startScan(id, label){
   $("#scan-type").onclick = () => { MANUAL_OPEN[id] = true; closeModal(); render(); };
 
   const video = $("#scan-video");
-  const det = nativeDetectorPossible() ? new window.BarcodeDetector() : null;
+  /* Construct the native detector defensively: ask specifically for QR (some Android
+     builds expose the API but support only a subset of formats), and never let a
+     failed construction abort scanning — jsQR still runs as the fallback below. */
+  let det = null;
+  if(nativeDetectorPossible()){
+    try{ det = new window.BarcodeDetector({ formats:["qr_code"] }); }
+    catch(_){ try{ det = new window.BarcodeDetector(); }catch(__){ det = null; } }
+  }
   const cv = document.createElement("canvas");
   const cx = cv.getContext("2d", { willReadFrequently:true });
   let stream = null, stopped = false;
@@ -11839,13 +11846,15 @@ function startScan(id, label){
     stream = null;
   };
 
-  /* jsQR needs pixels, so frames go through a small canvas. 480px on the long edge
-     decodes a label held at arm's length and keeps the loop inside a frame budget
-     on an older iPad. */
+  /* jsQR needs pixels, so frames go through a canvas. 900px on the long edge: the
+     four-line Innoventric label is a dense QR, and the previous 480px downscale left
+     too few pixels per module to decode on phones without a native detector (e.g.
+     Samsung Internet), which showed as a camera that opens but never reads. 900px
+     resolves it while staying inside the per-frame budget on modern hardware. */
   function decodeFrame(){
     const vw = video.videoWidth, vh = video.videoHeight;
     if(!vw || !vh) return null;
-    const scale = Math.min(1, 480 / Math.max(vw, vh));
+    const scale = Math.min(1, 900 / Math.max(vw, vh));
     cv.width = Math.round(vw * scale); cv.height = Math.round(vh * scale);
     cx.drawImage(video, 0, 0, cv.width, cv.height);
     return PivotalScanner.decodeImageData(cx.getImageData(0, 0, cv.width, cv.height));
@@ -11863,6 +11872,14 @@ function startScan(id, label){
     /* Cath labs are dim and the drape is dark. If the camera exposes a torch, offer it. */
     const track = s.getVideoTracks()[0];
     const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+    /* A label is held close, and many Android cameras open at a far/fixed focus, so the
+       QR arrives blurry and neither decoder can read it. Ask for continuous autofocus
+       when the camera supports it — best-effort, never fatal. */
+    try{
+      if(caps && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")){
+        await track.applyConstraints({ advanced:[{ focusMode:"continuous" }] });
+      }
+    }catch(e){ /* focus control is optional; scanning still runs without it */ }
     const torchBtn = $("#scan-torch");
     if(torchBtn && caps && caps.torch){
       torchBtn.hidden = false;
