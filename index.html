@@ -13191,6 +13191,17 @@ function submitRegister(){
         const res = await api("POST", "/api/devices/register",
           { locationId, checks:Object.assign({}, REG.checks), units });
         try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+        /* Merge the just-created devices on TOP of the reload. SharePoint can lag a
+           moment before a new item appears in a list query, so the reload above may
+           return without them; the server already gave us the authoritative rows, so
+           make sure they are present (deduped) — otherwise stock screens read empty
+           until the next manual refresh. */
+        if(Array.isArray(res.devices)){
+          for(const nd of res.devices){
+            const i = S.db.devices.findIndex(x => x.id === nd.id);
+            if(i >= 0) S.db.devices[i] = nd; else S.db.devices.push(nd);
+          }
+        }
         finish(res);
       }catch(e){
         if(btn) btn.disabled = false;
