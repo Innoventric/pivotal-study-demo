@@ -11849,28 +11849,41 @@ function startScan(id, label){
       const msg = $("#scan-msg"); if(msg) msg.textContent = "Reading the photo…";
       const url = URL.createObjectURL(file);
       const img = new Image();
-      img.onload = () => {
-        const max = 2200;
-        const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
-        const w = Math.max(1, Math.round(img.naturalWidth * scale));
-        const h = Math.max(1, Math.round(img.naturalHeight * scale));
-        const c = document.createElement("canvas"); c.width = w; c.height = h;
-        const g = c.getContext("2d", { willReadFrequently:true });
-        g.drawImage(img, 0, 0, w, h);
-        let code = PivotalScanner.decodeImageData(g.getImageData(0, 0, w, h));
-        if(!code){                                   // try the centre, where the QR usually is
-          const side = Math.round(Math.min(w, h) * 0.8);
-          const sx = Math.round((w - side) / 2), sy = Math.round((h - side) / 2);
-          const c2 = document.createElement("canvas"); c2.width = side; c2.height = side;
-          const g2 = c2.getContext("2d", { willReadFrequently:true });
-          g2.drawImage(img, sx / scale, sy / scale, side / scale, side / scale, 0, 0, side, side);
-          code = PivotalScanner.decodeImageData(g2.getImageData(0, 0, side, side));
+      img.onload = async () => {
+        let code = null;
+        /* 1) Native detector first — it reads QR, DataMatrix, Aztec and 1-D barcodes,
+           so it copes with a device label that isn't a plain QR. */
+        try{
+          if(nativeDetectorPossible()){
+            let d = null;
+            try{ d = new window.BarcodeDetector(); }catch(_){ d = null; }
+            if(d){ const found = await d.detect(img); if(found && found.length) code = found[0].rawValue; }
+          }
+        }catch(e){ /* fall through to jsQR */ }
+        /* 2) jsQR (QR only) at high resolution — full frame, then a centre crop. */
+        if(!code){
+          const max = 2200;
+          const scale = Math.min(1, max / Math.max(img.naturalWidth, img.naturalHeight));
+          const w = Math.max(1, Math.round(img.naturalWidth * scale));
+          const h = Math.max(1, Math.round(img.naturalHeight * scale));
+          const c = document.createElement("canvas"); c.width = w; c.height = h;
+          const g = c.getContext("2d", { willReadFrequently:true });
+          g.drawImage(img, 0, 0, w, h);
+          code = PivotalScanner.decodeImageData(g.getImageData(0, 0, w, h));
+          if(!code){
+            const side = Math.round(Math.min(w, h) * 0.8);
+            const sx = Math.round((w - side) / 2), sy = Math.round((h - side) / 2);
+            const c2 = document.createElement("canvas"); c2.width = side; c2.height = side;
+            const g2 = c2.getContext("2d", { willReadFrequently:true });
+            g2.drawImage(img, sx / scale, sy / scale, side / scale, side / scale, 0, 0, side, side);
+            code = PivotalScanner.decodeImageData(g2.getImageData(0, 0, side, side));
+          }
         }
         URL.revokeObjectURL(url);
         photoInput.value = "";
         if(code){ MODAL_CLEANUP(); closeModal(); return deliverCode(id, String(code).trim(), false); }
-        if(msg) msg.innerHTML = "<b>Couldn't read a QR in that photo.</b> Retake it closer and " +
-          "centred, with the whole QR sharp and well lit.";
+        if(msg) msg.innerHTML = "<b>Couldn't read the code in that photo.</b> Retake it closer and " +
+          "centred, with the whole code sharp and well lit.";
       };
       img.onerror = () => { URL.revokeObjectURL(url); photoInput.value = "";
         const m2 = $("#scan-msg"); if(m2) m2.textContent = "Could not open that photo."; };
@@ -11882,10 +11895,13 @@ function startScan(id, label){
   /* Construct the native detector defensively: ask specifically for QR (some Android
      builds expose the API but support only a subset of formats), and never let a
      failed construction abort scanning — jsQR still runs as the fallback below. */
+  /* Detect ALL formats the browser supports, not just QR: medical device labels often
+     carry a GS1 DataMatrix (square like a QR but different), which jsQR cannot read. */
   let det = null;
   if(nativeDetectorPossible()){
-    try{ det = new window.BarcodeDetector({ formats:["qr_code"] }); }
-    catch(_){ try{ det = new window.BarcodeDetector(); }catch(__){ det = null; } }
+    try{ det = new window.BarcodeDetector(); }
+    catch(_){ try{ det = new window.BarcodeDetector({ formats:["qr_code","data_matrix"] }); }
+              catch(__){ det = null; } }
   }
   const cv = document.createElement("canvas");
   const cx = cv.getContext("2d", { willReadFrequently:true });
