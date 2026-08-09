@@ -418,8 +418,11 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
 .scan-frame{position:relative; background:#000; border-radius:8px;
             overflow:hidden; aspect-ratio:4/3;}
 .scan-frame video{width:100%; height:100%; object-fit:cover;}
-.scan-ret{position:absolute; inset:18% 14%; border:2px solid rgba(255,255,255,.85);
-          border-radius:10px; box-shadow:0 0 0 100vmax rgba(0,0,0,.35);}
+/* A centred SQUARE aperture — a QR code is square, and a wide rectangle here reads
+   as a 1-D barcode scanner and makes people line the code up the wrong way. */
+.scan-ret{position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+          width:66%; aspect-ratio:1/1; border:3px solid rgba(255,255,255,.92);
+          border-radius:14px; box-shadow:0 0 0 100vmax rgba(0,0,0,.35);}
 
 /* ------------------------------------------------------- shell: mobile menu */
 #menu-btn{display:none; flex:none; width:38px; height:38px; padding:0;}
@@ -11813,14 +11816,16 @@ function startScan(id, label){
   }
 
   modal("Scan the QR code — " + label,
-    '<div class="scan-frame">' +
+    '<div class="scan-frame" id="scan-frame">' +
       '<video id="scan-video" playsinline muted></video><div class="scan-ret"></div>' +
     '</div>' +
-    '<div class="hint" style="margin-top:9px" id="scan-msg" role="status">Starting the camera…</div>',
+    '<div class="hint" style="margin-top:9px" id="scan-msg" role="status">Starting the camera…</div>' +
+    '<div class="hint" style="margin-top:4px">Fit the whole square QR inside the box. ' +
+      'Tap the picture to refocus, and use Flash in dim light.</div>',
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn" id="scan-type">Enter by hand instead</button>' +
     '<span class="spacer"></span>' +
-    '<button class="btn btn-sm" id="scan-torch" hidden>Light</button></div>');
+    '<button class="btn btn-sm" id="scan-torch">Flash</button></div>');
 
   $("#scan-type").onclick = () => { MANUAL_OPEN[id] = true; closeModal(); render(); };
 
@@ -11861,34 +11866,50 @@ function startScan(id, label){
   }
 
   navigator.mediaDevices.getUserMedia({
-    video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1280 }, height:{ ideal:960 } }
+    /* Ask for continuous autofocus from the start: a label is held close, and many
+       Android cameras otherwise open at a fixed/far focus so the QR is blurry and
+       nothing decodes. advanced constraints are hints — ignored where unsupported. */
+    video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1280 }, height:{ ideal:960 },
+            advanced:[{ focusMode:"continuous" }] }
   }).then(async s => {
     if(stopped){ s.getTracks().forEach(t => t.stop()); return; }
     stream = s; video.srcObject = s;
     try{ await video.play(); }catch(e){}
     const msg = $("#scan-msg");
-    if(msg) msg.textContent = "Hold the QR code inside the frame.";
+    if(msg) msg.textContent = "Hold the QR code inside the box.";
 
-    /* Cath labs are dim and the drape is dark. If the camera exposes a torch, offer it. */
     const track = s.getVideoTracks()[0];
-    const caps = track && track.getCapabilities ? track.getCapabilities() : {};
-    /* A label is held close, and many Android cameras open at a far/fixed focus, so the
-       QR arrives blurry and neither decoder can read it. Ask for continuous autofocus
-       when the camera supports it — best-effort, never fatal. */
-    try{
-      if(caps && Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")){
-        await track.applyConstraints({ advanced:[{ focusMode:"continuous" }] });
-      }
-    }catch(e){ /* focus control is optional; scanning still runs without it */ }
+    const caps = (track && track.getCapabilities) ? track.getCapabilities() : {};
+
+    /* Best-effort continuous autofocus after the track is live (some browsers only
+       honour it here, not in getUserMedia). */
+    async function refocus(){
+      try{ await track.applyConstraints({ advanced:[{ focusMode:"continuous" }] }); }catch(e){}
+    }
+    if(!caps || !Array.isArray(caps.focusMode) || caps.focusMode.includes("continuous")) await refocus();
+
+    /* Tap the picture to force a refocus — the reliable fix when a close label opens
+       blurry and the camera will not refocus on its own. */
+    const frame = $("#scan-frame");
+    if(frame) frame.onclick = () => { refocus(); if(msg) msg.textContent = "Focusing…"; };
+
+    /* Flashlight. Always offer the button: some browsers (e.g. Samsung Internet) do not
+       advertise `torch` in capabilities yet still honour the constraint. Try it on tap;
+       only if the attempt actually fails do we tell the user it is unsupported. */
     const torchBtn = $("#scan-torch");
-    if(torchBtn && caps && caps.torch){
-      torchBtn.hidden = false;
+    if(torchBtn){
       let on = false;
       torchBtn.onclick = async () => {
-        on = !on;
-        try{ await track.applyConstraints({ advanced:[{ torch:on }] });
-             torchBtn.textContent = on ? "Light off" : "Light"; }
-        catch(e){ torchBtn.hidden = true; }
+        try{
+          on = !on;
+          await track.applyConstraints({ advanced:[{ torch:on }] });
+          torchBtn.textContent = on ? "Flash off" : "Flash";
+        }catch(e){
+          on = false;
+          torchBtn.disabled = true; torchBtn.textContent = "No flash";
+          if(msg) msg.innerHTML = "This browser can't control the flashlight — " +
+            "turn on more light, or use your phone's own camera torch.";
+        }
       };
     }
 
@@ -11911,8 +11932,8 @@ function startScan(id, label){
       /* Roughly ten seconds of nothing means the code is damaged, or the operator is
          pointing at the wrong thing. Say so rather than letting them keep waiting. */
       if(++misses === 300 && msg)
-        msg.innerHTML = '<b>Still nothing.</b> Move closer, steady the unit, or ' +
-          '<a href="#" id="scan-give-up">enter it by hand</a>.';
+        msg.innerHTML = '<b>Still nothing.</b> Tap the picture to refocus, try Flash, hold the ' +
+          'label ~15–20&nbsp;cm away and steady, or <a href="#" id="scan-give-up">enter it by hand</a>.';
       const giveUp = $("#scan-give-up");
       if(giveUp) giveUp.onclick = e => {
         e.preventDefault(); MANUAL_OPEN[id] = true; closeModal(); render();
