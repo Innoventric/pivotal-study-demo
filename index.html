@@ -11884,7 +11884,9 @@ function startScan(id, label){
       '<b>Zoom</b> to enlarge it. Tap the picture to refocus; use Flash in dim light.</div>',
     '<input type="file" accept="image/*" capture="environment" id="scan-photo-input" style="display:none">' +
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
-    '<button class="btn btn-primary" id="scan-photo">Take a photo</button>' +
+    '<button class="btn btn-primary" id="scan-photo" aria-label="Take a photo">' +
+      '<svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true" fill="none" stroke="currentColor" ' +
+      'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="' + ICON.camera + '"/></svg></button>' +
     '<button class="btn" id="scan-type">Enter by hand instead</button>' +
     '<span class="spacer"></span>' +
     '<button class="btn btn-sm" id="scan-torch">Flash</button></div>');
@@ -12361,7 +12363,8 @@ const ICON = {
   alert:   'M10 3a4.5 4.5 0 00-4.5 4.5c0 3.5-1.5 4.5-1.5 4.5h12s-1.5-1-1.5-4.5A4.5 4.5 0 0010 3zM8.5 15a1.7 1.7 0 003 0',
   history: 'M4 10a6 6 0 106-6 6 6 0 00-4.5 2M4 4v3h3M10 7v3l2 1.5',
   cloud:   'M6 15a3 3 0 01-.3-6A4.5 4.5 0 0114.4 9 2.8 2.8 0 0114 15zM10 8v5m0 0l-2-2m2 2l2-2',
-  gear:    'M10 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM10 2.5l1 2 2.2-.5 1 1.8-1.4 1.8.9 2 2.1.7v2l-2.1.7-.9 2 1.4 1.8-1 1.8-2.2-.5-1 2h-2l-1-2-2.2.5-1-1.8L4.2 15l-.9-2L1.2 12.3v-2l2.1-.7.9-2L2.8 5.8l1-1.8L6 4.5l1-2z'
+  gear:    'M10 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5zM10 2.5l1 2 2.2-.5 1 1.8-1.4 1.8.9 2 2.1.7v2l-2.1.7-.9 2 1.4 1.8-1 1.8-2.2-.5-1 2h-2l-1-2-2.2.5-1-1.8L4.2 15l-.9-2L1.2 12.3v-2l2.1-.7.9-2L2.8 5.8l1-1.8L6 4.5l1-2z',
+  camera:  'M4 7h2.5l1-1.5h5l1 1.5H16a1 1 0 011 1v7a1 1 0 01-1 1H4a1 1 0 01-1-1V8a1 1 0 011-1zM10 13.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z'
 };
 function icon(k){
   return '<svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" ' +
@@ -15048,15 +15051,15 @@ async function showDelivery(){
     $("#dl-again").onclick = showDelivery;
   }
 
-  function addCode(code){
+  function addCode(code, scanned){
     code = String(code || "").trim();
     if(!code) return;
     if(DL.items.some(x => x.code.toUpperCase() === code.toUpperCase()))
       return toast("That device is already in the list.", "warn");
-    DL.items.push({ code }); paint();
+    DL.items.push({ code, scanned: !!scanned }); paint();
   }
-  function addCurrent(){ const el = $("#dl-code"); if(el){ addCode(el.value); el.value = ""; } }
-  SCANFIELDS["dl-scan"] = { label:"product label", onCode:(code) => addCode(code) };
+  function addCurrent(){ const el = $("#dl-code"); if(el){ addCode(el.value, false); el.value = ""; } }
+  SCANFIELDS["dl-scan"] = { label:"product label", onCode:(code) => addCode(code, true) };
 
   /* Shrink a captured photo to keep the upload small (public form, ~4MB body cap). */
   function resizePhoto(file, cb){
@@ -15076,6 +15079,9 @@ async function showDelivery(){
   }
 
   function paint(){
+    /* If any device was entered by hand (not scanned), a photo of the package and
+       labels is required so the team can identify what actually arrived. */
+    const needPhoto = DL.items.some(it => !it.scanned);
     b.innerHTML =
       '<div class="login-h"><h1>Report a delivery</h1>' +
         '<p>One short screen. You do not need an account.</p></div>' +
@@ -15090,7 +15096,8 @@ async function showDelivery(){
         '<div class="card" style="margin:0 0 10px"><div class="card-bd">' +
           '<b>' + DL.items.length + ' device(s) to report</b>' +
           '<div class="tbl-wrap" style="margin-top:6px"><table><tbody>' +
-          DL.items.map((it,i) => '<tr><td class="mono">' + esc(it.code) + '</td>' +
+          DL.items.map((it,i) => '<tr><td class="mono">' + esc(it.code) +
+            (it.scanned ? '' : ' <span class="pill p-grey">typed</span>') + '</td>' +
             '<td style="text-align:right"><button class="btn btn-sm btn-danger" data-dl-rm="' + i + '">Remove</button></td></tr>').join("") +
           '</tbody></table></div></div></div>' : '') +
       '<button class="btn btn-block" id="dl-more" style="margin-bottom:14px">Scan another device</button>' +
@@ -15105,16 +15112,23 @@ async function showDelivery(){
       '<div class="field"><label for="dl-note">Problems or extra info (optional)</label>' +
         '<textarea id="dl-note" placeholder="e.g. box was damaged, temperature indicator triggered, wrong quantity…">' +
           esc(DL.note) + '</textarea></div>' +
-      '<div class="field"><label>Photos of what arrived (optional)</label>' +
+      '<div class="field"><label class="' + (needPhoto ? "req" : "") + '">Photos of what arrived' +
+          (needPhoto ? '' : ' (optional)') + '</label>' +
+        '<div class="' + (needPhoto ? "warn" : "hint") + '" style="margin:0 0 6px">' +
+          'Please photograph <b>the package</b> and <b>the labels</b>.' +
+          (needPhoto ? ' A photo is <b>required</b> here because a code was entered by hand, not scanned.' : '') +
+          '</div>' +
         '<input type="file" accept="image/*" capture="environment" id="dl-photo-input" style="display:none">' +
-        '<button type="button" class="btn" id="dl-photo-btn">Add a photo</button>' +
+        '<button type="button" class="btn' + (needPhoto ? " btn-primary" : "") + '" id="dl-photo-btn" aria-label="Take a photo">' +
+          '<svg viewBox="0 0 20 20" width="17" height="17" aria-hidden="true" fill="none" stroke="currentColor" ' +
+            'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="' + ICON.camera + '"/></svg></button>' +
         (DL.photos.length ? '<div class="row" style="gap:8px;flex-wrap:wrap;margin-top:8px">' +
           DL.photos.map((p,i) => '<div style="position:relative">' +
             '<img src="' + p + '" alt="" style="width:72px;height:72px;object-fit:cover;border-radius:8px;border:1px solid var(--line)">' +
             '<button class="btn btn-sm btn-danger" data-dl-photo-rm="' + i + '" ' +
               'style="position:absolute;top:-8px;right:-8px;padding:1px 7px;line-height:1.4">×</button></div>').join("") +
           '</div>' : '') +
-        '<div class="hint">Up to 5 photos. Helpful if anything looks wrong.</div></div>' +
+        '<div class="hint">Up to 5 photos.</div></div>' +
       whyBox("dl-why") +
       '<button class="btn btn-primary btn-block btn-lg" id="dl-go">Report it</button>' +
       '<div class="sep"></div>' +
@@ -15146,6 +15160,8 @@ async function showDelivery(){
     if(!DL.items.length) return showWhy("dl-why", "Scan or enter at least one product ID.");
     if(!DL.siteId)       return showWhy("dl-why", "Choose which site you are at.");
     if(!DL.name.trim() || !DL.phone.trim()) return showWhy("dl-why", "Your name and phone are required.");
+    if(DL.items.some(it => !it.scanned) && !DL.photos.length)
+      return showWhy("dl-why", "A code was entered by hand — please add a photo of the package and the labels before reporting.");
     clearWhy("dl-why");
     const codes = DL.items.map(x => x.code);
     const site = siteById(DL.siteId);
