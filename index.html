@@ -14842,8 +14842,6 @@ VIEWS.shipment = {
     if(!SH && !restoreShip()) resetShip();
     const req = shipReq();
     const counts = shipCounts();
-    const reqReady = SH.originId && SH.destId &&
-      Object.keys(req).length && Object.values(req).every(n => n > 0);
 
     /* Step 1 — where it is going */
     let h = '<div class="card"><div class="card-hd"><h2>Step 1 · What is going where</h2></div>' +
@@ -14878,10 +14876,10 @@ VIEWS.shipment = {
       '</div>' +
     '</div></div>';
 
-    /* Step 2b — scan the units (only once there is somewhere to send them and a count) */
-    if(reqReady) h += shipmentScanCard(req, counts);
-    else h += '<div class="card"><div class="card-bd"><div class="hint">' +
-      'Choose <b>From</b>, <b>To</b>, what to send and how many, and the scanner opens here.</div></div></div>';
+    /* Step 2b — scan the units. Always visible so the step is obvious; the scan field
+       itself unlocks once an origin (From) is chosen, since every unit is validated
+       against the stock there. */
+    h += shipmentScanCard(req, counts);
 
     /* Step 3 — who is sending, any FIFO override, and the single confirm-all */
     const flags = shipFifoFlags();
@@ -14951,6 +14949,7 @@ SCANFIELDS["sh-scan"] = {
   onCode(code, wasManual){
     if(!SH) return;
     SH.lines = SH.lines || [];
+    if(!SH.originId){ render(); return showWhy("sh-why", "Choose where the units are coming from (From) first."); }
     const req = shipReq();
     let parsed = null, problem = "";
     try{
@@ -15040,8 +15039,10 @@ function shipmentScanCard(req, counts){
     '<div class="card-bd">' +
     '<p class="hint">Scan each unit going out. The label’s REF and serial are cross-checked, and a ' +
     'wrong-type, over-count, duplicate, expired or not-in-stock unit is refused rather than guessed at.</p>' +
-    (done ? '<div class="info">All requested units are scanned. Confirm each line, then send below.</div>'
-          : scanField("sh-scan", "Scan the device label", "", {})) +
+    (!SH.originId
+      ? '<div class="warn">Choose where the units are coming from (<b>From</b>) in Step 1 to start scanning.</div>'
+      : done ? '<div class="info">All requested units are scanned. Confirm each line, then send below.</div>'
+             : scanField("sh-scan", "Scan the device label", "", {})) +
     '<div class="tbl-wrap" style="margin-top:10px"><table><thead><tr>' +
       '<th>Device SN</th><th>Product / size</th><th>Expiry</th>' +
       '<th>From</th><th>To</th><th>Confirm</th><th></th>' +
