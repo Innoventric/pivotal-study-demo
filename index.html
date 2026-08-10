@@ -298,6 +298,20 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
 .matrix .sub-row td:first-child{background:var(--brand-wash);}
 .matrix .tot-row td{background:var(--ink); color:#fff; font-weight:700;}
 .matrix .tot-row td:first-child{background:var(--ink); color:#fff;}
+/* Expand a product/size row to its individual serials. The first cell is the toggle;
+   the caret rotates when open. The expansion is one full-width cell holding a plain
+   nested table, so the sticky/z-index rules of the outer matrix must be neutralised
+   on it or the first serial column would float over the rest. */
+.matrix td[data-stk]{cursor:pointer; user-select:none;}
+.matrix td[data-stk]:hover{background:#fafbfc;}
+.stk-caret{display:inline-block; transition:transform .15s; color:var(--brand,#9E1259); font-size:11px;}
+.matrix .stk-row.open .stk-caret{transform:rotate(90deg);}
+.matrix .stk-exp td{background:var(--grey-bg,#f5f7f9); padding:8px 10px; position:static; z-index:auto;}
+.matrix .stk-exp:hover td:first-child{background:var(--grey-bg,#f5f7f9);}
+table.stk-serials{width:100%; border-collapse:collapse; font-size:12px; background:#fff;}
+table.stk-serials th,table.stk-serials td{border:1px solid var(--line,#e2e8ee); padding:4px 8px;
+  text-align:left; white-space:nowrap; position:static; z-index:auto; font-weight:400;}
+table.stk-serials th{background:#f3e6ee; color:#5a0c3a; font-weight:600;}
 /* A zero is a stock-out, which is the thing this dashboard exists to surface.
    #c8d2da measured 1.53:1 — invisible. #6f7d89 is 4.22:1 on white and 4.08:1 on
    the row-hover tint, so it passes AA as text while still sitting well behind the
@@ -15317,6 +15331,9 @@ async function showDelivery(){
 /* ========================================================================= */
 /* ====================================================== STOCK DASHBOARD == */
 let FL = { locType:"", product:"", status:"", q:"" };
+/* Which product/size rows are expanded to reveal their individual serials.
+   Keyed "PRODUCTTYPE|size"; survives re-renders so a toggle stays open. */
+const STOCK_OPEN = new Set();
 
 function stockCols(){
   return visibleLocations().filter(l =>
@@ -15327,6 +15344,31 @@ function stockCount(productType, size, locationId){
   return S.db.devices.filter(d =>
     d.productType === productType && d.size === size && d.locationId === locationId &&
     (FL.status ? d.status === FL.status : DEV_STATUS[d.status].stock)).length;
+}
+/* The expansion row for one product/size: a full-width cell holding a small table of
+   the individual units behind that row's count — serial, where it is, its status and
+   expiry. It applies exactly the same scope, status filter and visible-column set as
+   stockCount, so the list always matches the number shown on the row. */
+function stockSerialRow(productType, size, colIds, colspan){
+  const units = visibleDevices().filter(d =>
+    d.productType === productType && d.size === size && colIds.has(d.locationId) &&
+    (FL.status ? d.status === FL.status : DEV_STATUS[d.status].stock));
+  units.sort((a, b) => {
+    const la = locName(a.locationId), lb = locName(b.locationId);
+    if(la !== lb) return la < lb ? -1 : 1;
+    return (a.sn || "") < (b.sn || "") ? -1 : (a.sn || "") > (b.sn || "") ? 1 : 0;
+  });
+  const inner = units.length
+    ? '<table class="stk-serials"><thead><tr><th>Serial</th><th>Location</th>' +
+        '<th>Status</th><th>Expiry</th></tr></thead><tbody>' +
+      units.map(d => '<tr>' +
+        '<td class="mono">' + esc(d.sn || "—") + '</td>' +
+        '<td>' + esc(locName(d.locationId)) + '</td>' +
+        '<td>' + pill(DEV_STATUS, d.status) + '</td>' +
+        '<td>' + esc(d.expiration || "—") + '</td></tr>').join("") +
+      '</tbody></table>'
+    : '<div class="hint" style="margin:2px 0">No matching units.</div>';
+  return '<tr class="stk-exp"><td colspan="' + colspan + '">' + inner + '</td></tr>';
 }
 VIEWS.stock = {
   title(){ return S.me.role === "WH_ADMIN" ? "My Warehouse Stock" : "Stock by Location"; },
@@ -15367,10 +15409,12 @@ VIEWS.stock = {
 
     if(!cols.length) return h + '<div class="empty">No locations match the filters.</div>';
 
-    h += '<div class="tbl-wrap" style="max-height:62vh"><table class="matrix"><thead><tr>' +
+    h += '<div class="tbl-wrap" id="stock-scroll" style="max-height:62vh"><table class="matrix"><thead><tr>' +
       '<th>Product / size</th>' + cols.map(c => '<th class="num">' + esc(c.name) + '</th>').join("") +
       '<th class="num">All locations</th></tr></thead><tbody>';
 
+    const colIds = new Set(cols.map(c => c.id));
+    const spanAll = cols.length + 2;    // label column + location columns + "All locations"
     const colTot = cols.map(() => 0); let grand = 0;
     for(const p of prods){
       let sub = cols.map(() => 0), subAll = 0;
@@ -15379,9 +15423,20 @@ VIEWS.stock = {
         const rowTot = cells.reduce((a,b) => a+b, 0);
         cells.forEach((v,i) => { sub[i] += v; colTot[i] += v; });
         subAll += rowTot; grand += rowTot;
-        h += '<tr><td>' + esc(p.label + " " + size) + '</td>' +
+        /* A row with units is a toggle that reveals each unit's serial and location;
+           an empty row stays inert (nothing to expand). */
+        const key = p.key + "|" + size;
+        const open = STOCK_OPEN.has(key);
+        const clickable = rowTot > 0;
+        const firstTd = clickable
+          ? '<td role="button" tabindex="0" aria-expanded="' + (open ? "true" : "false") +
+            '" data-stk="' + esc(key) + '"><span class="stk-caret">▸</span> '
+          : '<td>';
+        h += '<tr' + (clickable ? ' class="stk-row' + (open ? " open" : "") + '"' : '') + '>' +
+          firstTd + esc(p.label + " " + size) + '</td>' +
           cells.map(v => '<td class="num' + (v ? "" : " zero") + '">' + v + '</td>').join("") +
           '<td class="num"><b>' + rowTot + '</b></td></tr>';
+        if(open) h += stockSerialRow(p.key, size, colIds, spanAll);
       }
       h += '<tr class="sub-row"><td>' + esc(p.label) + ' subtotal</td>' +
         sub.map(v => '<td class="num">' + v + '</td>').join("") +
@@ -15411,6 +15466,28 @@ VIEWS.stock = {
       }, 220);
     };
     const c = $("#csv"); if(c) c.onclick = exportCSV;
+
+    /* Expand / collapse a product-size row to its serials. The inner scroll position
+       is preserved across the re-render so a toggle deep in the table doesn't jump
+       back to the top. Keyboard: Enter / Space on the focused row header. */
+    const scroll = $("#stock-scroll");
+    if(scroll){
+      const toggle = td => {
+        const key = td.dataset.stk; if(!key) return;
+        const y = scroll.scrollTop;
+        if(STOCK_OPEN.has(key)) STOCK_OPEN.delete(key); else STOCK_OPEN.add(key);
+        render();
+        const again = $("#stock-scroll"); if(again) again.scrollTop = y;
+      };
+      scroll.addEventListener("click", e => {
+        const td = e.target.closest("[data-stk]"); if(td) toggle(td);
+      });
+      scroll.addEventListener("keydown", e => {
+        if(e.key !== "Enter" && e.key !== " ") return;
+        const td = e.target.closest("[data-stk]"); if(!td) return;
+        e.preventDefault(); toggle(td);
+      });
+    }
   }
 };
 function exportCSV(){
