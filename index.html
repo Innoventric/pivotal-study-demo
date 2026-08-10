@@ -11687,27 +11687,20 @@ document.addEventListener("keydown", e => {
    on the server — the "seen" marker is a single localStorage key. Bump the version and
    edit the groups to publish the next set of highlights. */
 const WHATS_NEW = {
-  version: "1.5.0",
-  since: "7 August 2026",
+  version: "1.6.0",
+  since: "the last update",
   groups: [
-    { h:"Scanning & devices", items:[
-      "The label scanner now reads the Innoventric GS1 DataMatrix labels, with a flashlight, tap-to-focus, zoom, and a “Take a photo” fallback for cameras that struggle to focus.",
-      "New Device Registration at Innoventric HQ (with batch approvals), and “Receive a Delivery” now checks in several units in a single scan.",
-      "The public “Report a delivery” page (no login) lets couriers and reception scan the label, report several devices, and attach notes and photos."
+    { h:"Stock & reports", items:[
+      "In Stock by Location, click a product row to expand every unit of that size — its serial number and exactly where it is. Click again to collapse.",
+      "New Site Product Report: all units received at a site between two dates, who received each and any found compromised, exportable to Excel (CSV) and PDF."
     ] },
-    { h:"Case file & clinical", items:[
-      "The case file was reorganised: a clearer “Procedure info” step and a real-time event timeline with IVC pressures (PRE / POST, plus an optional extra PRE) and a notes box beside each event.",
-      "Implant and Delivery-System sizes are now taken automatically from the Anatomical Evaluation.",
-      "Employees can now edit the Anatomical Evaluation.",
-      "You can now export a full case file to PDF, including its source images."
+    { h:"Sending devices out", items:[
+      "Send a Device Out is reworked: choose what to send (Implant, Delivery System, or both) and how many of each, scan exactly that many units, and confirm the whole shipment in one step. FIFO is still enforced, with an override for a Clinical PM or App Admin."
     ] },
-    { h:"Reports & inventory", items:[
-      "New Site Product Report: every unit received at a site between two dates — who received it and any found compromised — exportable to Excel (CSV) and PDF.",
-      "The patient list shows a “time to / since procedure” countdown, and the home screen shows only the areas you can access."
-    ] },
-    { h:"Data & reliability", items:[
-      "The app now runs on a shared, live database: everyone sees the same up-to-date information, changes are saved centrally and backed up, and a case file is briefly checked out while you edit it so two people can’t overwrite each other.",
-      "Admins can configure who receives product-order notification emails."
+    { h:"Case file", items:[
+      "The Stage 2 pre-procedure checklist has been updated to the current review items.",
+      "Medical questions are now answered at patient registration and carried into the case file, where they stay editable during the procedure.",
+      "Export a full case file to PDF, including its source images."
     ] }
   ]
 };
