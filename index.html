@@ -11670,6 +11670,60 @@ document.addEventListener("keydown", e => {
   else if(!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
 });
 
+/* ------------------------------------------------------------- what's new */
+/* A short, user-facing changelog shown once per browser after sign-in, and shown
+   again only when WHATS_NEW.version changes. Purely presentational: nothing is stored
+   on the server — the "seen" marker is a single localStorage key. Bump the version and
+   edit the groups to publish the next set of highlights. */
+const WHATS_NEW = {
+  version: "1.5.0",
+  since: "7 August 2026",
+  groups: [
+    { h:"Scanning & devices", items:[
+      "The label scanner now reads the Innoventric GS1 DataMatrix labels, with a flashlight, tap-to-focus, zoom, and a “Take a photo” fallback for cameras that struggle to focus.",
+      "New Device Registration at Innoventric HQ (with batch approvals), and “Receive a Delivery” now checks in several units in a single scan.",
+      "The public “Report a delivery” page (no login) lets couriers and reception scan the label, report several devices, and attach notes and photos."
+    ] },
+    { h:"Case file & clinical", items:[
+      "The case file was reorganised: a clearer “Procedure info” step and a real-time event timeline with IVC pressures (PRE / POST, plus an optional extra PRE) and a notes box beside each event.",
+      "Implant and Delivery-System sizes are now taken automatically from the Anatomical Evaluation.",
+      "Employees can now edit the Anatomical Evaluation.",
+      "You can now export a full case file to PDF, including its source images."
+    ] },
+    { h:"Reports & inventory", items:[
+      "New Site Product Report: every unit received at a site between two dates — who received it and any found compromised — exportable to Excel (CSV) and PDF.",
+      "The patient list shows a “time to / since procedure” countdown, and the home screen shows only the areas you can access."
+    ] },
+    { h:"Data & reliability", items:[
+      "The app now runs on a shared, live database: everyone sees the same up-to-date information, changes are saved centrally and backed up, and a case file is briefly checked out while you edit it so two people can’t overwrite each other.",
+      "Admins can configure who receives product-order notification emails."
+    ] }
+  ]
+};
+const WHATS_NEW_KEY = (DEMO ? "pivotal.demo" : "pivotal") + ".whatsnew.seen";
+function whatsNewBody(){
+  return '<p class="hint" style="margin:0 0 12px">Here is what changed since ' + esc(WHATS_NEW.since) + '.</p>' +
+    WHATS_NEW.groups.map(g =>
+      '<h3 style="margin:14px 0 6px;color:#9E1259">' + esc(g.h) + '</h3>' +
+      '<ul style="margin:0 0 4px;padding-left:20px">' +
+        g.items.map(t => '<li style="margin-bottom:5px">' + esc(t) + '</li>').join("") +
+      '</ul>').join("");
+}
+function openWhatsNew(){
+  modal("What’s new", whatsNewBody(),
+    '<div class="row"><button class="btn btn-primary" data-close="1">Got it</button></div>');
+  /* Any close path (Got it, Close, Escape, backdrop) marks it seen, so it does not
+     reappear on the next entry. closeModal() runs MODAL_CLEANUP then clears it. */
+  MODAL_CLEANUP = () => { try{ localStorage.setItem(WHATS_NEW_KEY, WHATS_NEW.version); }catch(e){} };
+}
+function maybeShowWhatsNew(){
+  let seen = null;
+  try{ seen = localStorage.getItem(WHATS_NEW_KEY); }catch(e){}
+  if(seen === WHATS_NEW.version) return;   // already seen this edition
+  if(modalOpen()) return;                  // don't fight another dialog for the screen
+  openWhatsNew();
+}
+
 /* ------------------------------------------------------------- refusal text */
 /* Every "this is why I cannot do that yet" message in the app goes through here.
    Previously each screen wrote into a .hint span parked at the far right of the
@@ -12475,6 +12529,7 @@ function enterApp(){
   renderNav();
   renderSideFoot();
   render();
+  maybeShowWhatsNew();
 }
 
 function renderNav(){
@@ -12540,7 +12595,9 @@ function renderSideFoot(){
       '<div><b>' + esc(S.me.name) + '</b><small>' + esc(ROLES[S.me.role].label) +
       (S.me.guest ? " · guest" : "") + '</small></div></div>' +
     '<div class="hint" style="margin-bottom:8px">Scope: ' + esc(scope) + '</div>' +
+    '<button class="btn btn-sm btn-block" id="whatsnew" style="margin-bottom:6px">What’s new</button>' +
     '<button class="btn btn-sm btn-block" id="signout">Sign out</button>';
+  const wn = $("#whatsnew"); if(wn) wn.onclick = openWhatsNew;
   $("#signout").onclick = signOut;
 }
 
