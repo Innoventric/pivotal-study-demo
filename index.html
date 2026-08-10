@@ -14768,9 +14768,11 @@ function lockCase(p){
 /* ================================================== 3. OUT FOR SHIPMENT === */
 let SH = null;
 function resetShip(){
-  SH = { originId: S.me.locationId || "", productType:"UNICA", size:"M",
-         destId:"", deviceId:"", shipper:S.me.name, override:false, initials:"", reason:"",
-         lines:[] };
+  SH = { originId: S.me.locationId || "", destId:"", shipper:S.me.name,
+         mode:"UNICA",              // what to send: "UNICA" | "DS" | "BOTH"
+         qty:{ UNICA:1, DS:1 },     // how many of each selected type
+         lines:[],                  // scanned units going out
+         override:false, initials:"", reason:"" };
   saveDrafts();
 }
 function restoreShip(){
@@ -14778,31 +14780,74 @@ function restoreShip(){
   if(!d || typeof d !== "object") return false;
   if(d.originId && !loc(d.originId)) d.originId = "";
   if(d.destId && !loc(d.destId)) d.destId = "";
-  if(d.deviceId && !device(d.deviceId)) d.deviceId = "";
   if(!Array.isArray(d.lines)) d.lines = [];
   /* A draft can outlive the units it referenced - a line whose device has since been
      used or shipped must not silently ship again. */
   d.lines = d.lines.filter(l => !l.deviceId || device(l.deviceId));
+  if(d.mode !== "UNICA" && d.mode !== "DS" && d.mode !== "BOTH") d.mode = "UNICA";
+  if(!d.qty || typeof d.qty !== "object") d.qty = { UNICA:1, DS:1 };
+  if(typeof d.shipper !== "string") d.shipper = S.me.name;
   SH = d;
   return true;
 }
+function productTypeLabel(pt){ return (PRODUCTS.find(p => p.key === pt) || { label:pt }).label; }
+/* The requested types and their quantities, derived from the mode + qty inputs. */
+function shipReq(){
+  const r = {};
+  if(SH.mode === "UNICA" || SH.mode === "BOTH") r.UNICA = Math.max(0, parseInt(SH.qty.UNICA, 10) || 0);
+  if(SH.mode === "DS"    || SH.mode === "BOTH") r.DS    = Math.max(0, parseInt(SH.qty.DS, 10) || 0);
+  return r;
+}
+/* How many of each type have actually been scanned. */
+function shipCounts(){
+  const c = {};
+  (SH.lines || []).forEach(l => { c[l.productType] = (c[l.productType] || 0) + 1; });
+  return c;
+}
+/* FIFO check per scanned unit: for each product+size group scanned, the FIFO-valid
+   choices are the earliest-expiry units available at the origin. A scanned unit outside
+   that earliest set is a bypass (it skips an earlier-expiry unit left behind). Returns
+   deviceId -> true when that unit is a bypass. Ships in expiry order later, so a fully
+   FIFO-compliant batch passes the server's sequential FIFO check with no override. */
+function shipFifoFlags(){
+  const flags = {};
+  const byGroup = {};
+  (SH.lines || []).forEach(l => { const k = l.productType + "|" + l.size; (byGroup[k] = byGroup[k] || []).push(l); });
+  for(const k in byGroup){
+    const [pt, size] = k.split("|");
+    const avail = S.db.devices.filter(d => d.locationId === SH.originId &&
+        ["IN_WH","IN_SITE"].includes(d.status) && d.productType === pt && d.size === size)
+      .sort((a, b) => (a.expiration < b.expiration ? -1 : a.expiration > b.expiration ? 1 : 0));
+    const earliest = new Set(avail.slice(0, byGroup[k].length).map(d => d.id));
+    byGroup[k].forEach(l => { flags[l.deviceId] = !(l.deviceId && earliest.has(l.deviceId)); });
+  }
+  return flags;
+}
+/* Keep the scanned lines consistent with the current mode/quantity: drop units whose
+   type is no longer requested, and trim any that exceed the requested count (keeping
+   the earliest scanned). */
+function pruneShipLines(){
+  const req = shipReq();
+  const seen = {};
+  SH.lines = (SH.lines || []).filter(l => {
+    if(!(l.productType in req)) return false;
+    seen[l.productType] = (seen[l.productType] || 0) + 1;
+    return seen[l.productType] <= req[l.productType];
+  });
+}
 VIEWS.shipment = {
   title:"Send a Device Out",
-  sub:"The oldest matching unit is proposed automatically. Sending a different one is recorded.",
+  sub:"Choose what and how many, scan each unit, then confirm the whole shipment at once.",
   body(){
     if(!SH && !restoreShip()) resetShip();
-    const prod = PRODUCTS.find(p => p.key === SH.productType);
-    if(!prod.sizes.includes(SH.size)) SH.size = prod.sizes[0];
-    const pick = SH.originId ? fifoPick(SH.productType, SH.size, SH.originId) : null;
-    const manual = SH.deviceId ? device(SH.deviceId) : null;
-    const chosen = manual || pick;
-    const alt = SH.originId ? S.db.devices.filter(d =>
-      d.locationId === SH.originId && ["IN_WH","IN_SITE"].includes(d.status) &&
-      d.productType === SH.productType && d.size === SH.size) : [];
+    const req = shipReq();
+    const counts = shipCounts();
+    const reqReady = SH.originId && SH.destId &&
+      Object.keys(req).length && Object.values(req).every(n => n > 0);
 
-    return '<div class="card"><div class="card-hd"><h2>Step 1 · What is going where</h2></div>' +
-      '<div class="card-bd">' +
-      '<div class="grid g4">' +
+    /* Step 1 — where it is going */
+    let h = '<div class="card"><div class="card-hd"><h2>Step 1 · What is going where</h2></div>' +
+      '<div class="card-bd"><div class="grid g2">' +
         '<div class="field"><label class="req" for="sh-o">From</label><select id="sh-o">' +
           '<option value="">— choose —</option>' +
           visibleLocations().map(l => '<option value="' + l.id + '"' + (l.id === SH.originId ? " selected" : "") +
@@ -14813,99 +14858,100 @@ VIEWS.shipment = {
             '<option value="' + l.id + '"' + (l.id === SH.destId ? " selected" : "") + '>' +
             esc(l.name) + '</option>').join("") + '</select>' +
           '<div class="hint">Any location in the study, not only the ones you can see stock for.</div></div>' +
-        '<div class="field"><label class="req" for="sh-p">Product</label><select id="sh-p">' +
-          PRODUCTS.map(p => '<option value="' + p.key + '"' + (p.key === SH.productType ? " selected" : "") +
-            '>' + esc(p.label) + '</option>').join("") + '</select></div>' +
-        '<div class="field"><label class="req" for="sh-s">Size</label><select id="sh-s">' +
-          prod.sizes.map(s => '<option' + (s === SH.size ? " selected" : "") + '>' + esc(s) + '</option>').join("") +
-          '</select></div>' +
-      '</div>' +
-      (!SH.originId ? '<div class="hint">Choose where it is coming from to see which unit is proposed.</div>' :
-        pick ? '<div class="okbox"><b>Proposed: <span class="mono">' + esc(pick.ref) + '</span></b> — ' +
-          'the oldest matching unit here, expiring ' + esc(pick.expiration) + '. Sending this one ' +
-          'needs no justification.</div>'
-             : '<div class="warn"><b>No matching stock at this location.</b> ' +
-               (can("overrideFifo") ? 'You can send a different unit by recording an override below.' :
-                'Only a Clinical PM or App Admin can override this.') + '</div>') +
-      (alt.length > 1 ? '<div class="field"><label for="sh-dev">Send a different unit instead</label>' +
-        '<select id="sh-dev"><option value="">Use the proposed unit</option>' +
-        alt.map(d => '<option value="' + d.id + '"' + (d.id === SH.deviceId ? " selected" : "") + '>' +
-          esc(d.ref + " · expires " + d.expiration) + '</option>').join("") + '</select>' +
-        '<div class="hint">Passing over an earlier expiry for a later one is an override, ' +
-        'and is recorded as one.</div></div>' : "") +
-      (chosen ? '<div class="info" style="margin-top:10px"><b>Unit selected:</b> ' +
-        esc(chosen.ref + " · " + devName(chosen)) + ' · expires ' + esc(chosen.expiration) + '</div>' : "") +
-    '</div></div>' +
+      '</div></div></div>';
 
-    masterPackCard() +
-
-    '<div class="card"><div class="card-hd"><h2>Step 2 · Who is sending it</h2></div><div class="card-bd">' +
-      '<div class="grid g2">' +
-        '<div class="field"><label class="req" for="sh-by">Shipped by</label>' +
-          '<input type="text" id="sh-by" value="' + esc(SH.shipper) + '"></div>' +
+    /* Step 2 — what to send and how many of each */
+    h += '<div class="card"><div class="card-hd"><h2>Step 2 · What to send</h2></div><div class="card-bd">' +
+      '<div class="field"><label class="req">Products</label><div class="row" style="gap:8px;flex-wrap:wrap">' +
+        [["UNICA","Implant only"],["DS","Delivery System only"],["BOTH","Implant + Delivery System"]].map(([v,l]) =>
+          '<label class="check' + (SH.mode === v ? " on" : "") + '" style="margin:0">' +
+            '<input type="radio" name="sh-mode" value="' + v + '"' + (SH.mode === v ? " checked" : "") + '>' +
+            '<span>' + esc(l) + '</span></label>').join("") +
+      '</div></div>' +
+      '<div class="grid g2" style="margin-top:10px">' +
+        ((SH.mode === "UNICA" || SH.mode === "BOTH")
+          ? '<div class="field"><label class="req" for="sh-q-u">How many Implants</label>' +
+            '<input type="number" id="sh-q-u" min="1" max="20" value="' + esc(SH.qty.UNICA) + '" style="max-width:120px"></div>' : "") +
+        ((SH.mode === "DS" || SH.mode === "BOTH")
+          ? '<div class="field"><label class="req" for="sh-q-d">How many Delivery Systems</label>' +
+            '<input type="number" id="sh-q-d" min="1" max="20" value="' + esc(SH.qty.DS) + '" style="max-width:120px"></div>' : "") +
       '</div>' +
-      (can("overrideFifo") ? '<label class="check' + (SH.override ? " on" : "") + '" for="sh-ov">' +
-        '<input type="checkbox" id="sh-ov"' + (SH.override ? " checked" : "") + '>' +
-        '<span>Record an override — I am not sending the proposed unit</span></label>' +
-        (SH.override ? '<div class="grid g2" style="margin-top:8px">' +
-          /* This was a password field labelled "Override PIN". Nothing ever checked it
-             and nothing recorded it, so it implied a second factor that did not exist.
-             Initials are honest about what they are — an attestation — and they are
-             written into the audit entry, which makes them worth something. */
-          '<div class="field"><label class="req" for="sh-ini">Your initials</label>' +
-            '<input type="text" id="sh-ini" maxlength="4" value="' + esc(SH.initials) + '" ' +
-            'autocomplete="off" style="max-width:110px">' +
-            '<div class="hint">Recorded in the audit entry beside your account.</div></div>' +
-          '<div class="field"><label class="req" for="sh-rsn">Reason for not sending the proposed unit</label>' +
-            '<input type="text" id="sh-rsn" value="' + esc(SH.reason) + '"></div></div>' : "") : "") +
+    '</div></div>';
+
+    /* Step 2b — scan the units (only once there is somewhere to send them and a count) */
+    if(reqReady) h += shipmentScanCard(req, counts);
+    else h += '<div class="card"><div class="card-bd"><div class="hint">' +
+      'Choose <b>From</b>, <b>To</b>, what to send and how many, and the scanner opens here.</div></div></div>';
+
+    /* Step 3 — who is sending, any FIFO override, and the single confirm-all */
+    const flags = shipFifoFlags();
+    const anyBypass = (SH.lines || []).some(l => l.deviceId && flags[l.deviceId]);
+    h += '<div class="card"><div class="card-hd"><h2>Step 3 · Confirm &amp; send</h2></div><div class="card-bd">' +
+      '<div class="field"><label class="req" for="sh-by">Shipped by</label>' +
+        '<input type="text" id="sh-by" value="' + esc(SH.shipper) + '"></div>' +
+      (anyBypass ? (can("overrideFifo")
+        ? '<div class="warn">One or more scanned units are not the earliest-expiry stock (FIFO). ' +
+          'Record an override to send them.</div>' +
+          '<div class="grid g2" style="margin-top:8px">' +
+            '<div class="field"><label class="req" for="sh-ini">Your initials</label>' +
+              '<input type="text" id="sh-ini" maxlength="4" value="' + esc(SH.initials) + '" ' +
+              'autocomplete="off" style="max-width:110px">' +
+              '<div class="hint">Recorded in the audit entry beside your account.</div></div>' +
+            '<div class="field"><label class="req" for="sh-rsn">Reason for overriding FIFO</label>' +
+              '<input type="text" id="sh-rsn" value="' + esc(SH.reason) + '"></div></div>'
+        : '<div class="warn">One or more scanned units are not the earliest-expiry stock, and only a ' +
+          'Clinical PM or App Admin can override FIFO. Remove them or ask one of them.</div>') : "") +
     '</div><div class="card-ft">' +
       whyBox("sh-why") +
       '<div class="row">' +
-        '<button class="btn btn-primary btn-lg" id="sh-go">Send it</button>' +
+        '<button class="btn btn-primary btn-lg" id="sh-go">Confirm &amp; send all</button>' +
         '<button class="btn" id="sh-clear">Start over</button>' +
         '<span class="spacer"></span>' +
         '<span class="hint">Your progress is kept if you leave this screen.</span>' +
       '</div>' +
-    '</div></div>' +
+    '</div></div>';
 
-    '<div class="card"><div class="card-hd"><h2>Currently in transit</h2>' +
+    h += '<div class="card"><div class="card-hd"><h2>Currently in transit</h2>' +
       '<span class="hint">Sent, not yet checked in at the far end.</span></div>' +
       inTransitTable() + '</div>';
+    return h;
   },
   wire(){
     const b = (id, f) => { const e = $(id); if(e) e.onchange = ev => { f(ev); saveDrafts(); }; };
-    b("#sh-o", e => { SH.originId = e.target.value; SH.deviceId = ""; clearWhy("sh-why"); render(); });
-    b("#sh-p", e => { SH.productType = e.target.value; SH.deviceId = ""; render(); });
-    b("#sh-s", e => { SH.size = e.target.value; SH.deviceId = ""; render(); });
-    b("#sh-d", e => { SH.destId = e.target.value; clearWhy("sh-why"); });
-    b("#sh-dev", e => { SH.deviceId = e.target.value; render(); });
-    b("#sh-ov", e => { SH.override = e.target.checked; render(); });
+    b("#sh-o", e => { SH.originId = e.target.value; clearWhy("sh-why"); render(); });
+    b("#sh-d", e => { SH.destId = e.target.value; clearWhy("sh-why"); render(); });
+    $$('input[name="sh-mode"]').forEach(r => r.onchange = e => {
+      SH.mode = e.target.value; pruneShipLines(); saveDrafts(); render();
+    });
+    const q = (id, key) => { const e = $(id); if(e) e.onchange = ev => {
+      SH.qty[key] = Math.max(1, Math.min(20, parseInt(ev.target.value, 10) || 1));
+      pruneShipLines(); saveDrafts(); render();
+    }; };
+    q("#sh-q-u", "UNICA"); q("#sh-q-d", "DS");
     const on = (id, f) => { const e = $(id); if(e) e.oninput = ev => { f(ev); saveDrafts(); clearWhy("sh-why"); }; };
     on("#sh-by",  e => { SH.shipper  = e.target.value; });
     on("#sh-ini", e => { SH.initials = e.target.value; });
     on("#sh-rsn", e => { SH.reason   = e.target.value; });
-    wireMasterPack();
+    wireShipmentScan();
     wireScanFields();
-    $("#sh-clear").onclick = () => { resetShip(); render(); };
-    $("#sh-go").onclick = doShip;
+    const c = $("#sh-clear"); if(c) c.onclick = () => { resetShip(); render(); };
+    const g = $("#sh-go");    if(g) g.onclick = doShip;
   }
 };
-/* ---------------------------------------------------------------- MASTER PACK ---
-   Up to two units travel in one master carton, so the screen has to accept two
-   labels and let the operator check each line before it is sent. Scanning fills the
-   row; the operator confirms or corrects it. Nothing is shipped from an unconfirmed
-   row - the whole point of showing the table is that a human agrees with it. */
-const MASTER_PACK_MAX = 2;
-
+/* ------------------------------------------------------------- SHIPMENT SCAN ---
+   The shipment is defined up front as "N Implants and/or M Delivery Systems". Each
+   unit is then scanned in; scanning reads the REF and serial and checks them against
+   each other, and the same validation runs on every unit — right type for this
+   shipment, not over the requested count, not a duplicate, not expired, actually in
+   stock at the origin, and (unless overridden) the earliest-expiry unit. Nothing
+   ships from an unconfirmed line: the table exists so a human agrees with it, and the
+   whole shipment is confirmed together at the end. */
 SCANFIELDS["sh-scan"] = {
-  label:"device in the master pack",
+  label:"device to send",
   onCode(code, wasManual){
     if(!SH) return;
     SH.lines = SH.lines || [];
-    if(SH.lines.length >= MASTER_PACK_MAX){
-      showWhy("sh-why", "A master pack holds " + MASTER_PACK_MAX + " units. Remove one first.");
-      return render();
-    }
+    const req = shipReq();
     let parsed = null, problem = "";
     try{
       parsed = window.DeviceQr.parseDeviceQr(code);
@@ -14914,13 +14960,23 @@ SCANFIELDS["sh-scan"] = {
          a hand-typed value: a wrong size here is a wrong implant later. */
       problem = e.message || "That label could not be read.";
     }
-    if(!parsed){
-      showWhy("sh-why", problem);
-      return render();
+    /* On a refusal the screen is re-rendered FIRST and the reason set AFTER, because
+       render() rebuilds the #sh-why box and would otherwise wipe a message set before it. */
+    if(!parsed){ render(); return showWhy("sh-why", problem); }
+    if(!(parsed.productType in req)){
+      render();
+      return showWhy("sh-why", "This is a " + productTypeLabel(parsed.productType) +
+        " unit, which is not part of this shipment.");
+    }
+    const counts = shipCounts();
+    if((counts[parsed.productType] || 0) >= req[parsed.productType]){
+      render();
+      return showWhy("sh-why", "You have already scanned all " + req[parsed.productType] + " " +
+        productTypeLabel(parsed.productType) + " unit(s). Remove one to swap it.");
     }
     if(SH.lines.some(l => l.sn === parsed.sn)){
-      showWhy("sh-why", "That unit is already in this master pack.");
-      return render();
+      render();
+      return showWhy("sh-why", "That unit is already scanned.");
     }
     const known = S.db.devices.find(d => String(d.sn).toUpperCase() === parsed.sn);
     SH.lines.push({
@@ -14938,65 +14994,72 @@ SCANFIELDS["sh-scan"] = {
   }
 };
 
-function masterPackCard(){
-  SH.lines = SH.lines || [];
-  const full = SH.lines.length >= MASTER_PACK_MAX;
-  const fromName = SH.originId ? locName(SH.originId) : "—";
-  const toName   = SH.destId   ? locName(SH.destId)   : "—";
+function shipmentScanCard(req, counts){
+  const flags = shipFifoFlags();
+  const done = Object.keys(req).every(pt => (counts[pt] || 0) >= req[pt]);
+  const progress = Object.keys(req).map(pt =>
+    '<span class="pill ' + ((counts[pt] || 0) >= req[pt] ? "p-green" : "p-orange") + '">' +
+    esc(productTypeLabel(pt)) + ': ' + (counts[pt] || 0) + ' / ' + req[pt] + '</span>').join(" ");
+  const toName = SH.destId ? locName(SH.destId) : "—";
 
-  let rows = "";
+  let rows;
   if(!SH.lines.length){
     rows = '<tr><td colspan="7" class="hint" style="padding:14px">' +
-           'Nothing scanned yet. Scan the QR code on each unit going into this carton.</td></tr>';
+           'Nothing scanned yet. Scan the label on each unit going out.</td></tr>';
   }else{
     rows = SH.lines.map((l, i) => {
-      const unknown = !l.deviceId;
+      const dev = l.deviceId ? device(l.deviceId) : null;
+      const here = dev && dev.locationId === SH.originId && ["IN_WH","IN_SITE"].includes(dev.status);
+      const bypass = l.deviceId && flags[l.deviceId];
+      let issue = "";
+      if(!dev)            issue = '<span class="badge p-orange">not in stock here</span>';
+      else if(!here)      issue = '<span class="badge p-orange">not available at origin</span>';
+      else if(l.expired)  issue = '<span class="badge p-red">expired</span>';
+      else if(bypass)     issue = '<span class="badge p-orange">not earliest expiry — override</span>';
+      const canConfirm = dev && here && !l.expired;
       return '<tr' + (l.confirmed ? '' : ' class="row-unconfirmed"') + '>' +
         '<td class="mono">' + esc(l.sn) + (l.handEntered ?
             ' <span class="badge p-orange">hand-entered</span>' : '') + '</td>' +
-        '<td>' + esc(l.productType + " " + l.size) +
+        '<td>' + esc(productTypeLabel(l.productType) + " " + l.size) +
           '<div class="hint">' + esc(l.ref) + '</div></td>' +
-        '<td class="mono">' + esc(l.expiration) +
-          (l.expired ? ' <span class="badge p-red">expired</span>' : '') + '</td>' +
-        '<td>' + esc(fromName) + '</td>' +
+        '<td class="mono">' + esc(l.expiration) + '</td>' +
+        '<td>' + esc(SH.originId ? locName(SH.originId) : "—") + '</td>' +
         '<td>' + esc(toName) + '</td>' +
-        '<td>' + (unknown
-            ? '<span class="badge p-orange">not in stock here</span>'
-            : '<label class="check' + (l.confirmed ? " on" : "") + '" style="margin:0">' +
-              '<input type="checkbox" data-mpc="' + i + '"' + (l.confirmed ? " checked" : "") + '>' +
-              '<span>Correct</span></label>') + '</td>' +
-        '<td><button class="btn btn-sm" data-mpx="' + i + '">Remove</button></td>' +
+        '<td>' + (canConfirm
+            ? '<label class="check' + (l.confirmed ? " on" : "") + '" style="margin:0">' +
+              '<input type="checkbox" data-shc="' + i + '"' + (l.confirmed ? " checked" : "") + '>' +
+              '<span>Correct</span></label>' + (bypass ? ' ' + issue : "")
+            : issue) + '</td>' +
+        '<td><button class="btn btn-sm" data-shx="' + i + '">Remove</button></td>' +
         '</tr>';
     }).join("");
   }
 
-  return '<div class="card"><div class="card-hd"><h2>Step 1b · Devices in this master pack</h2>' +
-    '<span class="hint">' + SH.lines.length + ' of ' + MASTER_PACK_MAX + '</span></div>' +
+  return '<div class="card"><div class="card-hd"><h2>Step 2b · Scan the units</h2>' +
+    '<span class="hint">' + progress + '</span></div>' +
     '<div class="card-bd">' +
-    '<p class="hint">Two units may be packed in one master carton. Scanning reads the ' +
-    'REF and the serial number and checks them against each other — a label whose REF ' +
-    'and SN disagree about the size is refused, not guessed at.</p>' +
-    (full ? '<div class="info">The carton is full. Remove a line to scan a different unit.</div>'
-          : scanField("sh-scan", "Scan the device QR code", "", {})) +
+    '<p class="hint">Scan each unit going out. The label’s REF and serial are cross-checked, and a ' +
+    'wrong-type, over-count, duplicate, expired or not-in-stock unit is refused rather than guessed at.</p>' +
+    (done ? '<div class="info">All requested units are scanned. Confirm each line, then send below.</div>'
+          : scanField("sh-scan", "Scan the device label", "", {})) +
     '<div class="tbl-wrap" style="margin-top:10px"><table><thead><tr>' +
-      '<th>Device SN</th><th>Device Size</th><th>Expiration Date</th>' +
-      '<th>From</th><th>To</th><th>Confirmed</th><th></th>' +
+      '<th>Device SN</th><th>Product / size</th><th>Expiry</th>' +
+      '<th>From</th><th>To</th><th>Confirm</th><th></th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></div>' +
     (SH.lines.length && SH.lines.some(l => !l.confirmed)
-      ? '<div class="warn" style="margin-top:9px">Every line has to be confirmed before the ' +
-        'carton can be sent.</div>' : "") +
+      ? '<div class="warn" style="margin-top:9px">Confirm every line before sending.</div>' : "") +
     (SH.lines.some(l => l.expired)
-      ? '<div class="warn">A unit in this carton is past its expiry date. It cannot be sent.</div>' : "") +
+      ? '<div class="warn">A scanned unit is past its expiry date. It cannot be sent.</div>' : "") +
     '</div></div>';
 }
 
-function wireMasterPack(){
-  $$("[data-mpc]").forEach(cb => cb.onchange = () => {
-    SH.lines[+cb.dataset.mpc].confirmed = cb.checked;
+function wireShipmentScan(){
+  $$("[data-shc]").forEach(cb => cb.onchange = () => {
+    SH.lines[+cb.dataset.shc].confirmed = cb.checked;
     clearWhy("sh-why"); saveDrafts(); render();
   });
-  $$("[data-mpx]").forEach(b => b.onclick = () => {
-    SH.lines.splice(+b.dataset.mpx, 1);
+  $$("[data-shx]").forEach(b => b.onclick = () => {
+    SH.lines.splice(+b.dataset.shx, 1);
     clearWhy("sh-why"); saveDrafts(); render();
   });
 }
@@ -15013,43 +15076,49 @@ function inTransitTable(){
     '</tbody></table></div>';
 }
 function doShip(){
-  const pick = SH.originId ? fifoPick(SH.productType, SH.size, SH.originId) : null;
-  const d = SH.deviceId ? device(SH.deviceId) : pick;
-  if(!SH.originId) return showWhy("sh-why", "Step 1 — choose where the unit is coming from.");
-  if(!SH.destId)   return showWhy("sh-why", "Step 1 — choose where it is going.");
-  if(!SH.shipper.trim()) return showWhy("sh-why", "Step 2 — record who is sending it.");
-  const bypassing = !d || (pick && d.id !== pick.id);
-  if(bypassing){
-    if(!can("overrideFifo"))
-      return showWhy("sh-why", "There is no matching unit here, and only a Clinical PM or " +
-        "App Admin can override that. Ask one of them, or ship stock in first.");
-    if(!SH.override) return showWhy("sh-why", "Step 2 — this is not the proposed unit, so tick " +
-      "the override box and say why.");
-    if(!SH.initials.trim() || !SH.reason.trim())
-      return showWhy("sh-why", "Step 2 — an override needs both your initials and a reason.");
+  if(!SH.originId) return showWhy("sh-why", "Step 1 — choose where the units are coming from.");
+  if(!SH.destId)   return showWhy("sh-why", "Step 1 — choose where they are going.");
+  const req = shipReq();
+  if(!Object.keys(req).length || Object.values(req).some(n => n < 1))
+    return showWhy("sh-why", "Step 2 — choose what to send and how many.");
+  const counts = shipCounts();
+  for(const pt in req){
+    if((counts[pt] || 0) !== req[pt])
+      return showWhy("sh-why", "Step 2b — scan exactly " + req[pt] + " " + productTypeLabel(pt) +
+        " unit(s); " + (counts[pt] || 0) + " scanned so far.");
   }
-  if(!d) return showWhy("sh-why", "There is no unit available to send.");
-  /* When the carton has been scanned, it is the authority on what is being sent. */
-  const lines = (SH.lines || []);
-  if(lines.length){
-    if(lines.some(l => !l.deviceId))
-      return showWhy("sh-why", "A scanned unit is not in stock at this location. Remove it, " +
-        "or check it in on the Receive a Delivery screen first.");
-    if(lines.some(l => !l.confirmed))
-      return showWhy("sh-why", "Step 1b — confirm every line in the master pack.");
-    if(lines.some(l => l.expired))
-      return showWhy("sh-why", "Step 1b — a unit in this carton is past its expiry date.");
+  if(!SH.shipper.trim()) return showWhy("sh-why", "Step 3 — record who is sending it.");
+  if(!SH.lines.length)   return showWhy("sh-why", "Nothing scanned to send.");
+  /* Every unit passes the same checks: it exists in stock at the origin, it is not
+     expired, and its line has been confirmed. */
+  for(const l of SH.lines){
+    const dev = l.deviceId ? device(l.deviceId) : null;
+    if(!dev || dev.locationId !== SH.originId || !["IN_WH","IN_SITE"].includes(dev.status))
+      return showWhy("sh-why", "A scanned unit (" + l.sn + ") is not in stock at this location. " +
+        "Remove it, or check it in on the Receive a Delivery screen first.");
+    if(l.expired) return showWhy("sh-why", "A scanned unit (" + l.sn + ") is past its expiry date.");
+    if(!l.confirmed) return showWhy("sh-why", "Step 2b — confirm every scanned line.");
+  }
+  const flags = shipFifoFlags();
+  const anyBypass = SH.lines.some(l => flags[l.deviceId]);
+  if(anyBypass){
+    if(!can("overrideFifo"))
+      return showWhy("sh-why", "Some units are not the earliest-expiry stock, and only a Clinical PM " +
+        "or App Admin can override FIFO. Remove them, or ask one of them.");
+    if(!SH.initials.trim() || !SH.reason.trim())
+      return showWhy("sh-why", "Step 3 — a FIFO override needs both your initials and a reason.");
   }
   clearWhy("sh-why");
 
   const from = SH.originId, to = SH.destId;
   const shipper = SH.shipper.trim();
   const at = nowISO();
-  /* If the carton was scanned, every confirmed line ships. Otherwise the single
-     FIFO-proposed unit does. One code path either way, so the audit trail, the
-     notification and the backup record are identical in both cases. */
-  const units = lines.length ? lines.map(l => device(l.deviceId)).filter(Boolean) : [d];
+  /* Ship earliest-expiry first, so every FIFO-compliant unit is the server's current
+     pick when its turn comes and needs no override. */
+  const units = SH.lines.map(l => device(l.deviceId)).filter(Boolean)
+    .sort((a, b) => (a.expiration < b.expiration ? -1 : a.expiration > b.expiration ? 1 : 0));
   const packId = units.length > 1 ? "MP-" + Date.now().toString(36).toUpperCase() : "";
+  const bypassOf = u => !!flags[u.id];
 
   /* The audit line and the permanent archive record for one shipped unit. Identical
      whether the state change happened locally or on the server, so both paths call it. */
@@ -15057,22 +15126,20 @@ function doShip(){
     logAction("Shipped " + u.ref + " (" + devName(u) + ") to " + locName(to), {
       locationId: from,
       stateChanges: DEV_STATUS[before].label + " → In Transit",
-      comments: (packId ? "master pack " + packId + " (" + units.length + " units) — " : "") +
-        (bypassing ? ("FIFO OVERRIDE by " + S.me.email + " (initialled " +
+      comments: (packId ? "shipment " + packId + " (" + units.length + " units) — " : "") +
+        (bypassOf(u) ? ("FIFO OVERRIDE by " + S.me.email + " (initialled " +
           SH.initials.trim().toUpperCase() + ") — " + SH.reason)
-        : lines.length ? "scanned and confirmed" : "FIFO proposal accepted"),
-      highPriority: bypassing
+        : "scanned and confirmed"),
+      highPriority: bypassOf(u)
     });
     queueBackup(locName(from) + "/Inventory_Logs", "shipment_" + u.sn + "_" + Date.now() + ".json", {
       type:"SHIPMENT_RECORD",
       device:{ id:u.id, ref:u.ref, sn:u.sn, mfgDate:u.mfgDate, product:devName(u), expiration:u.expiration },
       masterPackId: packId || null, unitsInPack: units.length,
       from:locName(from), to:locName(to), shippedBy:shipper, shippedAt:at,
-      identifierSource: lines.length
-        ? ((lines.find(l => l.deviceId === u.id) || {}).handEntered ? "hand-entered" : "scanned")
-        : "fifo-proposed",
-      fifoOverride:bypassing, overrideReason: bypassing ? SH.reason : null,
-      overrideInitials: bypassing ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
+      identifierSource: (SH.lines.find(l => l.deviceId === u.id) || {}).handEntered ? "hand-entered" : "scanned",
+      fifoOverride:bypassOf(u), overrideReason: bypassOf(u) ? SH.reason : null,
+      overrideInitials: bypassOf(u) ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
     });
   }
   function finishShip(){
@@ -15081,9 +15148,9 @@ function doShip(){
            ["ADMIN","CPM","EMPLOYEE"], [], to);
     commit();
     /* Amber, not red: an override shipment succeeded, it just carries a note. */
-    toast(bypassing ? "Sent, with the override recorded."
-                    : units.length > 1 ? "Sent — " + units.length + " units in one carton." : "Sent.",
-          bypassing ? "warn" : "good");
+    toast(anyBypass ? "Sent, with the FIFO override recorded."
+                    : units.length > 1 ? "Sent — " + units.length + " units." : "Sent.",
+          anyBypass ? "warn" : "good");
     resetShip(); renderNav(); render();
   }
 
@@ -15091,15 +15158,16 @@ function doShip(){
     /* The server enforces FIFO/override/transitions and owns the ETag, so each unit
        ships through the API; the local state is updated from what it returns. Units
        ship sequentially - the FIFO pick shipping first makes the next unit the pick. */
-    const overrideReason = bypassing ? (SH.initials.trim().toUpperCase() + ": " + SH.reason) : undefined;
     (async () => {
       let done = 0;
       try{
         for(const u of units){
           const before = u.status;
+          const bypass = bypassOf(u);
           const out = await api("POST", "/api/devices/" + encodeURIComponent(u.id) + "/ship", {
             destinationId: to, shipperName: shipper, masterPackId: packId || null,
-            override: bypassing, overrideReason
+            override: bypass,
+            overrideReason: bypass ? (SH.initials.trim().toUpperCase() + ": " + SH.reason) : undefined
           });
           const i = S.db.devices.findIndex(x => x.id === out.device.id);
           if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
