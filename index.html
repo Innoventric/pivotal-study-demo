@@ -450,9 +450,49 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
     padding:11px 12px; font-size:16px;   /* 16px stops iOS zooming on focus */
   }
 }
+
+/* ============================================================ PRINT / PDF =
+   There is no PDF library (default-src 'self' rules out a CDN and the bundle is
+   already large). Instead a report is rendered into #print-root and the browser's
+   own "Save as PDF" is used. #print-root is hidden on screen; while printing, the
+   body gets .print-mode and everything EXCEPT #print-root is hidden, so the print
+   is exactly the report — no sidebar, no header, no toasts. */
+#print-root{ display:none; }
+.pr-doc{ color:#111; font:13px/1.5 -apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+.pr-doc h1{ font-size:20px; margin:0 0 2px; }
+.pr-doc h2{ font-size:15px; margin:18px 0 6px; padding-bottom:3px; border-bottom:2px solid #9E1259; color:#9E1259; }
+.pr-doc h3{ font-size:13px; margin:12px 0 4px; color:#333; }
+.pr-head{ display:flex; align-items:center; gap:12px; border-bottom:3px solid #9E1259; padding-bottom:10px; margin-bottom:8px; }
+.pr-head .pr-meta{ margin-left:auto; text-align:right; font-size:11px; color:#555; }
+.pr-sub{ color:#555; font-size:12px; margin:0 0 6px; }
+.pr-tbl{ width:100%; border-collapse:collapse; margin:6px 0 10px; font-size:12px; }
+.pr-tbl th,.pr-tbl td{ border:1px solid #ccc; padding:5px 7px; text-align:left; vertical-align:top; }
+.pr-tbl th{ background:#f3e6ee; color:#5a0c3a; font-weight:600; }
+.pr-tbl tr:nth-child(even) td{ background:#faf6f9; }
+.pr-bad{ color:#b0113a; font-weight:700; }
+.pr-ok{ color:#1a7f37; }
+.pr-kv{ width:100%; border-collapse:collapse; margin:2px 0 8px; font-size:12px; }
+.pr-kv td{ padding:3px 6px; vertical-align:top; border-bottom:1px solid #eee; }
+.pr-kv td.k{ width:38%; color:#555; font-weight:600; }
+.pr-imgs{ display:flex; flex-wrap:wrap; gap:10px; margin:6px 0; }
+.pr-imgs figure{ margin:0; width:47%; }
+.pr-imgs img{ width:100%; border:1px solid #999; border-radius:4px; }
+.pr-imgs figcaption{ font-size:10px; color:#555; margin-top:2px; }
+.pr-empty{ color:#777; font-style:italic; }
+.pr-foot{ margin-top:16px; padding-top:6px; border-top:1px solid #ccc; font-size:10px; color:#777; }
+@media print{
+  @page{ margin:14mm; }
+  body.print-mode > *:not(#print-root){ display:none !important; }
+  body.print-mode #print-root{ display:block !important; }
+  .pr-doc h2{ break-after:avoid; }
+  .pr-tbl tr,.pr-imgs figure{ break-inside:avoid; }
+}
 </style>
 </head>
 <body>
+
+<!-- Print/PDF target. Filled by printHtml(), shown only while body has .print-mode. -->
+<div id="print-root" aria-hidden="true"></div>
 
 <!-- aria-live: toasts are the only confirmation several actions get, and without
      this a screen reader never hears them at all. -->
@@ -12388,6 +12428,7 @@ const NAV = [
   { k:"shipment", ic:"ship",    label:"Send a Device Out",  roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
   { k:"stock",    ic:"stock",   label:"Stock by Location",  roles:["ADMIN","CPM","EMPLOYEE"] },
   { k:"stock",    ic:"stock",   label:"My Warehouse Stock", roles:["WH_ADMIN"] },
+  { k:"sitereport", ic:"history", label:"Site Product Report", roles:["ADMIN","CPM","WH_ADMIN"] },
   { grp:"Procedures" },
   { k:"screening",ic:"case",    label:"Patient Screening",  roles:["ADMIN","CPM","EMPLOYEE"] },
   { k:"clinical", ic:"case",    label:"Procedure Case File",roles:["ADMIN","CPM","EMPLOYEE"] },
@@ -14342,6 +14383,10 @@ VIEWS.clinical = {
       '</div>' +
       tf(p,"postNotes","Post-procedure notes","textarea") +
     '</div><div class="card-ft">' +
+      /* Export is available whatever the file's state — including after the final lock,
+         which is exactly when a shareable PDF of the whole procedure is wanted. */
+      '<div class="row" style="margin-bottom:10px">' +
+        '<button class="btn" id="pt-pdf">Export case file (PDF)</button></div>' +
       (p.fileLocked ? '<div class="row"><span class="pill p-green">Permanently locked</span></div>' :
       whyBox("pt-why") +
       '<div class="row">' +
@@ -14496,6 +14541,7 @@ VIEWS.clinical = {
     const sv = $("#pt-save");   if(sv) sv.onclick = () => saveDraft(p);
     const sb = $("#pt-submit"); if(sb) sb.onclick = () => submitCase(p);
     const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
+    const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
   }
 };
 
@@ -15324,6 +15370,334 @@ function exportCSV(){
   a.download = "pivotal_stock_" + new Date().toISOString().slice(0,10) + ".csv";
   a.click(); URL.revokeObjectURL(a.href);
   toast("CSV exported.", "good");
+}
+
+/* ============================================== PRINT / PDF (shared) ====== */
+function prLogoSvg(){
+  return '<svg viewBox="0 0 120 100" width="42" height="35" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">' +
+    '<polygon points="30,6 60,36 30,66 0,36" fill="#9E1259"/>' +
+    '<polygon points="90,6 120,36 90,66 60,36" fill="#E4187A"/>' +
+    '<polygon points="60,36 60,96 30,66" fill="#C2166B"/>' +
+    '<polygon points="60,36 90,66 60,96" fill="#EE3D8C"/></svg>';
+}
+/* Wrap report body HTML in the branded document shell used for every PDF. */
+function printDoc(titleText, bodyHtml){
+  const who = (S.me && S.me.name) || "";
+  const stamp = fmtTs(nowISO());
+  return '<div class="pr-doc">' +
+    '<div class="pr-head">' + prLogoSvg() +
+      '<div><h1>' + esc(titleText) + '</h1>' +
+        '<div class="pr-sub">Innoventric &middot; Pivotal Study Procedures</div></div>' +
+      '<div class="pr-meta">Generated ' + esc(stamp) + '<br>by ' + esc(who) + '</div>' +
+    '</div>' + bodyHtml +
+    '<div class="pr-foot">Innoventric &mdash; Pivotal Study Procedures. Generated from the live ' +
+      'application on ' + esc(stamp) + '. May contain confidential clinical information.</div>' +
+  '</div>';
+}
+/* Render HTML into #print-root and open the browser's print / "Save as PDF" dialog.
+   No PDF library is bundled (default-src 'self' rules out a CDN); the print CSS hides
+   everything except #print-root so the output is exactly the report. */
+function printHtml(html){
+  const root = document.getElementById("print-root");
+  if(!root){ toast("Printing is unavailable here.", "bad"); return; }
+  root.innerHTML = html;
+  document.body.classList.add("print-mode");
+  let done = false;
+  const cleanup = () => {
+    if(done) return; done = true;
+    document.body.classList.remove("print-mode");
+    root.innerHTML = "";
+    window.removeEventListener("afterprint", cleanup);
+  };
+  window.addEventListener("afterprint", cleanup);
+  /* One tick lets layout and any freshly-decoded <img> data URLs settle before the
+     browser snapshots the page; the long timer is a fallback if afterprint never fires. */
+  setTimeout(() => { window.print(); setTimeout(cleanup, 90000); }, 80);
+}
+function downloadTextFile(name, text, mime){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type:mime || "text/plain;charset=utf-8" }));
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+function csvCell(v){ return '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"'; }
+function toCSV(rows){
+  /* Lead with a UTF-8 BOM so Excel opens Hebrew and other non-ASCII text correctly. */
+  return "﻿" + rows.map(r => r.map(csvCell).join(",")).join("\r\n");
+}
+function slugify(s){ return String(s || "").trim().replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "site"; }
+
+/* ======================================= SITE PRODUCT REPORT (feature 1) == */
+let SR = { siteId:"", from:"", to:"" };
+function srDefaults(){
+  if(!SR.to) SR.to = new Date().toISOString().slice(0, 10);
+  if(!SR.from){ const d = new Date(); d.setDate(d.getDate() - 90); SR.from = d.toISOString().slice(0, 10); }
+  if(!SR.siteId){
+    const locs = visibleLocations();
+    const site = locs.find(l => l.type === "SITE") || locs[0];
+    SR.siteId = site ? site.id : "";
+  }
+}
+function srDayCount(){
+  const a = new Date(SR.from + "T00:00:00"), b = new Date(SR.to + "T00:00:00");
+  if(isNaN(a) || isNaN(b)) return "—";
+  return Math.max(0, Math.round((b - a) / 86400000) + 1);
+}
+/* Units RECEIVED at a site within a date range, read from the audit log — the one
+   timestamped, per-event source of who received a unit and whether it was found
+   compromised. Product/size come from the catalogue REF (deterministic); the serial
+   number is not shown here because the arrival log records the REF, not the unit. */
+const SR_ARRIVAL_RE = /^Arrival & condition verification completed for (.+)$/;
+function siteReportRows(siteId, from, to){
+  const rows = [];
+  for(const l of (S.db.logs || [])){
+    if(l.locationId !== siteId) continue;
+    const day = String(l.timestamp || "").slice(0, 10);
+    if(from && day < from) continue;
+    if(to && day > to) continue;
+    const m = SR_ARRIVAL_RE.exec(l.action || "");
+    if(!m) continue;
+    const ref = m[1].trim();
+    const dev = (S.db.devices || []).find(d => d.ref === ref) || null;
+    const comments = l.comments || "";
+    const compromised = /COMPROMISED/i.test(comments);
+    rows.push({
+      ts: l.timestamp || "",
+      ref,
+      product: dev ? devName(dev) : ref,
+      receivedBy: l.userName || "—",
+      compromised,
+      detail: compromised ? comments.replace(/^COMPROMISED:\s*/i, "") : comments
+    });
+  }
+  rows.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
+  return rows;
+}
+VIEWS.sitereport = {
+  title:"Site Product Report",
+  sub:"Units received at a site between two dates — who received each, and any found compromised. Export to Excel (CSV) or PDF.",
+  body(){
+    srDefaults();
+    const locs = visibleLocations();
+    if(!locs.length) return '<div class="empty">No locations to report on.</div>';
+    const rows = SR.siteId ? siteReportRows(SR.siteId, SR.from, SR.to) : [];
+    const bad = rows.filter(r => r.compromised).length;
+
+    let h = '<div class="card"><div class="card-bd"><div class="grid g3" style="margin:0">' +
+      '<div class="field" style="margin:0"><label for="sr-site">Site / location</label><select id="sr-site">' +
+        locs.map(l => '<option value="' + esc(l.id) + '"' + (SR.siteId === l.id ? " selected" : "") + '>' +
+          esc(l.name) + '</option>').join("") + '</select></div>' +
+      '<div class="field" style="margin:0"><label for="sr-from">From date</label>' +
+        '<input type="date" id="sr-from" value="' + esc(SR.from) + '"></div>' +
+      '<div class="field" style="margin:0"><label for="sr-to">To date</label>' +
+        '<input type="date" id="sr-to" value="' + esc(SR.to) + '"></div>' +
+    '</div></div></div>';
+
+    h += '<div class="grid g3" style="margin:12px 0">' +
+      [["Units received", rows.length, ""], ["Compromised", bad, bad ? "p-red" : ""],
+       ["Days in range", srDayCount(), ""]].map(m =>
+        '<div class="card" style="margin:0"><div class="card-bd">' +
+          '<div class="hint" style="margin:0 0 3px">' + esc(m[0]) + '</div>' +
+          '<div style="font-size:24px;font-weight:700' + (m[2] === "p-red" && m[1] ? ";color:var(--bad-fg)" : "") +
+            '">' + m[1] + '</div></div></div>').join("") +
+    '</div>';
+
+    h += '<div class="row" style="margin-bottom:12px;gap:8px">' +
+      '<button class="btn" id="sr-csv"' + (rows.length ? "" : " disabled") + '>Export to Excel (CSV)</button>' +
+      '<button class="btn btn-primary" id="sr-pdf"' + (rows.length ? "" : " disabled") + '>Export PDF</button>' +
+    '</div>';
+
+    if(!rows.length) return h + '<div class="empty">No units were received at ' +
+      esc(locName(SR.siteId)) + ' between ' + esc(SR.from) + ' and ' + esc(SR.to) + '.</div>';
+
+    h += '<div class="tbl-wrap"><table class="matrix"><thead><tr>' +
+      '<th>Date received</th><th>Product</th><th>REF</th><th>Received by</th>' +
+      '<th>Condition</th><th>Details</th></tr></thead><tbody>' +
+      rows.map(r => '<tr>' +
+        '<td>' + esc(fmtTs(r.ts)) + '</td>' +
+        '<td>' + esc(r.product) + '</td>' +
+        '<td class="mono">' + esc(r.ref) + '</td>' +
+        '<td>' + esc(r.receivedBy) + '</td>' +
+        '<td>' + (r.compromised ? '<span class="pill p-red">Compromised</span>'
+                                : '<span class="pill p-green">OK</span>') + '</td>' +
+        '<td>' + esc(r.detail) + '</td>' +
+      '</tr>').join("") + '</tbody></table></div>';
+    return h;
+  },
+  wire(){
+    const s = $("#sr-site"); if(s) s.onchange = e => { SR.siteId = e.target.value; render(); };
+    const f = $("#sr-from"); if(f) f.onchange = e => { SR.from = e.target.value; render(); };
+    const t = $("#sr-to");   if(t) t.onchange = e => { SR.to = e.target.value; render(); };
+    const c = $("#sr-csv");  if(c) c.onclick = siteReportCSV;
+    const p = $("#sr-pdf");  if(p) p.onclick = siteReportPDF;
+  }
+};
+function siteReportCSV(){
+  const rows = siteReportRows(SR.siteId, SR.from, SR.to);
+  const out = [
+    ["Site product report"],
+    ["Site", locName(SR.siteId)],
+    ["From", SR.from], ["To", SR.to],
+    ["Generated", fmtTs(nowISO())], ["By", (S.me && S.me.name) || ""],
+    [],
+    ["Date received", "Product", "REF", "Received by", "Condition", "Details"]
+  ].concat(rows.map(r => [fmtTs(r.ts), r.product, r.ref, r.receivedBy,
+    r.compromised ? "COMPROMISED" : "OK", r.detail]));
+  downloadTextFile("site_report_" + slugify(locName(SR.siteId)) + "_" + SR.from + "_to_" + SR.to + ".csv",
+    toCSV(out), "text/csv;charset=utf-8");
+  toast("CSV exported.", "good");
+}
+function siteReportPDF(){
+  const rows = siteReportRows(SR.siteId, SR.from, SR.to);
+  const bad = rows.filter(r => r.compromised).length;
+  const body =
+    '<table class="pr-kv"><tbody>' +
+      '<tr><td class="k">Site / location</td><td>' + esc(locName(SR.siteId)) + '</td></tr>' +
+      '<tr><td class="k">Date range</td><td>' + esc(SR.from) + ' → ' + esc(SR.to) + '</td></tr>' +
+      '<tr><td class="k">Units received</td><td>' + rows.length + '</td></tr>' +
+      '<tr><td class="k">Compromised</td><td>' + (bad ? '<span class="pr-bad">' + bad + '</span>' : "0") + '</td></tr>' +
+    '</tbody></table>' +
+    '<h2>Units received</h2>' +
+    (rows.length
+      ? '<table class="pr-tbl"><thead><tr><th>Date received</th><th>Product</th><th>REF</th>' +
+        '<th>Received by</th><th>Condition</th><th>Details</th></tr></thead><tbody>' +
+        rows.map(r => '<tr><td>' + esc(fmtTs(r.ts)) + '</td><td>' + esc(r.product) + '</td>' +
+          '<td>' + esc(r.ref) + '</td><td>' + esc(r.receivedBy) + '</td>' +
+          '<td class="' + (r.compromised ? "pr-bad" : "pr-ok") + '">' +
+            (r.compromised ? "COMPROMISED" : "OK") + '</td>' +
+          '<td>' + esc(r.detail) + '</td></tr>').join("") +
+        '</tbody></table>'
+      : '<div class="pr-empty">No units were received in this period.</div>');
+  printHtml(printDoc("Site Product Report — " + locName(SR.siteId), body));
+}
+
+/* ============================================ CASE-FILE PDF (feature 2) === */
+async function fetchImageDataUrl(im){
+  /* An image captured in THIS session still carries its redacted data URL, so use it
+     directly. Otherwise read the file back from OneDrive (backend mode only) through
+     the narrow, image-only output-download route. */
+  if(im && im.thumb && /^data:/.test(im.thumb)) return im.thumb;
+  if(!S.backend || !im || !im.filename) return null;
+  try{
+    const path = (im.folder ? im.folder + "/" : "") + im.filename;
+    const r = await fetch("/api/output/download?path=" + encodeURIComponent(path), { credentials:"same-origin" });
+    if(!r.ok) return null;
+    const blob = await r.blob();
+    return await new Promise(res => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => res(null);
+      fr.readAsDataURL(blob);
+    });
+  }catch(e){ return null; }
+}
+function prKv(pairs){
+  return '<table class="pr-kv"><tbody>' + pairs.map(pr =>
+    '<tr><td class="k">' + esc(pr[0]) + '</td><td>' +
+      ((pr[1] == null || pr[1] === "") ? "—" : esc(pr[1])) + '</td></tr>').join("") +
+    '</tbody></table>';
+}
+function prChecklist(items, arr){
+  arr = arr || [];
+  return '<ul style="margin:4px 0 8px;padding-left:18px">' + items.map((t, i) =>
+    '<li>' + (arr[i] ? "☑ " : "☐ ") + esc(t) + '</li>').join("") + '</ul>';
+}
+function prPressure(c, key){
+  const has = ["Sys", "Dias", "Mean", "At"].some(s => { const v = c[key + s]; return v !== "" && v != null; });
+  if(!has) return "—";
+  const g = s => { const v = c[key + s]; return (v === "" || v == null) ? "–" : v; };
+  return g("Sys") + "\\" + g("Dias") + "(" + g("Mean") + ")" + (c[key + "At"] ? "  @ " + c[key + "At"] : "");
+}
+function prImageGroup(p, key, label, imgMap){
+  const mine = (p.images || []).filter(i => i.field === key);
+  if(!mine.length) return "";
+  return '<h3>' + esc(label) + ' — source image(s)</h3><div class="pr-imgs">' +
+    mine.map(i => '<figure>' +
+      (imgMap[i.id]
+        ? '<img src="' + imgMap[i.id] + '" alt="' + esc(label) + '">'
+        : '<div class="pr-empty">Image not available (' + esc(i.filename || "") + ')</div>') +
+      '<figcaption>' + esc(i.filename || "") + '</figcaption></figure>').join("") + '</div>';
+}
+function caseFilePdfBody(p, imgMap){
+  const c = p.caseFile || {};
+  const dep = fmtDur(minsBetween(c.deployStart, c.deployEnd));
+  const sts = fmtDur(minsBetween(c.dsIn, c.dsOut));
+  let h = "";
+
+  h += '<h2>Patient</h2>' + prKv([
+    ["Patient code", p.patientCode],
+    ["Site", locName(p.siteId)],
+    ["Workflow status", (PT_STATUS[p.status] || {}).label || p.status],
+    ["Procedure date", fmtDate(p.procedureDate)],
+    ["Unica size", p.unicaSize], ["Delivery System size", p.dsSize],
+    ["Submitted", p.submitted ? "Yes" : "No"],
+    ["Case file locked", p.fileLocked ? "Yes" : "No"]
+  ]);
+  if(p.piNotes) h += '<h3>To discuss with the PI</h3><div>' + esc(p.piNotes) + '</div>';
+  if(p.notes)   h += '<h3>Notes</h3><div>' + esc(p.notes) + '</div>';
+
+  h += '<h2>Stage 1 — Procedure info</h2>' + prKv([
+    ["Date of procedure", c.procDate], ["Proctor", c.proctor],
+    ["Tech 1st", c.tech1], ["Tech 2nd", c.tech2], ["Clinical", c.clinical]
+  ]);
+
+  h += '<h2>Stage 2 — Pre-procedure checklists</h2>' + prKv([
+    ["Physician 1", c.physician1], ["Physician 2", c.physician2], ["Echo operator", c.echoOperator]
+  ]);
+  h += '<h3>Training &amp; review checklist</h3>' + prChecklist(TRAINING_ITEMS, c.training);
+  if(p.customQuestions && p.customQuestions.length){
+    h += '<h3>Custom clinical questions</h3>' + prKv(p.customQuestions.map(q => [q.q, q.a]));
+  }
+  h += '<h3>Device verification</h3>' + prChecklist(DEVICE_CONFIRMS, c.confirms);
+
+  h += '<h2>Stage 3 — Real-time clinical event logger</h2>' + prKv([
+    ["Introducer insertion time", c.introducerTime], ["— notes", c.introducerTimeNote],
+    ["ACT >250s achieved", c.actTime], ["— notes", c.actTimeNote],
+    ["IVC pressure PRE", prPressure(c, "ivcPre")], ["— notes", c.ivcPreNote],
+    ["DS insertion", c.dsIn], ["— notes", c.dsInNote],
+    ["IVC pressure PRE (additional)", prPressure(c, "ivcPre2")], ["— notes", c.ivcPre2Note],
+    ["Deployment initiation", c.deployStart], ["— notes", c.deployStartNote],
+    ["Deployment end", c.deployEnd], ["— notes", c.deployEndNote],
+    ["IVC pressure POST", prPressure(c, "ivcPost")], ["— notes", c.ivcPostNote],
+    ["DS extraction", c.dsOut], ["— notes", c.dsOutNote],
+    ["Deployment duration (computed)", dep], ["Skin to skin (computed)", sts],
+    ["Closing method", c.closingMethod], ["Closing time", c.closingTime], ["Closing notes", c.closingNote],
+    ["Total contrast volume (mL)", c.contrast], ["Contrast form", c.contrastForm], ["Contrast notes", c.contrastNote],
+    ["Echo parameter collection", c.echoParams]
+  ]);
+  h += prImageGroup(p, "ivcPre", "IVC pressure PRE", imgMap);
+  h += prImageGroup(p, "ivcPre2", "IVC pressure PRE (additional)", imgMap);
+  h += prImageGroup(p, "ivcPost", "IVC pressure POST", imgMap);
+  h += prImageGroup(p, "echoParams", "Echo parameters", imgMap);
+
+  h += '<h2>Stage 4 — Post-procedure verification</h2>' + prKv([
+    ["Devices used as expected?", c.asExpected],
+    ["What happened instead", c.notExpectedBranch],
+    ["Rejected / failed device", c.failRef ? (c.failRef + (c.failManual ? " (hand-entered)" : "")) : ""],
+    ["Replacement used", c.replRef ? (c.replRef + (c.replManual ? " (hand-entered)" : "")) : ""],
+    ["Reason", c.failReason], ["Failure detail", c.failDetail],
+    ["Post-procedure notes", c.postNotes]
+  ]);
+  return h;
+}
+async function exportCaseFilePDF(p){
+  if(!p) return;
+  const btn = $("#pt-pdf");
+  const label = btn ? btn.textContent : "";
+  if(btn){ btn.disabled = true; btn.textContent = "Preparing PDF…"; }
+  try{
+    const imgs = p.images || [];
+    const imgMap = {};
+    await Promise.all(imgs.map(async im => { imgMap[im.id] = await fetchImageDataUrl(im); }));
+    const missing = imgs.filter(im => !imgMap[im.id]).length;
+    printHtml(printDoc("Case File — " + (p.patientCode || "patient"), caseFilePdfBody(p, imgMap)));
+    if(missing) toast(missing + " image(s) could not be loaded; they are marked in the PDF.", "bad");
+  }catch(e){
+    toast("Could not prepare the case-file PDF.", "bad");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = label; }
+  }
 }
 
 /* ============================================================= AUDIT LOG = */
