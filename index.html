@@ -11158,15 +11158,13 @@ const PRODUCTS = [
 ];
 
 const TRAINING_ITEMS = [
-  "Patient anatomy reviewed against IFU inclusion criteria",
-  "CT measurements verified by two independent reviewers",
-  "Implant sizing confirmed with the clinical team",
-  "Procedure simulation / rehearsal completed",
-  "Proctor briefed and available on site",
-  "Cath lab imaging setup verified",
-  "Emergency surgical backup confirmed available",
-  "Anaesthesia and echo teams briefed",
-  "Device handling and preparation steps reviewed"
+  "Pliable model and road map review",
+  "Ports map and SOP review",
+  "Procedure simulation",
+  "Anaesthesia or conscious sedation",
+  "Echo protocol review",
+  "Device handling and preparation steps reviewed",
+  "Anticoagulation held prior to procedure"
 ];
 const DEVICE_CONFIRMS = [
   "Device identifiers match the patient assignment",
@@ -11297,8 +11295,7 @@ function seed(){
   const P = [
     mkPatient({ id:"pat-1", patientCode:"NGM-014", siteId:"loc-site-a", procedureDate:daysFromNow(6),
       unicaSize:"M", dsSize:"Short", status:"SCHEDULED", notes:"Severe TR, EuroSCORE II 6.1%",
-      customQuestions:[{ q:"Prior pacemaker lead present?", a:"" },
-                       { q:"Anticoagulation held for how long?", a:"" }],
+      customQuestions:[{ q:"Prior pacemaker lead present?", a:"No" }],
       reminders:[{ date:daysFromNow(4), text:"Confirm proctor availability", done:false }],
       piNotes:"PI wants the CT reviewed again with the core lab before scheduling." }),
     mkPatient({ id:"pat-2", patientCode:"NGM-015", siteId:"loc-site-a", procedureDate:"",
@@ -16027,10 +16024,12 @@ function patientForm(p){
 function questionsBlock(){
   return '<h3 style="margin:4px 0 7px">Medical questions for this patient</h3>' +
     '<div class="hint" style="margin-bottom:8px">Free-form and specific to this patient. ' +
-    'They appear in stage 2 of the case file and in the briefing panel.</div>' +
+    'Enter the answer / information now if it is known — the question and its answer are ' +
+    'carried into stage 2 of the case file and the briefing panel, and stay editable there.</div>' +
     (PFQ.length
       ? PFQ.map((q,i) => '<div class="row" style="gap:6px;margin-bottom:6px;flex-wrap:nowrap">' +
-          '<input type="text" data-q="' + i + '" value="' + esc(q.q) + '" placeholder="question">' +
+          '<input type="text" data-q="' + i + '" value="' + esc(q.q) + '" placeholder="question" style="flex:1">' +
+          '<input type="text" data-qa="' + i + '" value="' + esc(q.a || "") + '" placeholder="answer / info (optional)" style="flex:1">' +
           '<button type="button" class="btn btn-sm btn-danger" data-qdel="' + i + '" ' +
           'style="flex:none">Remove</button></div>').join("")
       : '<div class="hint">None yet.</div>') +
@@ -16091,6 +16090,7 @@ function patientFormRender(p, isNew){
      and only the changed row's value is read back. */
   const keep = () => {
     $$("[data-q]").forEach(i => { PFQ[+i.dataset.q].q = i.value; });
+    $$("[data-qa]").forEach(i => { PFQ[+i.dataset.qa].a = i.value; });
     $$("[data-rd]").forEach(i => { PFR[+i.dataset.rd].date = i.value; });
     $$("[data-rt]").forEach(i => { PFR[+i.dataset.rt].text = i.value; });
   };
