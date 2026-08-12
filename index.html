@@ -317,6 +317,11 @@ table.stk-serials th{background:#f3e6ee; color:#5a0c3a; font-weight:600;}
    the row-hover tint, so it passes AA as text while still sitting well behind the
    full-weight --ink of a real count. */
 .zero{color:#6f7d89; font-weight:400;}
+/* A cell that wants noticing without being an error: an expiry inside 90 days, a unit
+   that has been in transit a fortnight. Colour is NOT the only signal - every use also
+   carries a title attribute - because a red-green deficit is common and a date that
+   matters must not depend on seeing the tint. 5.9:1 on the tint, so it passes AA. */
+.warn-cell{background:#fdf0e3; color:#8a4b06; font-weight:600;}
 
 .tl{position:relative; padding-left:19px;}
 .tl::before{content:""; position:absolute; left:5px; top:5px; bottom:5px; width:2px; background:var(--line);}
@@ -11143,9 +11148,10 @@ const CAPABILITIES = {
   lockCaseFile:    ["ADMIN","CPM"],
   overrideFifo:    ["ADMIN","CPM","MANAGER"],
   registerDevice:  ["ADMIN","EMPLOYEE","QA","MANAGER"],  // prepare a batch at an HQ location
-  approveRegistration: ["ADMIN","QA","MANAGER"],  // release a prepared batch into stock
+  approveRegistration: ["ADMIN","QA","MANAGER","WH_ADMIN"],  // counter-sign a batch into stock; never on your own batch
   editAnatomical:  ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"],  // edit ONLY the anatomical-evaluation fields
-  reopenStage:     ["ADMIN","CPM","MANAGER"]   // withdraw a confirmed stage, with a reason
+  reopenStage:     ["ADMIN","CPM","MANAGER"],  // withdraw a confirmed stage, with a reason
+  overrideArrival: ["ADMIN","MANAGER","WH_ADMIN"]  // record an arrival nobody verified in the app
 };
 function can(cap){
   const a = CAPABILITIES[cap];
@@ -11774,9 +11780,12 @@ function openBatches(){
     .filter(b => b.status === "AWAITING_QA" || b.status === "HELD_MRB");
 }
 /* What the badge counts: work this user can actually act on. A producer sees their
-   own batches on the screen but has nothing to do about them, so no badge for them. */
+   own batches on the screen but has nothing to do about them, so those do not count -
+   an approver who produced three of the four open batches has ONE thing to do, and a
+   badge saying 4 would send them looking for work that is not theirs to sign. */
 function qaTodoCount(){
-  return can("approveRegistration") ? openBatches().length : 0;
+  if(!can("approveRegistration")) return 0;
+  return openBatches().filter(b => !iProducedBatch(b)).length;
 }
 
 async function loadRemoteStore(){
@@ -12119,20 +12128,61 @@ document.addEventListener("keydown", e => {
    on the server — the "seen" marker is a single localStorage key. Bump the version and
    edit the groups to publish the next set of highlights. */
 const WHATS_NEW = {
-  version: "1.6.0",
+  version: "2.1.0",
   since: "the last update",
   groups: [
-    { h:"Stock & reports", items:[
-      "In Stock by Location, click a product row to expand every unit of that size — its serial number and exactly where it is. Click again to collapse.",
-      "New Site Product Report: all units received at a site between two dates, who received each and any found compromised, exportable to Excel (CSV) and PDF."
+    { h:"Shipments now have a middle", items:[
+      "Sending a unit out no longer files it at the destination. Until somebody at the far end receives it, it is In Transit — counted at neither end.",
+      "New In Transit screen: everything that has left and not arrived, with where it came from, where it is going, when it was sent and how long it has been out. Anything out two weeks or more is flagged.",
+      "A unit becomes site stock in exactly two ways: it is checked in under Receive a Delivery, or an Admin, Manager or WH Admin records that it arrived and was signed for outside the app — which needs a reason and is marked as an override, so it can always be told apart from a verified arrival.",
+      "This also fixes a miscount: a unit in transit used to be counted both as being at the hospital and as being in transit — the same unit twice."
     ] },
-    { h:"Sending devices out", items:[
-      "Send a Device Out is reworked: choose what to send (Implant, Delivery System, or both) and how many of each, scan exactly that many units, and confirm the whole shipment in one step. FIFO is still enforced, with an override for a Clinical PM or App Admin."
+    { h:"Two signatures on every batch", items:[
+      "A produced batch now always needs two signatures from two different people. Holding QA approval no longer lets your own production confirmation release your own batch — whoever confirms production is refused the approval on that batch, whatever their role.",
+      "Pressing Production confirmation now does the whole thing: it creates the batch and asks whoever must approve it. The second button at the foot of the page is gone.",
+      "QA users are emailed and notified when a batch is waiting. If a QA user produced the batch, it goes to the managers and the warehouse manager instead — QA cannot approve its own work.",
+      "WH Admins can now approve a batch, which is what makes that path possible.",
+      "QA Approval (previously “Batches awaiting QA”) shows your own batches but will not let you sign them, and says why."
     ] },
-    { h:"Case file", items:[
-      "The Stage 2 pre-procedure checklist has been updated to the current review items.",
-      "Medical questions are now answered at patient registration and carried into the case file, where they stay editable during the procedure.",
-      "Export a full case file to PDF, including its source images."
+    { h:"Seeing what is behind a number", items:[
+      "In Stock Overview, choose a location from a list instead of typing its name.",
+      "The Home inventory table now splits “In warehouse” from “Received by site”, and units in transit are counted in neither.",
+      "Click any size row to see every unit behind the count — serial, where it is and its expiry date. Anything expiring within 90 days is highlighted."
+    ] },
+    { h:"Fixed", items:[
+      "Devices reserved for a patient were not being read back, so an allocation could look as though it had not been made.",
+      "Two batches prepared in the same second could be given the same batch number.",
+      "A warehouse manager could see every shipment in the study on the in-transit list rather than their own."
+    ] },
+    { h:"Finding your way around", items:[
+      "The menu is now grouped into Logistics and Clinical workflow, and the entries are ordered the way the work actually runs.",
+      "“Procedure Case File” is now called “Procedure Report” everywhere. Nothing about it moved — only the name.",
+      "The two stock entries are now one Stock Overview. You still see only your own locations."
+    ] },
+    { h:"Every stage is now a task", items:[
+      "Assign a stage to a person, optionally with a due date. They are emailed, and the stage opens for them straight away — they no longer have to wait for the earlier stages to finish.",
+      "Reassigning tells both people, so nobody keeps working on something that has moved.",
+      "Status is no longer typed in. A stage moves itself to In progress on the first edit and to Pending confirmation once its mandatory fields are filled. It becomes Completed only when someone presses “I’m done” and confirms — which records who and when.",
+      "Home shows what is waiting on you, and every patient row shows who their next open stage is stuck with. Overdue work is flagged.",
+      "A summary of what completed and what is stuck is emailed each evening at 20:00 Israel time."
+    ] },
+    { h:"The clinical workflow itself", items:[
+      "Stage 6 is now Pliable model evaluation. When suitability is Borderline it opens a scoring matrix comparing two candidate sizes over nine criteria. The system totals them and puts forward a recommendation — the decision stays yours, and is recorded as yours.",
+      "Stage 7 is now Training session and Road Map definition, and the old Road Map stage is replaced by Eligibility & Approvals, where the patient is allocated to the study or the control arm.",
+      "Scheduling and Product Order now sit in their own “Patient is eligible” section. They are still tasks, still assignable.",
+      "Model Printing now needs a Clinical PM or Manager to approve it before the stage can be completed.",
+      "Angles are entered as LAO/RAO and CRAN/CAUD on a 0–90 scale instead of free text. Filling one of a pair locks the other.",
+      "Control-group patients have their own tab and no longer appear in the other patient lists."
+    ] },
+    { h:"Procedure Report", items:[
+      "Device verification is now per unit: scan a device, then run its checks. “Backup device available” stays one check for the whole procedure.",
+      "Contrast is now up to three separate injections, each with its own volume and pure/diluted setting, with the total calculated for you.",
+      "DS extraction now comes before the POST pressure measurement, matching the order in the room."
+    ] },
+    { h:"Device registration", items:[
+      "A produced batch is now confirmed by production and released separately by QA, a Manager or an Admin — two different signatures. Units only become stock on that second signature.",
+      "Units held in MRB are approved or rejected one by one, with a confirmation on each.",
+      "Two new user types: QA, who may release batches, and Manager, who may also override FIFO."
     ] }
   ]
 };
@@ -12222,10 +12272,27 @@ function visibleLocations(){
   const s = scopedLocIds();
   return s ? S.db.locations.filter(l => s.includes(l.id)) : S.db.locations.slice();
 }
+/* A unit is visible to a scoped user if it is AT one of their locations or HEADED to
+   one. The destination half matters because a unit in transit now stays filed at its
+   origin: without it the receiving site could not see the delivery it is supposed to
+   check in, and with it the sending warehouse does not lose sight of what it sent.
+
+   Both ends see the unit while it is in the air, which is correct - it is a shipment
+   between them - and neither counts it as STOCK, because ON_WAY is not a stock status.
+   That distinction is what keeps it out of the inventory numbers. */
 function visibleDevices(){
   const s = scopedLocIds();
-  return s ? S.db.devices.filter(d => s.includes(d.locationId)) : S.db.devices.slice();
+  if(!s) return S.db.devices.slice();
+  return S.db.devices.filter(d =>
+    s.includes(d.locationId) || (d.destinationId && s.includes(d.destinationId)));
 }
+/* Where a unit counts as being, for anything that buckets by place. In transit it
+   counts at neither end - it is in the air, and the In Transit log is where it shows.
+   Anything asking "how much is at X" must go through this, never d.locationId. */
+function deviceAtLocation(d){
+  return (d.status === "ON_WAY" || d.status === "DELIVERED") ? null : d.locationId;
+}
+function inTransit(d){ return d.status === "ON_WAY" || d.status === "DELIVERED"; }
 function myAlerts(){
   const me = S.db.users.find(u => u.email === (S.me && S.me.email));
   return S.db.notifications.filter(n => {
@@ -12919,9 +12986,11 @@ const NAV = [
   { k:"register", ic:"receive", label:"New Device Registration", roles:["ADMIN","EMPLOYEE","QA","MANAGER"] },
   /* Producers see it too, read-only, so they can follow their own batch instead of
      wondering whether it arrived. The badge counts only what YOU can act on. */
-  { k:"batches",  ic:"receive", label:"Batches awaiting QA", roles:["ADMIN","EMPLOYEE","QA","MANAGER"], qaBadge:true },
+  { k:"batches",  ic:"receive", label:"QA Approval", roles:["ADMIN","EMPLOYEE","QA","MANAGER","WH_ADMIN"], qaBadge:true },
   { k:"shipment", ic:"ship",    label:"Send Devices Out",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  /* Sits between sending and receiving, which is where it belongs in the menu too. */
+  { k:"transit",  ic:"ship",    label:"In Transit",         roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* One row for every role. A warehouse manager still sees only their own warehouse,
      because the contents are scoped by visibleDevices() -> inScope(), not by the label. */
   { k:"stock",    ic:"stock",   label:"Stock Overview",     roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
@@ -13396,27 +13465,46 @@ function patientStatusWidget(){
     filters + chips + table + '</div></div>';
 }
 
+/* Which size rows are expanded to their serials in the Home inventory widget. */
+const HOME_STOCK_OPEN = new Set();
+
 function deviceInventoryWidget(){
   const f = HOME.df;
   /* Used units are consumed, not inventory, so they are excluded from this widget. */
   const devs = homeDevices().filter(d => {
     if(d.status === "USED") return false;
-    if(f.site && d.locationId !== f.site) return false;
+    /* Filtering by a location includes what is AT it and what is HEADED to it - the
+       two questions somebody picking a site actually has. deviceAtLocation is null in
+       transit, so the destination test is what keeps incoming units in view. */
+    if(f.site && deviceAtLocation(d) !== f.site && d.destinationId !== f.site) return false;
     if(f.size && String(d.size) !== f.size) return false;
     return true;
   });
   const locType = id => { const l = loc(id); return l ? l.type : ""; };
-  const statusOf = d => (d.status === "IN_WH" || d.status === "IN_SITE") ? "avail"
-                      : (d.status === "ON_WAY" || d.status === "DELIVERED") ? "ship" : "other";
 
-  /* One row per size, split by status - Unica sizes and DS sizes both kept. */
+  /* Four buckets, and the split between the first two is the point of this rework:
+     "in a warehouse" and "received by a site" are different facts, and neither of them
+     is true of a unit that is still in transit. */
+  const bucketOf = d => {
+    if(inTransit(d)) return "transit";
+    if(d.status === "IN_WH") return "wh";
+    if(d.status === "IN_SITE") return "site";
+    return "other";
+  };
+
   const sizes = UNICA_SIZES.concat(DS_SIZES);
-  const mtx = {}; sizes.forEach(s => mtx[s] = { avail:0, ship:0, other:0, total:0 });
-  let wh = 0, site = 0;
+  const mtx = {}; sizes.forEach(s => mtx[s] = { wh:0, site:0, transit:0, other:0, total:0 });
+  let atWh = 0, atSite = 0, moving = 0;
   devs.forEach(d => {
-    const t = locType(d.locationId); if(t === "WAREHOUSE" || t === "HQ") wh++; else if(t === "SITE") site++;
-    if(mtx[d.size] == null) mtx[d.size] = { avail:0, ship:0, other:0, total:0 };
-    mtx[d.size][statusOf(d)]++; mtx[d.size].total++;
+    /* Counted by where the unit IS. This used to bucket on d.locationId with no status
+       test at all, and because shipping overwrote locationId to the destination, an
+       in-transit unit was counted BOTH as "at hospital sites" and in the in-transit
+       column - the same unit twice, in one table. */
+    const at = deviceAtLocation(d);
+    if(at == null) moving++;
+    else { const t = locType(at); if(t === "WAREHOUSE" || t === "HQ") atWh++; else if(t === "SITE") atSite++; }
+    if(mtx[d.size] == null) mtx[d.size] = { wh:0, site:0, transit:0, other:0, total:0 };
+    mtx[d.size][bucketOf(d)]++; mtx[d.size].total++;
   });
 
   const filters = '<div class="filters">' +
@@ -13425,24 +13513,38 @@ function deviceInventoryWidget(){
 
   const rows = sizes.filter(s => mtx[s].total > 0);
   const matrix = rows.length
-    ? '<div class="tbl-wrap"><table><thead><tr><th>Size</th><th class="num">Available</th>' +
-      '<th class="num">In transit</th><th class="num">Other</th><th class="num">Total</th></tr></thead><tbody>' +
-      rows.map(s => '<tr><td><b>' + esc(s) + '</b></td>' +
-        '<td class="num">' + mtx[s].avail + '</td><td class="num">' + mtx[s].ship + '</td>' +
-        '<td class="num">' + mtx[s].other + '</td><td class="num"><b>' + mtx[s].total + '</b></td></tr>').join("") +
+    ? '<div class="tbl-wrap"><table><thead><tr><th>Size</th>' +
+      '<th class="num">In warehouse</th><th class="num">Received by site</th>' +
+      '<th class="num">In transit</th><th class="num">Other</th>' +
+      '<th class="num">Total</th></tr></thead><tbody>' +
+      rows.map(s => {
+        const open = HOME_STOCK_OPEN.has(s);
+        const units = devs.filter(d => String(d.size) === s);
+        return '<tr class="stk-row' + (open ? " open" : "") + '">' +
+          '<td role="button" tabindex="0" aria-expanded="' + (open ? "true" : "false") +
+            '" data-hstk="' + esc(s) + '"><span class="stk-caret">▸</span> <b>' + esc(s) + '</b></td>' +
+          '<td class="num">' + mtx[s].wh + '</td><td class="num">' + mtx[s].site + '</td>' +
+          '<td class="num">' + mtx[s].transit + '</td><td class="num">' + mtx[s].other + '</td>' +
+          '<td class="num"><b>' + mtx[s].total + '</b></td></tr>' +
+          (open ? '<tr class="stk-exp"><td colspan="6">' + unitDetailTable(units) + '</td></tr>' : '');
+      }).join("") +
       '</tbody></table></div>'
     : '<div class="hint">No devices match the current filters.</div>';
 
   const locChips = '<div class="chip-wrap" style="margin-top:11px">' +
-    '<div class="stat-chip" style="cursor:default"><span class="n">' + wh + '</span><span class="l">In warehouses</span></div>' +
-    '<div class="stat-chip" style="cursor:default"><span class="n">' + site + '</span><span class="l">At hospital sites</span></div>' +
+    '<div class="stat-chip" style="cursor:default"><span class="n">' + atWh + '</span><span class="l">In warehouses</span></div>' +
+    '<div class="stat-chip" style="cursor:default"><span class="n">' + atSite + '</span><span class="l">Received by sites</span></div>' +
+    '<div class="stat-chip" style="cursor:default"><span class="n">' + moving + '</span><span class="l">In transit</span></div>' +
     '</div>';
 
   return '<div class="card"><div class="card-hd"><h2>Device inventory</h2>' +
     '<span class="hint">' + devs.length + ' unit(s)</span></div><div class="card-bd">' +
     filters + matrix + locChips +
-    '<div class="hint" style="margin-top:9px">Used units are excluded — they are consumed, not inventory. ' +
-    '“Other” means expired or rejected.</div></div></div>';
+    '<div class="hint" style="margin-top:9px">Click a size to see every unit behind the ' +
+    'numbers — serial, where it is and its expiry date. Units in transit are counted in ' +
+    'neither the warehouse nor the site column: they are not anywhere yet. Used units are ' +
+    'excluded — they are consumed, not inventory. “Other” means expired or rejected.' +
+    '</div></div></div>';
 }
 
 function shipmentRequestsWidget(){
@@ -13562,6 +13664,22 @@ VIEWS.today = {
     onSel("df-site", v => HOME.df.site = v);   onSel("df-size", v => HOME.df.size = v);
     onSel("sf-site", v => HOME.sf.site = v);   onSel("sf-status", v => HOME.sf.status = v);
     onSel("sf-date", v => HOME.sf.date = v);
+
+    /* Expand a size row in the inventory widget to its serials. renderKeepingPlace
+       keeps the scroll position, so opening a row far down the Home screen does not
+       throw the operator back to the top. Keyboard: Enter / Space. */
+    const hToggle = td => {
+      const k = td.dataset.hstk; if(!k) return;
+      if(HOME_STOCK_OPEN.has(k)) HOME_STOCK_OPEN.delete(k); else HOME_STOCK_OPEN.add(k);
+      renderKeepingPlace();
+    };
+    $$("[data-hstk]").forEach(td => {
+      td.onclick = () => hToggle(td);
+      td.onkeydown = e => {
+        if(e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault(); hToggle(td);
+      };
+    });
   }
 };
 
@@ -13646,59 +13764,86 @@ function regAddScan(code){
   render();
 }
 
-/* Step 3 — the production confirmation. A button rather than a seventh checkbox,
-   because it is a signature and not an assertion about paperwork: it records WHO
-   pressed it and WHEN, and neither can be typed. The time shown here is this
-   device's clock; the server stamps its own on submission, and that is the one
-   that is kept, because a production PC's clock is not evidence.
-   Undo stays available only while the batch is still on this device. */
+/* Step 3 — the production confirmation, and the only button that does anything.
+   It is a signature rather than a seventh checkbox: it records WHO pressed it and
+   WHEN, and neither can be typed. The time kept is the SERVER's, because a
+   production PC's clock is not evidence.
+
+   Pressing it creates the batch and asks the counter-signers. It used to only stamp
+   a local draft, leaving a second button at the bottom of the page to actually
+   submit - two controls that both read as "confirm", where stopping at the first one
+   looked exactly like success and sent nothing anywhere. One button now. */
 function productionStepHtml(units){
-  const p = REG.production;
   const ready = !!(REG.locationId && units.length && REG_CHECKS.every(c => REG.checks[c.k]));
+  const who = approverWordFor(S.me && S.me.role);
   return '<div class="card"><div class="card-hd"><h2>Step 3 · Production confirmation</h2>' +
-    '<span class="pill ' + (p ? "p-green" : "p-grey") + '">' + (p ? "Signed" : "Not signed") + '</span>' +
+    '<span class="pill p-grey">Not signed</span>' +
     '</div><div class="card-bd">' +
-    (p
-      ? '<div class="okbox" style="font-size:14px"><b>Production confirmed by ' +
-          esc(p.byName || p.by) + '</b><br>' + esc(fmtTs(p.at)) + '</div>' +
-        '<div class="row" style="margin-top:8px">' +
-          '<button class="btn btn-sm" id="reg-unconfirm">Undo</button>' +
-          '<span class="hint">Possible while the batch is still on this device.</span>' +
-        '</div>'
-      : '<p>Confirms that this batch was produced and that the approvals above are ' +
-        'complete. Your name and the time are recorded automatically — there is ' +
-        'nothing to type.</p>' +
-        '<button class="btn btn-primary" id="reg-confirm-prod"' + (ready ? "" : " disabled") +
-          '>Production confirmation</button>' +
-        (ready ? "" : '<div class="hint" style="margin-top:6px">Scan at least one unit and ' +
-          'complete the batch approvals first.</div>')) +
+    '<p>Confirms that this batch was produced and that the approvals above are ' +
+    'complete. Your name and the time are recorded automatically — there is nothing ' +
+    'to type.</p>' +
+    '<p><b>This sends the batch for approval.</b> ' + esc(who.sentence) + '</p>' +
+    '<button class="btn btn-primary btn-lg" id="reg-confirm-prod"' + (ready ? "" : " disabled") +
+      '>Production confirmation · send ' + units.length + ' unit(s) for approval</button>' +
+    (ready ? "" : '<div class="hint" style="margin-top:6px">Scan at least one unit and ' +
+      'complete the batch approvals first.</div>') +
+    whyBox("reg-why") +
   '</div></div>';
 }
 
-/* Step 4 — what actually happens when the button is pressed, stated before it is.
-   The two audiences need opposite things said to them: a producer must understand
-   that nothing enters stock, and an approver must understand that it does. */
+/* Who counter-signs, given the role of the person about to sign production. Mirrors
+   batchApproverRoles in roleStore.js - the two must stay identical. QA cannot
+   counter-sign its own production, so a batch produced by QA goes to the people
+   outside QA instead. */
+function batchApproverRoles(producerRole){
+  return producerRole === "QA" ? ["ADMIN","MANAGER","WH_ADMIN"] : ["QA"];
+}
+function approverWordFor(producerRole){
+  const roles = batchApproverRoles(producerRole);
+  /* ROLES, not ROLE_LABELS - that name exists only in roleStore.js on the server. */
+  const names = roles.map(r => (ROLES[r] && ROLES[r].label) || r);
+  const list  = names.length > 1
+    ? names.slice(0, -1).join(", ") + " and " + names[names.length - 1]
+    : names[0];
+  return {
+    roles, list,
+    sentence: producerRole === "QA"
+      ? "You are QA, so you cannot approve your own batch — it goes to " + list +
+        ", who will be notified by email."
+      : list + " will be notified by email and must approve it before anything " +
+        "enters stock."
+  };
+}
+
+/* Step 4 — what happens after you press the button, stated before you press it.
+   Nothing to do here: it exists so that the person signing production knows the
+   batch is not finished and is not stock. Holding QA approval yourself changes
+   nothing - you still cannot counter-sign your own batch, so there is no longer a
+   second version of this step for approvers.
+
+   Standalone/demo has no server to hold a batch, so it registers on the spot and
+   says so plainly rather than promising an approval that will never come. */
 function qaStepHtml(units){
-  const release = !S.backend || can("approveRegistration");
-  return '<div class="card"><div class="card-hd"><h2>Step 4 · QA confirmation &amp; registration</h2>' +
-    '<span class="pill ' + (release ? "p-green" : "p-orange") + '">' +
-      (release ? "You may release" : "QA required") + '</span>' +
+  const where = esc((loc(REG.locationId) || {}).name || "—");
+  if(!S.backend){
+    return '<div class="card"><div class="card-hd"><h2>Step 4 · Registration</h2>' +
+      '<span class="pill p-grey">Standalone</span></div><div class="card-bd">' +
+      '<p>This copy runs without a server, so there is nobody to send the batch to: ' +
+      'the ' + units.length + ' unit(s) are registered at <b>' + where + '</b> ' +
+      'immediately. On the live app a second person would have to approve them.</p>' +
+    '</div></div>';
+  }
+  const who = approverWordFor(S.me && S.me.role);
+  return '<div class="card"><div class="card-hd"><h2>Step 4 · QA approval</h2>' +
+    '<span class="pill p-orange">A second person</span>' +
     '</div><div class="card-bd">' +
-    (release
-      ? '<p>' + (S.backend
-          ? 'You hold QA approval, so your production confirmation also signs the QA ' +
-            'confirmation — there is nobody to wait for. '
-          : '') +
-        'This releases <b>' + units.length + '</b> unit(s) into usable stock at <b>' +
-        esc((loc(REG.locationId) || {}).name || "—") + '</b>, and records you and the ' +
-        'time against every unit and the batch.</p>'
-      : '<p><b>Nothing enters stock in this step.</b> The batch is held for a QA ' +
-        'confirmation by someone with QA approval, who may be on another device and ' +
-        'may look at it later. You can follow it under <b>Batches awaiting QA</b>.</p>' +
-        '<p class="hint">' + units.length + ' unit(s) at ' +
-          esc((loc(REG.locationId) || {}).name || "—") + '.</p>') +
-    whyBox("reg-why") +
-  '</div>';
+    '<p><b>Nothing enters stock when you press the button above.</b> The ' + units.length +
+    ' unit(s) at <b>' + where + '</b> are held until ' + esc(who.list) + ' approves ' +
+    'them under <b>QA Approval</b> — possibly on another device and later today.</p>' +
+    '<p class="hint">Every batch carries two signatures from two different people. ' +
+    'Whoever confirms production is refused the approval on that batch, whatever ' +
+    'their role.</p>' +
+  '</div></div>';
 }
 
 VIEWS.register = {
@@ -13721,15 +13866,30 @@ VIEWS.register = {
          went to QA has put NOTHING into stock, and saying "registered" here would be
          the single most misleading sentence in the application. */
       if(w.sentToQa){
+        /* Whether the email actually went is reported, not assumed. Someone who is
+           told "QA has been notified" will stop chasing the batch, so that sentence
+           has to be true - and when the mail did not go, saying so here is the only
+           chance anyone gets to notice before the units sit unapproved. */
+        const n = w.notified;
+        const mail = !n ? ''
+          : n.sent
+            ? '<div class="kv"><b>Emailed</b> ' + esc(String(n.count)) + ' ' +
+              esc(w.approvers || n.roles.join("/")) + ' user(s)</div>'
+            : '<div class="warn" style="margin-top:10px"><b>The batch was saved, but no ' +
+              'email went out</b> — ' + esc(n.reason || "the mail server refused it") +
+              '. It is in the QA Approval queue, but nobody has been told by email. ' +
+              'Tell ' + esc(w.approvers || (n.roles || []).join("/")) + ' another way.</div>';
         return '<div class="card"><div class="card-bd">' +
-          '<div class="okbox" style="font-size:14px"><b>Batch sent to QA.</b><br>' +
-            esc(String(w.count)) + ' unit(s) are waiting for QA confirmation. ' +
-            'Nothing has entered stock yet.</div>' +
+          '<div class="okbox" style="font-size:14px"><b>Batch sent for approval.</b><br>' +
+            esc(String(w.count)) + ' unit(s) are waiting for a second signature from ' +
+            esc(w.approvers || "an approver") + '. Nothing has entered stock yet.</div>' +
           '<div class="grid g3" style="margin-top:8px">' +
             '<div class="kv"><b>Batch</b> <span class="mono">' + esc(w.batchId) + '</span></div>' +
             '<div class="kv"><b>Location</b> ' + esc(w.location) + '</div>' +
             '<div class="kv"><b>Production confirmed by</b> ' + esc(w.by) + '</div>' +
+            (n && n.sent ? mail : '') +
           '</div>' +
+          (n && !n.sent ? mail : '') +
           '</div><div class="card-ft"><div class="row">' +
             '<button class="btn btn-primary" id="reg-again">Prepare another batch</button>' +
             '<button class="btn" id="reg-tobatches">Track this batch</button>' +
@@ -13755,10 +13915,6 @@ VIEWS.register = {
     const units = REG.units;
     const nChecks = REG_CHECKS.length;
     const doneChecks = REG_CHECKS.filter(c => REG.checks[c.k]).length;
-    /* Standalone has no server to hold a batch for a second person, so it keeps the
-       old single-signature behaviour rather than pretending to a hand-off it cannot
-       perform. With a backend, the capability decides. */
-    const canRelease = !S.backend || can("approveRegistration");
     SCANFIELDS["reg-scan"] = { label:"device label", onCode:(code) => regAddScan(code) };
 
     let h = '<div class="card"><div class="card-hd"><h2>Step 1 · Where &amp; scan the units</h2></div><div class="card-bd">' +
@@ -13798,10 +13954,10 @@ VIEWS.register = {
     productionStepHtml(units) +
 
     qaStepHtml(units) +
+    /* No submit button down here any more. The production signature in step 3 IS the
+       submit, so a second primary button at the foot of the page would be the very
+       ambiguity this change removed. */
     '<div class="card-ft"><div class="row">' +
-      '<button class="btn btn-primary btn-lg" id="reg-go">' +
-        (canRelease ? "Confirm &amp; register " + units.length + " device(s)"
-                    : "Send to QA") + '</button>' +
       '<button class="btn" id="reg-clear">Start over</button>' +
       '<span class="spacer"></span>' +
       '<span class="hint">Your progress is kept if you leave this screen.</span>' +
@@ -13842,17 +13998,20 @@ VIEWS.register = {
         pillEl.className = "pill " + (n === REG_CHECKS.length ? "p-green" : "p-grey");
       }
     });
+    /* The production signature and the submit are one action now. The signature is
+       stamped locally only so the audit entry and the offline backup can name who
+       pressed it; the record that counts is the one the SERVER stamps from the
+       session, because a production PC's clock and a client's claim about its own
+       identity are both worth nothing. */
     const cp = $("#reg-confirm-prod");
     if(cp) cp.onclick = () => {
       if(!REG.locationId || !REG.units.length || !REG_CHECKS.every(x => REG.checks[x.k]))
         return showWhy("reg-why", "Complete step 1 and step 2 before confirming production.");
       REG.production = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO() };
-      saveDrafts(); clearWhy("reg-why"); render();
+      saveDrafts();
+      submitRegister();
     };
-    const up = $("#reg-unconfirm");
-    if(up) up.onclick = () => { REG.production = null; saveDrafts(); render(); };
     $("#reg-clear").onclick = () => { resetRegister(); render(); };
-    $("#reg-go").onclick = submitRegister;
   }
 };
 function submitRegister(){
@@ -13900,58 +14059,41 @@ function submitRegister(){
   }
 
   if(S.backend){
-    const btn = $("#reg-go"); if(btn) btn.disabled = true;
+    const btn = $("#reg-confirm-prod"); if(btn) btn.disabled = true;
     (async () => {
       try{
-        /* Always create the batch record first, even when this user can release it
-           themselves. Both signatures then exist on one record, and a batch released
-           by one person is traceable in exactly the same way as one that passed
-           between two. */
+        /* Creating the batch is the whole of this action. There is no longer a branch
+           that releases it in the same breath: whoever confirms production is refused
+           the approval on that batch by the server, whatever capabilities they hold,
+           so a batch always carries two signatures from two different people. */
         const batch = await api("POST", "/api/device-batches",
           { locationId, checks:Object.assign({}, REG.checks), units });
 
-        if(!can("approveRegistration")){
-          /* Nothing is in stock. Say so plainly rather than reporting a registration. */
-          logAction("Prepared batch " + batch.batchId + " for QA confirmation at " + (loc(locationId) || {}).name, {
-            locationId,
-            stateChanges: units.length + " unit(s) awaiting QA · batch " + batch.batchId,
-            comments: "Batch approvals: " + REG_CHECKS.map(c => c.t + " ✓").join(", ") +
-              " | Production confirmed by " + ((prod && (prod.byName || prod.by)) || "—") +
-              " | Serials: " + units.map(u => u.sn).join(", ")
-          });
-          notify("Batch " + batch.batchId + " (" + units.length + " unit(s)) is awaiting QA confirmation, " +
-                 "produced by " + ((prod && (prod.byName || prod.by)) || "—") + ".",
-                 ["ADMIN","QA","MANAGER"], [], locationId);
-          await refreshBatches(batch);
-          resetRegister();
-          REG.done = { sentToQa:true, batchId:batch.batchId, count:units.length,
-                       location:(loc(locationId) || {}).name, by:(prod && (prod.byName || prod.by)) || "" };
-          saveDrafts(); renderNav(); render();
-          toast("Batch sent to QA.", "good");
-          return;
-        }
-
-        /* 4.1 — the person who confirmed production already holds QA approval, so
-           there is nobody to wait for. Sign and release in the same breath. */
-        const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batch.batchId) + "/approve", {});
-        const res = out.result;
-        try{ S.db.batches = await loadBatches(); }catch(_){}
-        try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
-        /* Merge the just-created devices on TOP of the reload. SharePoint can lag a
-           moment before a new item appears in a list query, so the reload above may
-           return without them; the server already gave us the authoritative rows, so
-           make sure they are present (deduped) — otherwise stock screens read empty
-           until the next manual refresh. */
-        if(Array.isArray(res.devices)){
-          for(const nd of res.devices){
-            const i = S.db.devices.findIndex(x => x.id === nd.id);
-            if(i >= 0) S.db.devices[i] = nd; else S.db.devices.push(nd);
-          }
-        }
-        finish(res);
+        const who = approverWordFor(S.me && S.me.role);
+        logAction("Prepared batch " + batch.batchId + " for approval at " + (loc(locationId) || {}).name, {
+          locationId,
+          stateChanges: units.length + " unit(s) awaiting approval · batch " + batch.batchId,
+          comments: "Batch approvals: " + REG_CHECKS.map(c => c.t + " ✓").join(", ") +
+            " | Production confirmed by " + ((prod && (prod.byName || prod.by)) || "—") +
+            " | Approval requested from " + who.roles.join("/") +
+            " | Serials: " + units.map(u => u.sn).join(", ")
+        });
+        /* In-app notification to the same people the server emailed. Routing lives in
+           batchApproverRoles so the two channels can never address different rooms. */
+        notify("Batch " + batch.batchId + " (" + units.length + " unit(s)) needs your approval — " +
+               "produced by " + ((prod && (prod.byName || prod.by)) || "—") + ".",
+               who.roles, [], locationId);
+        await refreshBatches(batch);
+        resetRegister();
+        REG.done = { sentToQa:true, batchId:batch.batchId, count:units.length,
+                     location:(loc(locationId) || {}).name,
+                     by:(prod && (prod.byName || prod.by)) || "",
+                     approvers:who.list, notified:batch.notified || null };
+        saveDrafts(); renderNav(); render();
+        toast("Batch sent for approval.", "good");
       }catch(e){
         if(btn) btn.disabled = false;
-        showWhy("reg-why", e.message || "Registration was refused by the server.");
+        showWhy("reg-why", e.message || "The server refused this batch.");
       }
     })();
     return;
@@ -14055,7 +14197,11 @@ VIEWS.arrival = {
         '</div></div></div>';
     }
 
-    const unver = S.db.devices.filter(d => d.status === "DELIVERED" && inScope(d.locationId));
+    /* Scoped on the DESTINATION, not the current location: a unit in transit is still
+       filed at its origin, so a site checking in its own delivery would otherwise see
+       nothing waiting for it. */
+    const unver = S.db.devices.filter(d => d.status === "DELIVERED" &&
+      inScope(d.destinationId || d.locationId));
     const passed = ARRIVAL_CHECKS.filter(c => AR.checks[c.k]).length;
     SCANFIELDS["ar-scan"] = { label:"device label", onCode:(code, manual) => {
       const hit = findDeviceByCode(code);
@@ -14282,7 +14428,15 @@ function submitArrival(){
   for(const u of units){
     const d = device(u.deviceId); if(!d) continue;
     const before = d.status;
+    /* Arrival is where the unit's location finally moves, and where the journey ends -
+       so destinationId is cleared and who received it is recorded. Mirrors
+       verifyArrival on the server; this branch is the standalone/demo copy. */
     d.locationId = siteId;
+    d.destinationId = null;
+    d.receivedBy = (S.me && S.me.email) || null;
+    d.receivedByName = (S.me && S.me.name) || null;
+    d.receivedAt = nowISO();
+    d.receivedVia = "APP";
     d.condition  = u.compromised ? "COMPROMISED" : "OK";
     d.status     = u.compromised ? "REJECTED"
                    : ((target.type === "WAREHOUSE" || target.type === "HQ") ? "IN_WH" : "IN_SITE");
@@ -16581,13 +16735,21 @@ function wireShipmentScan(){
 }
 
 function inTransitTable(){
-  const t = S.db.devices.filter(d => d.status === "ON_WAY" || d.status === "DELIVERED");
+  /* Scoped, like every other device list. This read S.db.devices directly, so a
+     warehouse manager saw every shipment in the study rather than their own. */
+  const t = visibleDevices().filter(inTransit);
   if(!t.length) return '<div class="empty">Nothing in transit.</div>';
   return '<div class="tbl-wrap" style="border:0;border-radius:0"><table><thead><tr>' +
-    '<th>Ref</th><th>Product</th><th>From</th><th>To</th><th>Shipped by</th><th>Status</th></tr></thead><tbody>' +
-    t.map(d => '<tr><td class="mono">' + esc(d.ref) + '</td><td>' + esc(devName(d)) + '</td>' +
+    '<th>Serial</th><th>Product</th><th>From</th><th>To</th><th>Shipped</th>' +
+    '<th>Expiry</th><th>Status</th></tr></thead><tbody>' +
+    t.map(d => '<tr><td class="mono">' + esc(d.sn || d.ref) + '</td><td>' + esc(devName(d)) + '</td>' +
       '<td>' + esc(d.shippedFromId ? locName(d.shippedFromId) : "—") + '</td>' +
-      '<td>' + esc(locName(d.locationId)) + '</td><td>' + esc(d.shippedBy || "—") + '</td>' +
+      /* destinationId, NOT locationId. locationId is the ORIGIN for the whole journey
+         now, so reading it here printed the same place in both From and To. */
+      '<td>' + esc(d.destinationId ? locName(d.destinationId) : "—") + '</td>' +
+      '<td>' + esc(d.shippedAt ? fmtTs(d.shippedAt) : "—") +
+        (d.shippedBy ? '<div class="hint">by ' + esc(d.shippedBy) + '</div>' : '') + '</td>' +
+      '<td>' + esc(d.expiration ? fmtDate(d.expiration) : "—") + '</td>' +
       '<td>' + pill(DEV_STATUS, d.status) + '</td></tr>').join("") +
     '</tbody></table></div>';
 }
@@ -16883,7 +17045,11 @@ async function showDelivery(){
     const results = [];
     for(const code of codes){
       const d = findDeviceByCode(code);
-      if(d){ d.locationId = DL.siteId; d.status = "DELIVERED"; }
+      /* A courier saying "delivered" does not move the unit into anybody's stock -
+         only a verified arrival or an authorised override does. This page needs no
+         account at all, which is the other reason it must not relocate stock: it
+         would let anyone holding a serial number file a unit into a site. */
+      if(d){ d.destinationId = d.destinationId || DL.siteId; d.status = "DELIVERED"; }
       results.push({ code, matched: !!d });
     }
     const matched = results.filter(r => r.matched).length;
@@ -16913,8 +17079,175 @@ async function showDelivery(){
 /* ========================================================================= */
 /* PART E — supporting sections                                              */
 /* ========================================================================= */
+/* ========================================================= IN TRANSIT LOG ==
+   Everything that has left one place and not yet been received anywhere. It exists
+   because a shipped unit used to be filed at its destination the instant it was sent,
+   so there was no such thing as "in transit" to look at - the unit was simply counted
+   at a hospital it had not reached.
+
+   A unit leaves this log exactly two ways: somebody at the far end verifies it in
+   (Receive a Delivery, which runs the four checks), or an ADMIN / MANAGER / WH_ADMIN
+   records that it arrived and was signed for outside the app, with a reason. There is
+   no third way, and nothing here counts as stock at either end. */
+let TRL = { from:"", to:"", sort:"oldest" };
+
+function transitUnits(){
+  return visibleDevices().filter(inTransit);
+}
+/* How long it has been in the air. Overdue is a judgement, not a fact, so the number
+   is shown and only flagged past a fortnight - long enough that a courier problem is
+   more likely than a slow week. */
+function daysInTransit(d){
+  if(!d.shippedAt) return null;
+  return Math.floor((Date.now() - new Date(d.shippedAt).getTime()) / 864e5);
+}
+VIEWS.transit = {
+  title:"In Transit",
+  sub:"Units that have left but have not been received. Nothing here is stock at either end.",
+  body(){
+    const all = transitUnits();
+    const froms = [...new Set(all.map(d => d.shippedFromId).filter(Boolean))];
+    const tos   = [...new Set(all.map(d => d.destinationId).filter(Boolean))];
+    const rows = all.filter(d =>
+      (!TRL.from || d.shippedFromId === TRL.from) &&
+      (!TRL.to   || d.destinationId === TRL.to));
+    rows.sort((a, b) => {
+      const av = String(a.shippedAt || ""), bv = String(b.shippedAt || "");
+      return TRL.sort === "newest" ? bv.localeCompare(av) : av.localeCompare(bv);
+    });
+
+    const stale = rows.filter(d => (daysInTransit(d) || 0) >= 14).length;
+    const canOverride = !S.backend || can("overrideArrival");
+
+    let h = '<div class="card"><div class="card-bd">' +
+      '<div class="chip-wrap">' +
+        '<div class="stat-chip" style="cursor:default"><span class="n">' + all.length +
+          '</span><span class="l">In transit</span></div>' +
+        '<div class="stat-chip" style="cursor:default"><span class="n">' +
+          all.filter(d => d.status === "DELIVERED").length +
+          '</span><span class="l">Delivered, not checked in</span></div>' +
+        '<div class="stat-chip" style="cursor:default"><span class="n">' + stale +
+          '</span><span class="l">Out 14+ days</span></div>' +
+      '</div></div></div>';
+
+    h += '<div class="card"><div class="card-bd"><div class="grid g3" style="margin:0">' +
+      selField("tr-from","Shipped from", TRL.from,
+        [["","All origins"]].concat(froms.map(id => [id, locName(id)]))) +
+      selField("tr-to","Destination", TRL.to,
+        [["","All destinations"]].concat(tos.map(id => [id, locName(id)]))) +
+      selField("tr-sort","Order", TRL.sort, [["oldest","Longest in transit first"],["newest","Most recent first"]]) +
+    '</div></div></div>';
+
+    if(!rows.length){
+      return h + '<div class="empty">Nothing is in transit' +
+        (all.length ? ' for those filters' : '') + '.</div>';
+    }
+
+    h += '<div class="tbl-wrap"><table><thead><tr>' +
+      '<th>Serial</th><th>Product</th><th>From</th><th>To</th><th>Shipped</th>' +
+      '<th class="num">Days out</th><th>Expiry</th><th>Status</th>' +
+      (canOverride ? '<th></th>' : '') + '</tr></thead><tbody>';
+    for(const d of rows){
+      const days = daysInTransit(d);
+      h += '<tr>' +
+        '<td class="mono">' + esc(d.sn || "—") + '</td>' +
+        '<td>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</td>' +
+        '<td>' + esc(locName(d.shippedFromId)) + '</td>' +
+        '<td>' + esc(locName(d.destinationId)) + '</td>' +
+        '<td>' + esc(d.shippedAt ? fmtTs(d.shippedAt) : "—") +
+          (d.shippedBy ? '<div class="hint">by ' + esc(d.shippedBy) + '</div>' : '') + '</td>' +
+        /* One class attribute, not two - a second one is ignored by the parser. The
+           title carries the meaning so it does not rest on the tint alone. */
+        '<td class="num' + (days != null && days >= 14 ? " warn-cell" : "") + '"' +
+          (days != null && days >= 14 ? ' title="in transit two weeks or more"' : '') + '>' +
+          (days == null ? "—" : days) + '</td>' +
+        '<td>' + esc(d.expiration ? fmtDate(d.expiration) : "—") + '</td>' +
+        '<td>' + pill(DEV_STATUS, d.status) + '</td>' +
+        (canOverride
+          ? '<td><button class="btn btn-sm" data-ovr="' + esc(d.id) + '">Confirm arrival</button></td>'
+          : '') +
+        '</tr>';
+    }
+    h += '</tbody></table></div>';
+    h += '<div class="hint" style="margin-top:8px">A unit becomes site stock when somebody ' +
+      'at the destination checks it in under <b>Receive a Delivery</b>. ' +
+      (canOverride
+        ? 'If it arrived and was signed for outside the app, <b>Confirm arrival</b> records ' +
+          'that — with your name and a reason, marked as an override.'
+        : 'If it arrived outside the app, an Admin, Manager or WH Admin can record that.') +
+      '</div>';
+    return h;
+  },
+  wire(){
+    const onSel = (id, set) => { const el = $("#" + id); if(el) el.onchange = () => { set(el.value); render(); }; };
+    onSel("tr-from", v => TRL.from = v);
+    onSel("tr-to",   v => TRL.to   = v);
+    onSel("tr-sort", v => TRL.sort = v);
+    $$("[data-ovr]").forEach(b => b.onclick = () => askOverrideArrival(b.dataset.ovr));
+  }
+};
+
+/* The override, behind a dialog that states plainly what it does and refuses to
+   proceed without a reason. The reason is the whole point: the evidence that this
+   unit arrived lives outside this system, so the record has to say what it was. */
+function askOverrideArrival(deviceId){
+  const d = S.db.devices.find(x => x.id === deviceId);
+  if(!d) return;
+  const dest = locName(d.destinationId);
+  modal("Confirm an arrival not verified in the app",
+    '<p>Unit <b class="mono">' + esc(d.sn || d.id) + '</b> (' +
+      esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + ') will become ' +
+      'stock at <b>' + esc(dest) + '</b>.</p>' +
+    '<div class="warn" style="margin:8px 0"><b>The four arrival checks will not be run.</b> ' +
+      'Nobody scanned this unit, so this records that it arrived — it does not verify its ' +
+      'condition. A damaged unit must go through Receive a Delivery instead.</div>' +
+    '<div class="field"><label class="req" for="ovr-why">How was the arrival confirmed?</label>' +
+      '<input type="text" id="ovr-why" maxlength="400" ' +
+      'placeholder="e.g. signed courier POD 4471, confirmed by phone with the cath lab"></div>' +
+    whyBox("ovr-why-box"),
+    '<div class="row"><button class="btn btn-primary" id="ovr-go">Confirm arrival</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  const go = $("#ovr-go");
+  go.onclick = async () => {
+    const reason = ($("#ovr-why").value || "").trim();
+    if(reason.length < 3) return showWhy("ovr-why-box", "A reason is required — how was the arrival confirmed?");
+    clearWhy("ovr-why-box"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/devices/" + encodeURIComponent(deviceId) + "/override-arrival",
+          { reason });
+        const i = S.db.devices.findIndex(x => x.id === deviceId);
+        if(i >= 0) S.db.devices[i] = out.device;
+      }else{
+        const target = d.destinationId || d.locationId;
+        const l = loc(target) || {};
+        Object.assign(d, { locationId:target, destinationId:null,
+          status:(l.type === "WAREHOUSE" || l.type === "HQ") ? "IN_WH" : "IN_SITE",
+          receivedBy:(S.me && S.me.email) || null, receivedByName:(S.me && S.me.name) || null,
+          receivedAt:nowISO(), receivedVia:"OVERRIDE", receivedOverrideReason:reason });
+        commit();
+      }
+      logAction("Arrival of " + (d.sn || deviceId) + " confirmed WITHOUT app verification at " + dest, {
+        locationId: d.destinationId || d.locationId,
+        stateChanges: "In Transit → stock at " + dest + " (override, checks not run)",
+        comments: "Reason: " + reason
+      });
+      closeModal(); render();
+      toast("Arrival recorded as an override.", "good");
+    }catch(e){
+      go.disabled = false;
+      showWhy("ovr-why-box", e.message || "The server refused that.");
+    }
+  };
+}
+
 /* ====================================================== STOCK DASHBOARD == */
-let FL = { locType:"", product:"", status:"", q:"" };
+/* locId replaced a free-text "search site name" box. Typing a name to filter columns
+   meant guessing at its exact spelling and punctuation - several site names contain an
+   em dash - and a typo silently showed an empty table rather than saying nothing
+   matched. Never put a real site name in a comment: this file is the source the public
+   demo is built from, and a name in a comment ships just as surely as one in a string. */
+let FL = { locType:"", product:"", status:"", locId:"" };
 /* Which product/size rows are expanded to reveal their individual serials.
    Keyed "PRODUCTTYPE|size"; survives re-renders so a toggle stays open. */
 const STOCK_OPEN = new Set();
@@ -16922,11 +17255,16 @@ const STOCK_OPEN = new Set();
 function stockCols(){
   return visibleLocations().filter(l =>
     (!FL.locType || l.type === FL.locType) &&
-    (!FL.q || l.name.toLowerCase().includes(FL.q.toLowerCase())));
+    (!FL.locId || l.id === FL.locId));
 }
+/* Counts by WHERE THE UNIT IS, via deviceAtLocation - so a unit in transit lands in
+   no column at all, whatever status filter is applied. Filtering by "In Transit" used
+   to list units under the destination's column, which is the one place they were
+   certainly not. In transit belongs in the In Transit log, not in a location column. */
 function stockCount(productType, size, locationId){
   return S.db.devices.filter(d =>
-    d.productType === productType && d.size === size && d.locationId === locationId &&
+    d.productType === productType && d.size === size &&
+    deviceAtLocation(d) === locationId &&
     (FL.status ? d.status === FL.status : DEV_STATUS[d.status].stock)).length;
 }
 /* The expansion row for one product/size: a full-width cell holding a small table of
@@ -16935,24 +17273,48 @@ function stockCount(productType, size, locationId){
    stockCount, so the list always matches the number shown on the row. */
 function stockSerialRow(productType, size, colIds, colspan){
   const units = visibleDevices().filter(d =>
-    d.productType === productType && d.size === size && colIds.has(d.locationId) &&
+    d.productType === productType && d.size === size && colIds.has(deviceAtLocation(d)) &&
     (FL.status ? d.status === FL.status : DEV_STATUS[d.status].stock));
   units.sort((a, b) => {
     const la = locName(a.locationId), lb = locName(b.locationId);
     if(la !== lb) return la < lb ? -1 : 1;
     return (a.sn || "") < (b.sn || "") ? -1 : (a.sn || "") > (b.sn || "") ? 1 : 0;
   });
-  const inner = units.length
-    ? '<table class="stk-serials"><thead><tr><th>Serial</th><th>Location</th>' +
-        '<th>Status</th><th>Expiry</th></tr></thead><tbody>' +
-      units.map(d => '<tr>' +
+  return '<tr class="stk-exp"><td colspan="' + colspan + '">' +
+    unitDetailTable(units) + '</td></tr>';
+}
+
+/* ONE table for "show me the units behind this number", used by every screen that
+   prints a quantity. Serial, where it is, its status, and the expiry date - which is
+   the field somebody expanding a row is usually actually looking for.
+
+   It exists as a single function so the columns cannot drift between screens: a count
+   the operator can open is only trustworthy if every count opens the same way. */
+function unitDetailTable(units, opts){
+  const o = opts || {};
+  if(!units.length) return '<div class="hint" style="margin:2px 0">No matching units.</div>';
+  const rows = units.slice().sort((a, b) =>
+    String(a.expiration || "9999").localeCompare(String(b.expiration || "9999")) ||
+    String(a.sn || "").localeCompare(String(b.sn || "")));
+  const soon = new Date(Date.now() + 90 * 864e5).toISOString().slice(0, 10);
+  return '<table class="stk-serials"><thead><tr><th>Serial</th><th>Product</th>' +
+      '<th>Where</th><th>Status</th><th>Expiry</th></tr></thead><tbody>' +
+    rows.map(d => {
+      const here = deviceAtLocation(d);
+      const where = here ? esc(locName(here))
+        : '<span title="in transit">' + esc(locName(d.shippedFromId)) + ' → ' +
+          esc(locName(d.destinationId)) + '</span>';
+      const exp = d.expiration || "";
+      return '<tr>' +
         '<td class="mono">' + esc(d.sn || "—") + '</td>' +
-        '<td>' + esc(locName(d.locationId)) + '</td>' +
+        '<td>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</td>' +
+        '<td>' + where + '</td>' +
         '<td>' + pill(DEV_STATUS, d.status) + '</td>' +
-        '<td>' + esc(d.expiration || "—") + '</td></tr>').join("") +
-      '</tbody></table>'
-    : '<div class="hint" style="margin:2px 0">No matching units.</div>';
-  return '<tr class="stk-exp"><td colspan="' + colspan + '">' + inner + '</td></tr>';
+        '<td' + (exp && exp <= soon ? ' class="warn-cell" title="expires within 90 days"' : '') +
+          '>' + esc(exp ? fmtDate(exp) : "—") + '</td></tr>';
+    }).join("") +
+    '</tbody></table>' +
+    (o.note ? '<div class="hint" style="margin-top:4px">' + esc(o.note) + '</div>' : '');
 }
 VIEWS.stock = {
   /* One title for everyone. The screen was never actually different per role - only
@@ -16989,8 +17351,14 @@ VIEWS.stock = {
         '<option value=""' + (FL.status === "" ? " selected" : "") + '>Live stock only</option>' +
         Object.keys(DEV_STATUS).map(k => '<option value="' + k + '"' + (FL.status === k ? " selected" : "") +
           '>' + esc(DEV_STATUS[k].label) + '</option>').join("") + '</select></div>' +
-      '<div class="field" style="margin:0"><label for="f-q">Search site name</label>' +
-        '<input type="text" id="f-q" value="' + esc(FL.q) + '" placeholder="type to filter columns"></div>' +
+      '<div class="field" style="margin:0"><label for="f-loc">Location</label><select id="f-loc">' +
+        '<option value=""' + (FL.locId === "" ? " selected" : "") + '>All locations</option>' +
+        visibleLocations()
+          .filter(l => !FL.locType || l.type === FL.locType)
+          .slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))
+          .map(l => '<option value="' + esc(l.id) + '"' + (FL.locId === l.id ? " selected" : "") +
+            '>' + esc(l.name) + '</option>').join("") +
+        '</select></div>' +
     '</div></div></div>';
 
     if(!cols.length) return h + '<div class="empty">No locations match the filters.</div>';
@@ -17035,22 +17403,14 @@ VIEWS.stock = {
     return h;
   },
   wire(){
-    $("#f-lt").onchange = e => { FL.locType = e.target.value; render(); };
+    /* Changing the location TYPE clears a chosen location, because the chosen one may
+       not be of that type any more and a filter pair that contradicts itself shows an
+       empty table with no hint as to why. */
+    $("#f-lt").onchange = e => { FL.locType = e.target.value; FL.locId = ""; render(); };
     $("#f-p").onchange  = e => { FL.product = e.target.value; render(); };
     $("#f-s").onchange  = e => { FL.status  = e.target.value; render(); };
-    /* Re-rendering on every keystroke and then restoring focus and the caret fought
-       IME composition and mobile autocorrect. Debounced, and the caret is left
-       alone because the input itself is no longer torn down mid-word. */
-    $("#f-q").oninput   = e => {
-      FL.q = e.target.value;
-      clearTimeout(VIEWS.stock._t);
-      VIEWS.stock._t = setTimeout(() => {
-        const at = $("#f-q") && $("#f-q").selectionStart;
-        render();
-        const i = $("#f-q");
-        if(i){ i.focus(); if(at != null) try{ i.setSelectionRange(at, at); }catch(err){} }
-      }, 220);
-    };
+    const fl = $("#f-loc");
+    if(fl) fl.onchange = e => { FL.locId = e.target.value; render(); };
     const c = $("#csv"); if(c) c.onclick = exportCSV;
 
     /* Expand / collapse a product-size row to its serials. The inner scroll position
@@ -17229,9 +17589,19 @@ function batchUnitRows(b, editable){
     }).join("") + '</tbody></table></div>';
 }
 
+/* Did I sign production on this batch? Compared by email, the identity the session
+   carries; names are neither unique nor immutable. The server enforces this too and
+   is the authority - this only keeps the screen from offering a button that would be
+   refused, so nobody presses it and wonders what they did wrong. */
+function iProducedBatch(b){
+  const producer = String(((b || {}).production || {}).by || "").trim().toLowerCase();
+  const me = String((S.me && S.me.email) || "").trim().toLowerCase();
+  return !!(producer && me && producer === me);
+}
+
 VIEWS.batches = {
-  title:"Batches awaiting QA",
-  sub:"Produced batches held between the person who made them and the person who releases them. Only a QA confirmation puts units into stock.",
+  title:"QA Approval",
+  sub:"Produced batches waiting for their second signature. Nothing is stock until somebody other than the producer approves it.",
   body(){
     const all = (S.db && Array.isArray(S.db.batches)) ? S.db.batches : [];
     const approver = can("approveRegistration");
@@ -17243,7 +17613,9 @@ VIEWS.batches = {
     const done = all.filter(b => b.status === "COMPLETED");
 
     const card = b => {
-      const editable = approver && b.status === "HELD_MRB";
+      const mine = iProducedBatch(b);
+      const mayAct = approver && !mine;
+      const editable = mayAct && b.status === "HELD_MRB";
       const l = loc(b.locationId) || {};
       return '<div class="card"><div class="card-hd"><h2>' + esc(b.batchId) + '</h2>' +
         pill(BATCH_STATUS, b.status) + '</div><div class="card-bd">' +
@@ -17264,7 +17636,13 @@ VIEWS.batches = {
         batchUnitRows(b, editable) +
         (editable ? whyBox("mrb-why-" + b.batchId) : "") +
         '</div>' +
-        (approver && b.status === "AWAITING_QA"
+        /* Your own batch is shown but not actionable, and the reason is stated. Hiding
+           it entirely would read as "it never arrived" and invite a second scan. */
+        (approver && mine && b.status !== "COMPLETED"
+          ? '<div class="card-ft"><div class="note">You confirmed production on this ' +
+            'batch, so you cannot also approve it. It needs a second person.</div></div>'
+          : "") +
+        (mayAct && b.status === "AWAITING_QA"
           ? '<div class="card-ft"><div class="row">' +
               '<button class="btn btn-primary" data-bapprove="' + esc(b.batchId) + '">Approve &amp; register ' +
                 ((b.units || []).length) + ' device(s)</button>' +
@@ -18118,7 +18496,8 @@ VIEWS.admin = {
         '<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Address</th>' +
         '<th>Contact</th><th>Responsible CPM</th><th>Devices</th><th></th></tr></thead><tbody>' +
       S.db.locations.map(l => {
-        const n = S.db.devices.filter(d => d.locationId === l.id).length;
+        /* Units actually AT the location. A unit in transit is at neither end. */
+        const n = S.db.devices.filter(d => deviceAtLocation(d) === l.id).length;
         return '<tr><td><b>' + esc(l.name) + '</b></td>' +
           '<td>' + (l.type === "WAREHOUSE" ? '<span class="pill p-blue">Warehouse</span>'
                     : l.type === "HQ"     ? '<span class="pill p-green">Innoventric HQ</span>'
@@ -18364,8 +18743,12 @@ function locForm(l){
   };
 }
 async function removeLoc(l){
-  /* Referential guard: a location still holding anything cannot be deleted. */
-  const d = S.db.devices.filter(x => x.locationId === l.id).length;
+  /* Referential guard: a location still holding anything cannot be deleted. This one
+     is deliberately WIDER than deviceAtLocation - a location that is the origin or the
+     destination of a shipment still in the air must survive, or the In Transit log
+     would lose one end of the journey and the delivery would have nowhere to arrive. */
+  const d = S.db.devices.filter(x =>
+    x.locationId === l.id || x.destinationId === l.id || x.shippedFromId === l.id).length;
   const p = S.db.patients.filter(x => x.siteId === l.id).length;
   const u = S.db.users.filter(x => x.locationId === l.id).length;
   if(d || p || u)
