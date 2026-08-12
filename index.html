@@ -585,6 +585,9 @@ table.stk-serials th{background:#f3e6ee; color:#5a0c3a; font-weight:600;}
 </div>
 
 <div id="modal-root"></div>
+<!-- Offered on every angle field: pick a whole degree from the list, or type any value
+     in range. One list serves them all rather than four identical copies per stage. -->
+<datalist id="angle-0-90"></datalist>
 
 <!-- The QR decoder. A vendored npm package (jsqr 1.4.0, Apache-2.0, no dependencies
      of its own), served from our own origin so the page's default-src 'self' CSP
@@ -10924,6 +10927,177 @@ if(typeof module !== "undefined" && module.exports) module.exports = api;
 if(typeof window !== "undefined") window.DeviceQr = api;
 
 </script>
+<script>
+/* ---------------------------------------------------------------------------
+   anatStages.js - inlined verbatim by build-demo.js.
+   The ten stages of the anatomical workflow, their order, kind and required
+   fields. The live app loads the identical file from anatStages.js.
+   --------------------------------------------------------------------------- */
+"use strict";
+/* =============================================================================
+   THE ANATOMICAL WORKFLOW — one definition, three readers
+
+   WRAPPED IN A FUNCTION ON PURPOSE. In the browser this is a plain script sharing
+   one global scope with the page, so a top-level `var ANAT_STAGES` here and a
+   `const ANAT_STAGES` there are two declarations of the same global - which is a
+   SyntaxError that kills the whole page, not a warning. Nothing escapes except the
+   namespace at the bottom.
+
+   The ten stages are the spine of the clinical pathway. They are named in the
+   browser (the screening screen), on the server (the daily summary email names
+   the stage a task belongs to) and in the tests. Three copies of a list that gets
+   renamed is three chances to disagree, and a summary email that still calls a
+   stage by last month's name is worse than one that says nothing.
+
+   So this file is the single definition, loaded the same way deviceQr.js is:
+     · browser  a same-origin script tag  ->  window.AnatStages
+     · Node     require("./anatStages")
+     · the demo build inlines it verbatim
+   (Deliberately not spelling that tag out literally: this file gets inlined into the
+   demo, where a literal script tag in a comment makes a plain grep for external
+   scripts look like the demo has stopped being self-contained.)
+
+   It holds the SHAPE of the workflow - which stages exist, in what order, of what
+   kind, and what each one must contain. It holds no state and no policy: gating,
+   the task state machine and the recommendation logic stay in the page, because
+   they are about a patient rather than about the workflow.
+
+   No imports, no DOM, no third-party code.
+   ============================================================================= */
+(function(){
+
+/* kind drives which fields a stage renders and which ones it must have:
+     eval  - a clinical judgement (suitability, size, when it was decided)
+     ops   - something physically done (when it was actually done)
+     sched - the procedure booking
+     order - the product request                                              */
+var ANAT_STAGES = [
+  { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval" },
+  { k:"model3d",   n:2,  label:"3D Model Evaluation",                kind:"eval", pm:true, sim:true },
+  /* Printing cannot begin on somebody's say-so alone: a physical model gets made from
+     it, so a CPM or manager approves first. See PRINT_GATE below. */
+  { k:"printing",  n:3,  label:"Model Printing",                     kind:"ops",  needsApproval:true },
+  { k:"casting",   n:4,  label:"Model Casting",                      kind:"ops"  },
+  { k:"pmins",     n:5,  label:"PM Insertion",                       kind:"ops",  needsPm:true },
+  /* The pliable model is where a borderline anatomy gets argued out, so this is the one
+     evaluation stage that can open a scoring matrix. It carries no angle: the angle is
+     decided later, on fluoroscopy. */
+  { k:"flexible",  n:6,  label:"Pliable model evaluation",           kind:"eval", noAngle:true, scoring:true },
+  { k:"fluoro",    n:7,  label:"Training session and Road Map definition", kind:"eval", final:true, strategy:true },
+  /* Replaces the old "Road Map" stage, which was folded into 7. This is where the
+     patient is declared eligible and allocated to a study arm. */
+  { k:"approvals", n:8,  label:"Eligibility & Approvals",            kind:"approval" },
+  { k:"scheduling",n:9,  label:"Randomization and procedure scheduling", kind:"sched", eligible:true },
+  { k:"order",     n:10, label:"Product Order Request",              kind:"order", eligible:true }
+];
+
+/* Stages 1-8 must be finished (or Not required) before a procedure may be scheduled.
+   Stages 9 and 10 sit outside that set and outside the anatomical block on screen -
+   they belong to a patient who is already eligible. */
+var ANAT_MANDATORY = ANAT_STAGES.filter(function(s){ return s.n <= 8; }).map(function(s){ return s.k; });
+
+/* Who may release stage 3 for printing. Assignment opens the stage for editing, but
+   this approval is still required before it can be confirmed complete - so the gate
+   stays a real control without blocking the work. */
+var PRINT_GATE = ["CPM", "ADMIN", "MANAGER"];
+
+/* The nine criteria a borderline anatomy is scored on, per candidate implant size.
+   1 is bad and 5 is good. The weights are all 1 today; real ones are expected later,
+   and keeping them here as data means that is a change of numbers rather than a
+   change of code. */
+var SCORING_CRITERIA = [
+  { k:"ivcSeal",    label:"IVC sealing",                         weight:1 },
+  { k:"svcSeal",    label:"SVC sealing",                         weight:1 },
+  { k:"ivcAnchor",  label:"IVC anchoring",                       weight:1 },
+  { k:"svcAnchor",  label:"SVC anchoring",                       weight:1 },
+  { k:"pmEffect",   label:"PM effect on device",                 weight:1,
+    hint:"Interference with the skirt, a challenging path, and so on" },
+  { k:"heightRoom", label:"Room for error in final implantation height", weight:1 },
+  { k:"stentHigh",  label:"How high the stent sits in the innominate",   weight:1,
+    hint:"Below the AZ, between the AZ, or meeting the innominate" },
+  { k:"raFloor",    label:"RA floor complexity",                 weight:1 },
+  { k:"svcValve",   label:"SVC valve round or oval",             weight:1 }
+];
+
+/* What the person scoring concludes. The system totals the scores and puts a size
+   forward; this decision stays theirs, and is recorded as theirs. */
+var SCORING_DECISIONS = [
+  { k:"ELIGIBLE",   label:"Patient eligible by Innoventric" },
+  { k:"DISCUSSION", label:"Internal discussion required" },
+  { k:"UNSUITABLE", label:"Anatomically unsuitable" }
+];
+
+/* The four fluoroscopic angles. LAO/RAO are opposite tilts on one axis, as are
+   CRAN/CAUD, so only one of each pair can hold a value. */
+var ANGLE_FIELDS = [
+  { k:"lao",  label:"LAO",  pair:"lr" },
+  { k:"rao",  label:"RAO",  pair:"lr" },
+  { k:"cran", label:"CRAN", pair:"cc" },
+  { k:"caud", label:"CAUD", pair:"cc" }
+];
+
+/* What a stage must actually contain before it may be called Completed. Without this,
+   "Completed" would be just a stored word: a stage could be signed off with every
+   field blank and the next one would unlock, which defeats the only thing the
+   sequence exists to guarantee. */
+function stageRequired(s){
+  if(s.kind === "eval")  return [["suitability","Anatomical suitability"],
+                                 ["size","Recommended implant size"],
+                                 ["completionDate","Completion date"]];
+  if(s.kind === "ops")   return [["actualDate","Actual completion date"]];
+  /* Eligibility is two approvals and an arm. The arm is what stage 9 acts on, so a
+     stage that closed without it would leave the randomisation with nothing to read. */
+  if(s.kind === "approval") return [["eligibleByInnoventric","Patient eligible by Innoventric"],
+                                    ["committeeApproval","Eligibility committee approval"],
+                                    ["studyArm","Study or control group"]];
+  if(s.kind === "sched") return [["completionDate","Procedure date"],
+                                 ["hospital","Hospital"],["physician","Physician"]];
+  if(s.kind === "order") return [["shippingDest","Shipping destination"],
+                                 ["requestedDate","Requested delivery date"]];
+  return [];
+}
+
+/* Which arm a patient was allocated to. Decided once, at stage 8. */
+var STUDY_ARMS = [
+  { k:"STUDY",   label:"Study group (enrolment)" },
+  { k:"CONTROL", label:"Control group" }
+];
+function isControl(p){
+  return !!(p && p.anat && p.anat.approvals && p.anat.approvals.studyArm === "CONTROL");
+}
+
+/* A stage is finished either because somebody signed it, or because somebody judged
+   it unnecessary. Both are stored; everything else about its state is derived. */
+function anatDone(status){ return status === "Completed" || status === "Not required"; }
+
+/* "3. Model Printing" - how a stage is named to a human, in an email or a log line. */
+function stageName(s){ return s.n + ". " + s.label; }
+function stageByKey(k){
+  for(var i = 0; i < ANAT_STAGES.length; i++) if(ANAT_STAGES[i].k === k) return ANAT_STAGES[i];
+  return null;
+}
+
+var api = {
+  ANAT_STAGES: ANAT_STAGES,
+  ANAT_MANDATORY: ANAT_MANDATORY,
+  PRINT_GATE: PRINT_GATE,
+  SCORING_CRITERIA: SCORING_CRITERIA,
+  SCORING_DECISIONS: SCORING_DECISIONS,
+  ANGLE_FIELDS: ANGLE_FIELDS,
+  STUDY_ARMS: STUDY_ARMS,
+  stageRequired: stageRequired,
+  anatDone: anatDone,
+  stageName: stageName,
+  stageByKey: stageByKey,
+  isControl: isControl
+};
+
+if(typeof module !== "undefined" && module.exports) module.exports = api;
+if(typeof window !== "undefined") window.AnatStages = api;
+
+})();
+
+</script>
 
 <script>
 /* Generated demo build: never contact a backend, and keep storage separate so a
@@ -10954,7 +11128,9 @@ const ROLES = {
   ADMIN:    { label:"App Admin",           blurb:"Everything, plus the Admin screen." },
   CPM:      { label:"Clinical PM",         blurb:"Employee rights plus create/edit patients, overrides, final lock." },
   EMPLOYEE: { label:"Innoventric Employee",blurb:"Main workflow. Cannot create or edit patients." },
-  WH_ADMIN: { label:"WH Admin",            blurb:"Warehouse operations, own warehouse only." }
+  WH_ADMIN: { label:"WH Admin",            blurb:"Warehouse operations, own warehouse only." },
+  QA:       { label:"QA",                  blurb:"Employee rights plus releasing a produced batch into stock." },
+  MANAGER:  { label:"Manager",             blurb:"Employee rights plus releasing a batch and overriding FIFO." }
 };
 
 /* Mirrors CAPABILITIES in roleStore.js. The server is still the authority —
@@ -10965,9 +11141,11 @@ const CAPABILITIES = {
   manageUsers:     ["ADMIN"],
   deletePatients:  ["ADMIN"],
   lockCaseFile:    ["ADMIN","CPM"],
-  overrideFifo:    ["ADMIN","CPM"],
-  registerDevice:  ["ADMIN","EMPLOYEE"],  // produce new devices at an HQ location
-  editAnatomical:  ["ADMIN","CPM","EMPLOYEE"]  // edit ONLY the anatomical-evaluation fields
+  overrideFifo:    ["ADMIN","CPM","MANAGER"],
+  registerDevice:  ["ADMIN","EMPLOYEE","QA","MANAGER"],  // prepare a batch at an HQ location
+  approveRegistration: ["ADMIN","QA","MANAGER"],  // release a prepared batch into stock
+  editAnatomical:  ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"],  // edit ONLY the anatomical-evaluation fields
+  reopenStage:     ["ADMIN","CPM","MANAGER"]   // withdraw a confirmed stage, with a reason
 };
 function can(cap){
   const a = CAPABILITIES[cap];
@@ -11020,22 +11198,24 @@ const SCREENING_STEPS = [
 /* ---- Anatomical evaluation: ten stages, strictly sequential ----
    kind drives which fields render, so the ten stages are one generated form rather
    than ten hand-written ones that drift apart. */
-const ANAT_STATUS  = ["Not started","In progress","Completed","Not required"];
+/* Display order of the task states. "Pending confirmation" sits between the work and
+   the signature: every mandatory field is in, and the person doing it has yet to say
+   so. It is derived, never stored - see stageState. */
+const ANAT_STATUS  = ["Not started","In progress","Pending confirmation","Completed","Not required"];
+const ANAT_STATE_CLS = {
+  "Not started":          "p-grey",
+  "In progress":          "p-orange",
+  "Pending confirmation": "p-blue",
+  "Completed":            "p-green",
+  "Not required":         "p-grey"
+};
 const SUITABILITY  = ["","Suitable","Borderline","Not suitable"];
-const ANAT_STAGES = [
-  { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval" },
-  { k:"model3d",   n:2,  label:"3D Model Evaluation",                kind:"eval", pm:true, sim:true },
-  { k:"printing",  n:3,  label:"Model Printing",                     kind:"ops"  },
-  { k:"casting",   n:4,  label:"Model Casting",                      kind:"ops"  },
-  { k:"pmins",     n:5,  label:"PM Insertion",                       kind:"ops",  needsPm:true },
-  { k:"flexible",  n:6,  label:"Flexible Model Evaluation",          kind:"eval" },
-  { k:"fluoro",    n:7,  label:"Fluoroscopy Implantation Simulation", kind:"eval", final:true },
-  { k:"roadmap",   n:8,  label:"Road Map",                           kind:"eval", final:true, strategy:true },
-  { k:"scheduling",n:9,  label:"Procedure Scheduling",               kind:"sched" },
-  { k:"order",     n:10, label:"Product Order Request",              kind:"order" }
-];
-/* Stages 1-8 must be finished (or Not required) before a procedure may be scheduled. */
-const ANAT_MANDATORY = ANAT_STAGES.filter(s => s.n <= 8).map(s => s.k);
+/* The workflow's shape lives in anatStages.js, because the server names these stages
+   in the daily summary email and the tests exercise them - three copies of a list that
+   gets renamed is three chances to disagree. What stays here is everything ABOUT A
+   PATIENT: the gating, the task state machine, the recommendation. */
+const ANAT_STAGES    = window.AnatStages.ANAT_STAGES;
+const ANAT_MANDATORY = window.AnatStages.ANAT_MANDATORY;
 
 function blankScreening(){
   const o = {};
@@ -11046,35 +11226,88 @@ function blankAnat(){
   const o = {};
   ANAT_STAGES.forEach(s => {
     o[s.k] = { status:"Not started", suitability:"", size:"", altSize:"", angle:"",
-               assignedTo:"", completedBy:"", completionDate:"",
+               /* assignedTo holds an EMAIL. It used to hold a display name, which is
+                  neither unique nor stable and gave nothing to send a notification to.
+                  migrateAssignees() converts older records on read. */
+               assignedTo:"", dueDate:"", completedBy:"", completionDate:"",
                estDate:"", actualDate:"",
                simAngle:"", pmPresent:"", pmLeads:"", pmCrossingAngle:"",
                strategy:"", hospital:"", physician:"", schedNotes:"",
                accessories:"", shippingDest:"", requestedDate:"",
-               requestedBy:"", requestedAt:"", approvedBy:"" };
+               requestedBy:"", requestedAt:"", approvedBy:"",
+               /* Set when a completed stage is reopened, and by whom, and why. */
+               reopenedBy:"", reopenedAt:"", reopenReason:"",
+               notRequiredBy:"", notRequiredAt:"",
+               /* Stage 3 only: the release to print, and who gave it. */
+               printApproved:false, printApprovedBy:"", printApprovedAt:"",
+               /* Stage 8 only: the two approvals and the arm the patient goes into. */
+               eligibleByInnoventric:false, committeeApproval:false, studyArm:"",
+               /* Stage 10 only: the CPM's confirmation of date and sizes, and what
+                  the availability check found when it was given. */
+               productsConfirmed:false, productsConfirmedBy:"", productsConfirmedAt:"",
+               /* Stage 6 only, and only when the anatomy is borderline: two candidate
+                  sizes scored across nine criteria, and the conclusion drawn from it. */
+               scoring:null };
   });
   return o;
 }
-function anatDone(st){ return st === "Completed" || st === "Not required"; }
+const anatDone = window.AnatStages.anatDone;
 
-/* What a stage must actually contain before it may be called Completed.
-   Without this, "Completed" is just a dropdown value: a stage could be marked done
-   with every field blank and the next one would unlock, which defeats the only thing
-   the gating exists to guarantee. */
-function stageRequired(s){
-  if(s.kind === "eval")  return [["suitability","Anatomical suitability"],
-                                 ["size","Recommended implant size"],
-                                 ["completionDate","Completion date"]];
-  if(s.kind === "ops")   return [["actualDate","Actual completion date"]];
-  if(s.kind === "sched") return [["completionDate","Procedure date"],
-                                 ["hospital","Hospital"],["physician","Physician"]];
-  if(s.kind === "order") return [["shippingDest","Shipping destination"],
-                                 ["requestedDate","Requested delivery date"]];
-  return [];
+/* ---- the stage as a task ------------------------------------------------------
+   The status stopped being something a user picks. It is now a consequence of the
+   work: touching a field starts it, filling every mandatory field readies it, and
+   only an explicit confirmation completes it. Two of the five states are therefore
+   STORED, because nothing else could tell you them - "Completed" (somebody signed
+   it) and "Not required" (somebody judged it unnecessary) - and the rest are
+   derived on read. That split matters: a derived value cannot drift out of step
+   with the data it describes, which is exactly how a dropdown used to be able to
+   claim "Completed" over an empty stage.                                        */
+function stageTouched(p, s){
+  const a = p.anat[s.k];
+  /* Ignore the fields that are not the work itself: an assignment or a due date is
+     something done TO the task, not progress on it. */
+  const admin = { status:1, assignedTo:1, dueDate:1, completedBy:1, completionDate:1,
+                  requestedBy:1, requestedAt:1, reopenedBy:1, reopenedAt:1, reopenReason:1,
+                  notRequiredBy:1, notRequiredAt:1 };
+  return Object.keys(a).some(k => !admin[k] && String(a[k] || "").trim() !== "");
 }
+function stageState(p, s){
+  const a = p.anat[s.k];
+  if(a.status === "Not required") return "Not required";
+  if(a.status === "Completed" && stageMissing(p, s).length === 0) return "Completed";
+  if(stageRequired(s).length && stageMissing(p, s).length === 0) return "Pending confirmation";
+  return stageTouched(p, s) ? "In progress" : "Not started";
+}
+/* A task is waiting on somebody as soon as it is not finished. */
+function stageOpen(p, s){ return !anatDone(stageState(p, s)); }
+
+/* Overdue means a due date was set, it has passed, and the work is still open. A task
+   with no due date is never overdue - that is the whole point of the date being
+   optional, and counting undated work as late would make the flag meaningless. */
+function stageOverdue(p, s){
+  const a = p.anat[s.k] || {};
+  const due = String(a.dueDate || "").slice(0, 10);
+  if(!due || !stageOpen(p, s)) return false;
+  return due < nowISO().slice(0, 10);
+}
+
+const stageRequired = window.AnatStages.stageRequired;
 function stageMissing(p, s){
   const a = p.anat[s.k];
-  return stageRequired(s).filter(([f]) => !String(a[f] || "").trim()).map(([,label]) => label);
+  /* Booleans are checked as booleans. Coercing them to text the way the other fields
+     are compared would read `false` as the four-character string "false" - which is not
+     empty - and an unticked approval would count as given. */
+  const empty = v => (typeof v === "boolean") ? !v : !String(v == null ? "" : v).trim();
+  let required = stageRequired(s);
+  /* A control-group patient has no procedure to schedule, so the scheduling stage asks
+     nothing of them: it exists only to record the allocation. Requiring a date and a
+     hospital would leave every control patient permanently mid-workflow. */
+  if(s.kind === "sched" && isControl(p)) required = [];
+  const out = required.filter(([f]) => empty(a[f])).map(([,label]) => label);
+  /* An approval somebody else has to give is a requirement like any other, and belongs
+     in the same list so it appears wherever missing content is reported. */
+  if(s.needsApproval && !a.printApproved) out.push("Approval to print");
+  return out;
 }
 /* A stage counts as settled only if it is Not required, or Completed AND populated.
    Gating asks this rather than the raw status, so data that arrived from an import or
@@ -11086,31 +11319,153 @@ function stageComplete(p, s){
 }
 
 /* A stage may not remain "Completed" once its required fields are gone - a field cleared
-   after completion, or data from an older build. It drops back to "In progress" so the
-   Status dropdown can never say "Completed" while the badge says "Incomplete". Returns
-   true if it changed anything. */
+   after completion, or data from an older build. The stored signature is withdrawn, and
+   stageState then reports it honestly again. Returns true if it changed anything. */
 function reconcileStageStatus(p, s){
   const a = p.anat[s.k];
   if(a.status === "Completed" && stageMissing(p, s).length){
     a.status = "In progress";
     a.completedBy = "";        // cleared so a later re-completion stamps the right person
+    a.completionDate = "";     // and its time, which is no longer true either
     return true;
   }
   return false;
 }
 
-/* A stage may only be worked on once every earlier stage is finished, unless an
-   App Admin has recorded an override. */
+/* Assignment used to be stored as a display name. Convert on read: a name that matches
+   exactly one user becomes their email; anything ambiguous or unknown is LEFT ALONE
+   rather than guessed at, because assigning clinical work to the wrong person by
+   fuzzy-matching a name is worse than leaving a record that plainly needs a human.
+   Returns the number of entries that could not be resolved. */
+/* A patient recorded before the workflow was reshaped has the stages of that older
+   workflow: no Eligibility & Approvals, and a Road Map that no longer exists. Every
+   read path assumes p.anat[key] is there for every current stage, so a missing one is
+   not a blank field - it is a crash on the first render. Back-filled here, on read,
+   for the same reason the assignee migration is: the alternative is a data migration
+   that has to run before anybody opens the app.
+   The retired stage's data is LEFT ALONE. Removing it is a release-time decision with
+   a report attached, not something to do silently on somebody's screen. */
+function ensureAnatShape(p){
+  if(!p || !p.anat) return;
+  const blank = blankAnat();
+  for(const s of ANAT_STAGES){
+    if(!p.anat[s.k]) p.anat[s.k] = blank[s.k];
+    else for(const f of Object.keys(blank[s.k])){
+      if(p.anat[s.k][f] === undefined) p.anat[s.k][f] = blank[s.k][f];
+    }
+  }
+}
+
+function migrateAssignees(p){
+  if(!p || !p.anat) return 0;
+  let unresolved = 0;
+  for(const s of ANAT_STAGES){
+    const a = p.anat[s.k];
+    if(!a) continue;
+    const v = String(a.assignedTo || "").trim();
+    if(!v || v.includes("@")) continue;          // empty, or already an email
+    const hits = (S.db.users || []).filter(u => u.name === v);
+    if(hits.length === 1) a.assignedTo = hits[0].email;
+    else unresolved++;
+  }
+  return unresolved;
+}
+function userByEmail(email){
+  const e = String(email || "").trim().toLowerCase();
+  if(!e) return null;
+  return (S.db.users || []).find(u => String(u.email || "").toLowerCase() === e) || null;
+}
+function assigneeLabel(email){
+  const u = userByEmail(email);
+  return u ? u.name : (email || "");
+}
+
+/* ---- who a patient is waiting on -----------------------------------------------
+   The earliest stage that is still open names it, so the register shows one line per
+   patient. Before the evaluation can start at all - the CT material is not in yet, so
+   every stage is shut - it is the site's CPM who has to move it along. An open stage
+   nobody has taken falls to the CPM for the same reason. */
+function siteCpm(siteId){
+  const l = loc(siteId);
+  return l && l.cpmUserId ? l.cpmUserId : "";
+}
+function stuckWith(p){
+  if(!p.anat || p.status === "TREATED" || (p.cancelled && p.cancelled.is)) return null;
+  const ctReady = p.screening && p.screening.ct && p.screening.ct.done;
+  if(!ctReady){
+    const cpm = siteCpm(p.siteId);
+    return { who: cpm ? assigneeLabel(cpm) : "Unassigned CPM", email: cpm,
+             stage: null, why: "screening", overdue: false };
+  }
+  for(const s of ANAT_STAGES){
+    if(!stageOpen(p, s)) continue;
+    if(!anatUnlocked(p, s.k)) continue;
+    const a = p.anat[s.k] || {};
+    const email = String(a.assignedTo || "") || siteCpm(p.siteId);
+    return { who: email ? assigneeLabel(email) : "Nobody yet", email,
+             stage: s, why: a.assignedTo ? "assigned" : "unassigned",
+             overdue: stageOverdue(p, s) };
+  }
+  return null;
+}
+
+/* Every open stage this person is answerable for: theirs by name, plus - for a CPM -
+   the ones at their sites that nobody has picked up. */
+function myTasks(){
+  if(!S.me || !S.db) return [];
+  const me = String(S.me.email || "").toLowerCase();
+  const isCpm = S.me.role === "CPM" || S.me.role === "ADMIN";
+  const out = [];
+  for(const p of S.db.patients){
+    if(!inScope(p.siteId) || !p.anat) continue;
+    if(p.cancelled && p.cancelled.is) continue;
+    const ctReady = p.screening && p.screening.ct && p.screening.ct.done;
+    if(!ctReady) continue;
+    for(const s of ANAT_STAGES){
+      if(!stageOpen(p, s) || !anatUnlocked(p, s.k)) continue;
+      const a = p.anat[s.k] || {};
+      const owner = String(a.assignedTo || "").toLowerCase();
+      const mine = owner === me;
+      const orphanAtMySite = !owner && isCpm &&
+        (!siteCpm(p.siteId) || String(siteCpm(p.siteId)).toLowerCase() === me);
+      if(!mine && !orphanAtMySite) continue;
+      out.push({ p, s, a, unassigned: !owner, overdue: stageOverdue(p, s),
+                 state: stageState(p, s) });
+    }
+  }
+  /* Overdue first, then by due date, then undated - the order somebody would work in. */
+  return out.sort((x, y) =>
+    (y.overdue - x.overdue) ||
+    String(x.a.dueDate || "9999").localeCompare(String(y.a.dueDate || "9999")));
+}
+
+/* A stage may only be worked on once every earlier stage is finished - unless it has
+   been assigned to somebody, an App Admin has recorded an override, or work has already
+   been done in it.
+
+   Assignment opening a stage is deliberate: giving somebody a task and then refusing to
+   let them start it would make the assignment a lie. It does mean the sequence is now
+   advisory rather than absolute, which is why the one genuinely unsafe jump is still
+   refused outright below. */
 function anatUnlocked(p, key){
   const i = ANAT_STAGES.findIndex(s => s.k === key);
   if(i <= 0) return true;
+  const s = ANAT_STAGES[i];
   /* The Product Order stage may never open until the procedure is actually scheduled,
-     and this holds even under an override: ordering product for a procedure with no
-     date, hospital or physician is meaningless. */
-  if(key === "order" && !stageComplete(p, ANAT_STAGES.find(s => s.k === "scheduling")))
-    return false;
+     and this holds even under an override or an assignment: ordering product for a
+     procedure with no date, hospital or physician is meaningless. A control-group
+     patient receives no product at all, so it never opens for them. */
+  if(key === "order"){
+    if(isControl(p)) return false;
+    if(!stageComplete(p, ANAT_STAGES.find(x => x.k === "scheduling"))) return false;
+  }
+  const a = p.anat[key] || {};
+  if(String(a.assignedTo || "").trim()) return true;
+  /* Once a stage holds work it stays reachable, even if the assignee is later cleared -
+     data already entered must never become unreachable. */
+  if(stageTouched(p, s)) return true;
   if(p.anatOverride) return true;
-  return ANAT_STAGES.slice(0, i).every(s => stageComplete(p, s));
+  return ANAT_STAGES.slice(0, i).every(x => stageComplete(p, x));
 }
 function anatIncomplete(p){
   return ANAT_STAGES.filter(s => ANAT_MANDATORY.includes(s.k) && !stageComplete(p, s))
@@ -11122,8 +11477,12 @@ function currentRecommendation(p){
   let out = { size:"", altSize:"", angle:"", from:"" };
   ANAT_STAGES.filter(s => s.kind === "eval").forEach(s => {
     const a = p.anat[s.k];
-    if(stageComplete(p, s) && (a.size || a.angle)){
-      out = { size:a.size || out.size, altSize:a.altSize || "", angle:a.angle || out.angle,
+    /* The angle is four fields now; angleText renders whichever of them are set.
+       The old free-text value is still read as a fallback so a record written before
+       the change keeps showing the angle it recorded. */
+    const ang = angleText(a, "angle") || String(a.angle || "");
+    if(stageComplete(p, s) && (a.size || ang)){
+      out = { size:a.size || out.size, altSize:a.altSize || "", angle:ang || out.angle,
               from:s.n + ". " + s.label };
     }
   });
@@ -11166,6 +11525,25 @@ const TRAINING_ITEMS = [
   "Device handling and preparation steps reviewed",
   "Anticoagulation held prior to procedure"
 ];
+/* Device verification is per unit, because that is how it is actually performed: the
+   barrier, the expiry and the identifiers belong to a specific device in a specific
+   hand, and a single tick covering "the devices" cannot say which one was inspected.
+   Each scanned unit therefore carries its own set of these.
+   "Confirm using this device" is the clinician's assertion that the unit in use is the
+   one the system put forward - deliberately a human statement, not a comparison the
+   system makes for them. */
+const DEVICE_CHECKS = [
+  "Device identifiers match the patient assignment",
+  "Sterile barrier intact immediately before opening",
+  "Expiry date checked at the table",
+  "Correct Unica size and matching Delivery System present",
+  "Confirm using this device"
+];
+/* The one check that describes the ROOM rather than a unit, so it stays single. */
+const ROOM_CHECKS = [
+  "Backup device available in the room"
+];
+/* Kept for reading back reports written before verification became per-unit. */
 const DEVICE_CONFIRMS = [
   "Device identifiers match the patient assignment",
   "Sterile barrier intact immediately before opening",
@@ -11196,12 +11574,15 @@ const ARRIVAL_CHECKS = [
   { k:"expiry",    t:"Expiration date check — within its safe operational lifecycle" }
 ];
 
-/* The three batch-level approvals for producing new devices at HQ. They cover the
-   whole production batch, not each unit, and all three are required to register. */
+/* The batch-level approvals for producing new devices at HQ. They cover the whole
+   production batch, not each unit, and both are required before the batch can be
+   confirmed. DHR, not DMR: the Device History Record is the evidence of what was
+   actually built, whereas the Device Master Record is the specification it was built
+   to - it is the DHR that gets signed per batch. QA approval used to be a third box
+   here; it is now a separate signature by a different person, further down. */
 const REG_CHECKS = [
   { k:"batchRelease", t:"Batch release is complete" },
-  { k:"dmrSigned",    t:"DMR documents are signed" },
-  { k:"qaApproval",   t:"QA approval granted" }
+  { k:"dhrSigned",    t:"DHR documents are signed" }
 ];
 
 /* ------------------------------------------------------------------ state */
@@ -11379,6 +11760,25 @@ async function api(method, path, body){
 /* Backend mode: the live database comes from SharePoint via the server, in the same
    shape as the local db. Collections not yet migrated to Lists arrive empty and are
    filled in by later stages; until then they simply have nothing to show. */
+/* The QA queue is fetched separately rather than folded into /api/store: the server
+   scopes it by role (an approver sees every open batch, a producer only their own),
+   and /api/store returns one shape to everybody. Failure is not fatal - the rest of
+   the app must still load if this call is refused. */
+async function loadBatches(){
+  if(!S.backend || !(can("approveRegistration") || can("registerDevice"))) return [];
+  try{ return await api("GET", "/api/device-batches"); }
+  catch(e){ return []; }
+}
+function openBatches(){
+  return (S.db && Array.isArray(S.db.batches) ? S.db.batches : [])
+    .filter(b => b.status === "AWAITING_QA" || b.status === "HELD_MRB");
+}
+/* What the badge counts: work this user can actually act on. A producer sees their
+   own batches on the screen but has nothing to do about them, so no badge for them. */
+function qaTodoCount(){
+  return can("approveRegistration") ? openBatches().length : 0;
+}
+
 async function loadRemoteStore(){
   const j = await api("GET", "/api/store");
   return {
@@ -11390,6 +11790,7 @@ async function loadRemoteStore(){
     logs:          j.logs          || [],
     notifications: j.notifications || [],
     notifyRecipients: j.notifyRecipients || [],
+    batches:       j.batches       || [],
     backupQueue:   j.backupQueue   || []
   };
 }
@@ -11523,6 +11924,37 @@ function notify(text, forRoles, forUserIds, locationId){
    managers in-app, record it in the audit log, and - when a backend is present - ask
    the server to email the same people (who requested, what, when, procedure date,
    from where, to where). Called exactly once per patient, guarded by order.requestedBy. */
+/* A task changing hands. Both ends are told: the new owner because it is now theirs,
+   and the previous owner because otherwise they carry on with work that has moved.
+   In-app immediately; the email goes through the server, which knows the addresses and
+   is the only place allowed to send. Best-effort - a notification that fails must never
+   cost the assignment itself. */
+function announceAssignment(p, stage, prevEmail, nextEmail){
+  const a = p.anat[stage.k];
+  const what = "stage " + stage.n + ". " + stage.label;
+  const due = a.dueDate ? " by " + fmtDate(a.dueDate) : "";
+
+  if(nextEmail){
+    const u = userByEmail(nextEmail);
+    notify("You have " + what + " for patient " + p.patientCode + due + ".",
+           [], [nextEmail], p.siteId);
+    logAction("Task assigned to " + (u ? u.name : nextEmail), { locationId:p.siteId,
+      stateChanges: stage.k + " → " + nextEmail + (a.dueDate ? " (due " + a.dueDate + ")" : ""),
+      comments:"Patient " + p.patientCode + " · " + what });
+  }
+  if(prevEmail && prevEmail !== nextEmail){
+    notify(what + " for patient " + p.patientCode + " is no longer assigned to you.",
+           [], [prevEmail], p.siteId);
+  }
+  if(S.backend){
+    api("POST", "/api/tasks/notify", {
+      patientId: p.id, patientCode: p.patientCode, siteId: p.siteId,
+      stageKey: stage.k, stageLabel: stage.n + ". " + stage.label,
+      dueDate: a.dueDate || "", assignedTo: nextEmail || "", previous: prevEmail || ""
+    }).catch(() => {});   // in-app notification already carried it
+  }
+}
+
 function announceOrderRequest(p){
   const o = p.anat.order, sc = p.anat.scheduling;
   const rec = currentRecommendation(p);
@@ -11773,10 +12205,11 @@ function initials(n){
   return String(n||"?").trim().split(/\s+/).slice(0,2).map(w => w[0]).join("").toUpperCase();
 }
 /* Location scoping. A WH Admin sees their warehouse; an employee assigned to a
-   site sees that site; anyone with no assigned location sees everything. */
+   site sees that site; anyone with no assigned location sees everything. QA and
+   Manager scope exactly like an Employee - they are an Employee plus one power. */
 function scopedLocIds(){
   if(!S.me) return null;
-  if(S.me.role === "WH_ADMIN" || S.me.role === "EMPLOYEE"){
+  if(["WH_ADMIN","EMPLOYEE","QA","MANAGER"].includes(S.me.role)){
     if(S.me.locationId) return [S.me.locationId];
   }
   return null;
@@ -12258,7 +12691,7 @@ async function redactImage(file){
 }
 
 async function captureSourceImage(p, fieldKey, fieldLabel){
-  if(p.fileLocked) return toast("This case file is locked.", "bad");
+  if(p.fileLocked) return toast("This procedure report is locked.", "bad");
   pickImage(async (file) => {
     try{
       const out = await redactImage(file);
@@ -12358,6 +12791,8 @@ async function boot(){
         // the snapshot already reflects anything that just expired.
         await api("POST", "/api/devices/apply-expiry").catch(() => {});
         S.db = await loadRemoteStore();
+        // Role-scoped, so it is a separate call; a refusal must not blank the app.
+        S.db.batches = await loadBatches();
       }
       catch(e){ toast("Could not load live data from the server: " + (e.message || "unknown error"), "bad"); }
     }
@@ -12479,22 +12914,29 @@ function icon(k){
    logistics screens that has never existed. */
 const NAV = [
   { grp:"Start here" },
-  { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"], todo:true },
-  { grp:"Devices" },
-  { k:"register", ic:"receive", label:"New Device Registration", roles:["ADMIN","EMPLOYEE"] },
-  { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
-  { k:"shipment", ic:"ship",    label:"Send a Device Out",  roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
-  { k:"stock",    ic:"stock",   label:"Stock by Location",  roles:["ADMIN","CPM","EMPLOYEE"] },
-  { k:"stock",    ic:"stock",   label:"My Warehouse Stock", roles:["WH_ADMIN"] },
-  { k:"sitereport", ic:"history", label:"Site Product Report", roles:["ADMIN","CPM","WH_ADMIN"] },
-  { grp:"Procedures" },
-  { k:"screening",ic:"case",    label:"Patient Screening",  roles:["ADMIN","CPM","EMPLOYEE"] },
-  { k:"clinical", ic:"case",    label:"Procedure Case File",roles:["ADMIN","CPM","EMPLOYEE"] },
+  { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], todo:true },
+  { grp:"Logistics" },
+  { k:"register", ic:"receive", label:"New Device Registration", roles:["ADMIN","EMPLOYEE","QA","MANAGER"] },
+  /* Producers see it too, read-only, so they can follow their own batch instead of
+     wondering whether it arrived. The badge counts only what YOU can act on. */
+  { k:"batches",  ic:"receive", label:"Batches awaiting QA", roles:["ADMIN","EMPLOYEE","QA","MANAGER"], qaBadge:true },
+  { k:"shipment", ic:"ship",    label:"Send Devices Out",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  /* One row for every role. A warehouse manager still sees only their own warehouse,
+     because the contents are scoped by visibleDevices() -> inScope(), not by the label. */
+  { k:"stock",    ic:"stock",   label:"Stock Overview",     roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { grp:"Clinical workflow" },
   { k:"patients", ic:"people",  label:"Patient Register",   roles:["ADMIN","CPM"] },
+  { k:"screening",ic:"case",    label:"Patient Screening",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"clinical", ic:"case",    label:"Procedure Report",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  /* Visible to every role: a control patient leaves every other list, so the one place
+     they still appear must not be the one place somebody cannot look. */
+  { k:"control",  ic:"people",  label:"Eligible — in control", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"sitereport", ic:"history", label:"Site Accountability Log", roles:["ADMIN","CPM","WH_ADMIN"] },
   { grp:"Records" },
-  { k:"alerts",   ic:"alert",   label:"Alerts",             roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"], badge:true },
-  { k:"audit",    ic:"history", label:"Activity History",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
-  { k:"backup",   ic:"cloud",   label:"Backup & Sync",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN"] },
+  { k:"alerts",   ic:"alert",   label:"Alerts",             roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], badge:true },
+  { k:"audit",    ic:"history", label:"Activity History",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"backup",   ic:"cloud",   label:"Backup & Sync",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   { grp:"Setup" },
   { k:"admin",    ic:"gear",    label:"Administration",     roles:["ADMIN"] }
 ];
@@ -12549,7 +12991,7 @@ function renderNav(){
     if(!i.roles.includes(S.me.role)) continue;
     if(pending){ html += '<div class="nav-lbl">' + esc(pending) + '</div>'; pending = null; }
     const on = S.view === i.k;
-    const count = i.badge ? unread : (i.todo ? todo : 0);
+    const count = i.qaBadge ? qaTodoCount() : (i.badge ? unread : (i.todo ? todo : 0));
     html += '<button class="nav-i' + (on ? " on" : "") + '" data-k="' + i.k + '"' +
       (on ? ' aria-current="page"' : "") + '>' +
       '<span class="n">' + icon(i.ic) + '</span>' +
@@ -12662,8 +13104,22 @@ function todoItems(){
   if(!S.me || !S.db) return [];
   const out = [];
   const mine = visibleDevices();
-  const myPatients = S.db.patients.filter(p => inScope(p.siteId));
-  const clinical = ["ADMIN","CPM","EMPLOYEE"].includes(S.me.role);
+  const myPatients = activePatients().filter(p => inScope(p.siteId));
+  const clinical = ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"].includes(S.me.role);
+
+  /* 0 — the tasks this person is answerable for. First, because it is the one thing
+     on this screen that is about them rather than about the study. */
+  const tasks = myTasks();
+  if(tasks.length){
+    const late = tasks.filter(t => t.overdue).length;
+    out.push({ ic:"case", tone: late ? "t-red" : "t-blue", view:"screening",
+      title: tasks.length + " task(s) waiting on you" + (late ? " — " + late + " overdue" : ""),
+      sub: tasks.slice(0,3).map(t =>
+             t.p.patientCode + " · " + t.s.n + ". " + t.s.label +
+             (t.a.dueDate ? " (due " + fmtDate(t.a.dueDate) + ")" : "") +
+             (t.unassigned ? " · unassigned" : "")).join(" — ") +
+           (tasks.length > 3 ? "…" : "") });
+  }
 
   /* 1 — physically arrived, nobody has checked it in. Blocks it becoming stock. */
   const unver = mine.filter(d => d.status === "DELIVERED");
@@ -12685,8 +13141,8 @@ function todoItems(){
         view:"clinical", patientId:p.id,
         title: p.patientCode + " — procedure " + whenWord(d),
         sub: locName(p.siteId) + " · Unica " + p.unicaSize + " / DS " + p.dsSize +
-             (miss ? " · " + miss + " item(s) outstanding in the case file"
-                   : " · case file complete, ready to submit") });
+             (miss ? " · " + miss + " item(s) outstanding in the procedure report"
+                   : " · procedure report complete, ready to submit") });
     }
   }
 
@@ -12722,7 +13178,7 @@ function todoItems(){
     const wait = myPatients.filter(p => p.submitted && !p.fileLocked);
     if(wait.length) out.push({ ic:"case", tone:"t-blue", view:"clinical",
       patientId: wait[0].id,
-      title: wait.length + " case file(s) submitted, awaiting final lock",
+      title: wait.length + " procedure report(s) submitted, awaiting final lock",
       sub: wait.map(p => p.patientCode).join(", ") + " — locking archives them to OneDrive." });
   }
 
@@ -12779,8 +13235,22 @@ const HOME_MODULES = [
 ];
 function canAccessView(key){ return NAV.some(i => i.k === key && i.roles.includes(S.me.role)); }
 
-/* ---- data-access seam: swap these for the backend later, not the widgets ---- */
-function homePatients(){ return S.db.patients.filter(p => inScope(p.siteId)); }
+/* ---- data-access seam: swap these for the backend later, not the widgets ----
+   A control-group patient keeps their whole record but leaves every working list: the
+   screening screen, the register and the home table. They are not being screened or
+   scheduled any more, so leaving them in those lists would mean every count and every
+   "waiting on" answer quietly included people nobody is meant to act on. They live in
+   their own tab instead - one list, deliberately, so they are never simply lost. */
+/* Every list goes through here, so the shape check runs once for everybody rather than
+   being remembered at each of the dozen places that read a stage. */
+function allPatients(){
+  const list = (S.db && S.db.patients) || [];
+  for(const p of list) ensureAnatShape(p);
+  return list;
+}
+function activePatients(){ return allPatients().filter(p => !isControl(p)); }
+function controlPatients(){ return allPatients().filter(p => isControl(p) && inScope(p.siteId)); }
+function homePatients(){ return activePatients().filter(p => inScope(p.siteId)); }
 function homeDevices(){ return visibleDevices(); }
 function patImplant(p){ return p.unicaSize || currentRecommendation(p).size || ""; }
 function patPhysician(p){ return (p.anat && p.anat.scheduling && p.anat.scheduling.physician) || ""; }
@@ -12860,7 +13330,20 @@ function patientRowCells(p){
   return '<td><b>' + esc(p.patientCode) + '</b></td><td>' + esc(locName(p.siteId)) + '</td>' +
     '<td>' + esc(fmtDate(p.procedureDate)) + '</td><td>' + implant + '</td>' +
     '<td>' + ds + '</td><td>' + procCountdown(p) + '</td>' +
-    '<td>' + pill(PT_STATUS, p.status) + '</td><td>' + casefile + '</td>';
+    '<td>' + pill(PT_STATUS, p.status) + '</td>' +
+    '<td>' + stuckWithCell(p) + '</td><td>' + casefile + '</td>';
+}
+/* Beside the status: the person it is actually sitting with, and the stage it is sitting
+   at. The status says where the patient is in the pathway; this says who has to move. */
+function stuckWithCell(p){
+  const w = stuckWith(p);
+  if(!w) return '<span class="hint">—</span>';
+  const name = '<b>' + esc(w.who) + '</b>';
+  const where = w.stage ? '<small>' + esc(w.stage.n + ". " + w.stage.label) + '</small>'
+                        : '<small>Screening material</small>';
+  return name + (w.overdue ? ' <span class="pill p-red">Overdue</span>' : "") +
+    (w.why === "unassigned" ? ' <span class="pill p-orange">unassigned</span>' : "") +
+    '<br>' + where;
 }
 
 function patientStatusWidget(){
@@ -12903,7 +13386,7 @@ function patientStatusWidget(){
   const table = shown.length
     ? '<div class="tbl-wrap" style="margin-top:11px"><table><thead><tr>' +
       '<th>Code</th><th>Site</th><th>Procedure date</th><th>Unica</th><th>DS</th>' +
-      '<th>Time to/from procedure</th><th>Status</th><th>Case file</th></tr></thead><tbody>' +
+      '<th>Time to/from procedure</th><th>Status</th><th>With</th><th>Procedure report</th></tr></thead><tbody>' +
       shown.map(p => '<tr class="row-click" data-patient="' + p.id + '">' + patientRowCells(p) + '</tr>').join("") +
       '</tbody></table></div>'
     : '<div class="hint" style="margin-top:11px">No patients match the current filters.</div>';
@@ -13103,8 +13586,9 @@ function fmtDur(m){
    Producing brand-new units into stock. Unlike every other device screen, which
    moves a unit that already exists, this one CREATES units from their label QR. It
    is therefore the most tightly fenced: only at an HQ-type location, only for users
-   with the registerDevice capability, and only once the three batch approvals are
-   ticked. The server re-checks all of this and stamps who/when itself. */
+   with the registerDevice capability, and only once the batch approvals are ticked
+   and production has been confirmed. The server re-checks all of this and stamps
+   who/when itself. */
 let REG = null;
 
 function hqLocations(){ return visibleLocations().filter(l => l.type === "HQ"); }
@@ -13113,15 +13597,28 @@ function resetRegister(){
   const hq = hqLocations();
   const pref = (S.me && S.me.locationId && hq.some(l => l.id === S.me.locationId)) ? S.me.locationId
              : (hq.length === 1 ? hq[0].id : "");
-  REG = { locationId:pref, units:[], checks:{ batchRelease:false, dmrSigned:false, qaApproval:false }, done:null };
+  REG = { locationId:pref, units:[], checks:blankRegChecks(), production:null, done:null };
   saveDrafts();
+}
+function blankRegChecks(){
+  const o = {};
+  REG_CHECKS.forEach(c => { o[c.k] = false; });
+  return o;
 }
 function restoreRegister(){
   const d = loadDrafts().reg;
   if(!d || typeof d !== "object") return false;
   if(d.locationId && !(loc(d.locationId) && loc(d.locationId).type === "HQ")) d.locationId = "";
   if(!Array.isArray(d.units)) d.units = [];
-  if(!d.checks) d.checks = { batchRelease:false, dmrSigned:false, qaApproval:false };
+  /* A draft saved before the approvals changed carries dmrSigned/qaApproval. Those
+     ticks are NOT carried over: the DHR is a different document from the DMR, and QA
+     is now a different person's signature, so re-using them would record an approval
+     nobody gave. The units and the location survive; the approvals must be re-made. */
+  if(!d.checks || Object.prototype.hasOwnProperty.call(d.checks, "dmrSigned")){
+    d.checks = blankRegChecks();
+    d.production = null;
+  }
+  if(!d.production || !d.production.at) d.production = null;
   d.done = null;
   REG = d;
   return true;
@@ -13149,6 +13646,61 @@ function regAddScan(code){
   render();
 }
 
+/* Step 3 — the production confirmation. A button rather than a seventh checkbox,
+   because it is a signature and not an assertion about paperwork: it records WHO
+   pressed it and WHEN, and neither can be typed. The time shown here is this
+   device's clock; the server stamps its own on submission, and that is the one
+   that is kept, because a production PC's clock is not evidence.
+   Undo stays available only while the batch is still on this device. */
+function productionStepHtml(units){
+  const p = REG.production;
+  const ready = !!(REG.locationId && units.length && REG_CHECKS.every(c => REG.checks[c.k]));
+  return '<div class="card"><div class="card-hd"><h2>Step 3 · Production confirmation</h2>' +
+    '<span class="pill ' + (p ? "p-green" : "p-grey") + '">' + (p ? "Signed" : "Not signed") + '</span>' +
+    '</div><div class="card-bd">' +
+    (p
+      ? '<div class="okbox" style="font-size:14px"><b>Production confirmed by ' +
+          esc(p.byName || p.by) + '</b><br>' + esc(fmtTs(p.at)) + '</div>' +
+        '<div class="row" style="margin-top:8px">' +
+          '<button class="btn btn-sm" id="reg-unconfirm">Undo</button>' +
+          '<span class="hint">Possible while the batch is still on this device.</span>' +
+        '</div>'
+      : '<p>Confirms that this batch was produced and that the approvals above are ' +
+        'complete. Your name and the time are recorded automatically — there is ' +
+        'nothing to type.</p>' +
+        '<button class="btn btn-primary" id="reg-confirm-prod"' + (ready ? "" : " disabled") +
+          '>Production confirmation</button>' +
+        (ready ? "" : '<div class="hint" style="margin-top:6px">Scan at least one unit and ' +
+          'complete the batch approvals first.</div>')) +
+  '</div></div>';
+}
+
+/* Step 4 — what actually happens when the button is pressed, stated before it is.
+   The two audiences need opposite things said to them: a producer must understand
+   that nothing enters stock, and an approver must understand that it does. */
+function qaStepHtml(units){
+  const release = !S.backend || can("approveRegistration");
+  return '<div class="card"><div class="card-hd"><h2>Step 4 · QA confirmation &amp; registration</h2>' +
+    '<span class="pill ' + (release ? "p-green" : "p-orange") + '">' +
+      (release ? "You may release" : "QA required") + '</span>' +
+    '</div><div class="card-bd">' +
+    (release
+      ? '<p>' + (S.backend
+          ? 'You hold QA approval, so your production confirmation also signs the QA ' +
+            'confirmation — there is nobody to wait for. '
+          : '') +
+        'This releases <b>' + units.length + '</b> unit(s) into usable stock at <b>' +
+        esc((loc(REG.locationId) || {}).name || "—") + '</b>, and records you and the ' +
+        'time against every unit and the batch.</p>'
+      : '<p><b>Nothing enters stock in this step.</b> The batch is held for a QA ' +
+        'confirmation by someone with QA approval, who may be on another device and ' +
+        'may look at it later. You can follow it under <b>Batches awaiting QA</b>.</p>' +
+        '<p class="hint">' + units.length + ' unit(s) at ' +
+          esc((loc(REG.locationId) || {}).name || "—") + '.</p>') +
+    whyBox("reg-why") +
+  '</div>';
+}
+
 VIEWS.register = {
   title:"New Device Registration",
   sub:"Produce new units into stock. Only possible at Innoventric HQ.",
@@ -13165,6 +13717,24 @@ VIEWS.register = {
 
     if(REG.done){
       const w = REG.done;
+      /* Two different endings, and they must not be dressed up as one. A batch that
+         went to QA has put NOTHING into stock, and saying "registered" here would be
+         the single most misleading sentence in the application. */
+      if(w.sentToQa){
+        return '<div class="card"><div class="card-bd">' +
+          '<div class="okbox" style="font-size:14px"><b>Batch sent to QA.</b><br>' +
+            esc(String(w.count)) + ' unit(s) are waiting for QA confirmation. ' +
+            'Nothing has entered stock yet.</div>' +
+          '<div class="grid g3" style="margin-top:8px">' +
+            '<div class="kv"><b>Batch</b> <span class="mono">' + esc(w.batchId) + '</span></div>' +
+            '<div class="kv"><b>Location</b> ' + esc(w.location) + '</div>' +
+            '<div class="kv"><b>Production confirmed by</b> ' + esc(w.by) + '</div>' +
+          '</div>' +
+          '</div><div class="card-ft"><div class="row">' +
+            '<button class="btn btn-primary" id="reg-again">Prepare another batch</button>' +
+            '<button class="btn" id="reg-tobatches">Track this batch</button>' +
+          '</div></div></div>';
+      }
       return '<div class="card"><div class="card-bd">' +
         '<div class="' + (w.failed ? "warn" : "okbox") + '" style="font-size:14px"><b>' +
           w.created + ' device(s) registered into stock' +
@@ -13183,7 +13753,12 @@ VIEWS.register = {
     }
 
     const units = REG.units;
-    const done3 = Object.values(REG.checks).filter(Boolean).length;
+    const nChecks = REG_CHECKS.length;
+    const doneChecks = REG_CHECKS.filter(c => REG.checks[c.k]).length;
+    /* Standalone has no server to hold a batch for a second person, so it keeps the
+       old single-signature behaviour rather than pretending to a hand-off it cannot
+       perform. With a backend, the capability decides. */
+    const canRelease = !S.backend || can("approveRegistration");
     SCANFIELDS["reg-scan"] = { label:"device label", onCode:(code) => regAddScan(code) };
 
     let h = '<div class="card"><div class="card-hd"><h2>Step 1 · Where &amp; scan the units</h2></div><div class="card-bd">' +
@@ -13210,7 +13785,8 @@ VIEWS.register = {
     '</div></div>' +
 
     '<div class="card"><div class="card-hd"><h2>Step 2 · Batch approvals</h2>' +
-      '<span class="pill ' + (done3 === 3 ? "p-green" : "p-grey") + '">' + done3 + ' of 3 done</span>' +
+      '<span class="pill ' + (doneChecks === nChecks ? "p-green" : "p-grey") + '">' +
+        doneChecks + ' of ' + nChecks + ' done</span>' +
       '</div><div class="card-bd">' +
       '<div class="note" style="margin-bottom:8px">These apply to the whole batch, not to each unit.</div>' +
       REG_CHECKS.map(c =>
@@ -13219,13 +13795,13 @@ VIEWS.register = {
           (REG.checks[c.k] ? " checked" : "") + '><span>' + esc(c.t) + '</span></label>').join("") +
     '</div></div>' +
 
-    '<div class="card"><div class="card-hd"><h2>Step 3 · Confirm &amp; register</h2></div><div class="card-bd">' +
-      '<p>Registering <b>' + units.length + '</b> new unit(s) as usable stock at <b>' +
-        esc((loc(REG.locationId) || {}).name || "—") + '</b>. The system records you and the ' +
-        'time against every unit and the batch.</p>' +
-      whyBox("reg-why") +
-    '</div><div class="card-ft"><div class="row">' +
-      '<button class="btn btn-primary btn-lg" id="reg-go">Register ' + units.length + ' device(s)</button>' +
+    productionStepHtml(units) +
+
+    qaStepHtml(units) +
+    '<div class="card-ft"><div class="row">' +
+      '<button class="btn btn-primary btn-lg" id="reg-go">' +
+        (canRelease ? "Confirm &amp; register " + units.length + " device(s)"
+                    : "Send to QA") + '</button>' +
       '<button class="btn" id="reg-clear">Start over</button>' +
       '<span class="spacer"></span>' +
       '<span class="hint">Your progress is kept if you leave this screen.</span>' +
@@ -13235,7 +13811,10 @@ VIEWS.register = {
   wire(){
     if(REG && REG.done){
       $("#reg-again").onclick = () => { resetRegister(); render(); };
-      $("#reg-toaudit").onclick = () => { S.view = "audit"; renderNav(); render(); };
+      const ta = $("#reg-toaudit");
+      if(ta) ta.onclick = () => { S.view = "audit"; renderNav(); render(); };
+      const tb = $("#reg-tobatches");
+      if(tb) tb.onclick = () => { S.view = "batches"; renderNav(); render(); };
       return;
     }
     const ls = $("#reg-loc");
@@ -13246,15 +13825,32 @@ VIEWS.register = {
       REG.units.splice(+b.dataset.regRm, 1); saveDrafts(); render();
     });
     /* Update the counter pill in place, like the arrival checks, so ticking a box
-       does not re-render the page and lose the operator's scroll position. */
+       does not re-render the page and lose the operator's scroll position. The
+       exception is the last box: completing the approvals is what unlocks the
+       production confirmation, so that one re-renders to enable the button. */
     $$("[data-reg-chk]").forEach(c => c.onchange = e => {
       REG.checks[e.target.dataset.regChk] = e.target.checked;
       e.target.closest(".check").classList.toggle("on", e.target.checked);
-      const n = Object.values(REG.checks).filter(Boolean).length;
-      const pillEl = $$(".card-hd .pill").find(p => /^\d+ of 3 done$/.test(p.textContent));
-      if(pillEl){ pillEl.textContent = n + " of 3 done"; pillEl.className = "pill " + (n === 3 ? "p-green" : "p-grey"); }
+      const n = REG_CHECKS.filter(x => REG.checks[x.k]).length;
       saveDrafts(); clearWhy("reg-why");
+      const wasReady = !$("#reg-confirm-prod") || !$("#reg-confirm-prod").disabled;
+      const isReady  = n === REG_CHECKS.length && REG.units.length && REG.locationId;
+      if(wasReady !== isReady) return render();
+      const pillEl = $$(".card-hd .pill").find(p => /^\d+ of \d+ done$/.test(p.textContent));
+      if(pillEl){
+        pillEl.textContent = n + " of " + REG_CHECKS.length + " done";
+        pillEl.className = "pill " + (n === REG_CHECKS.length ? "p-green" : "p-grey");
+      }
     });
+    const cp = $("#reg-confirm-prod");
+    if(cp) cp.onclick = () => {
+      if(!REG.locationId || !REG.units.length || !REG_CHECKS.every(x => REG.checks[x.k]))
+        return showWhy("reg-why", "Complete step 1 and step 2 before confirming production.");
+      REG.production = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO() };
+      saveDrafts(); clearWhy("reg-why"); render();
+    };
+    const up = $("#reg-unconfirm");
+    if(up) up.onclick = () => { REG.production = null; saveDrafts(); render(); };
     $("#reg-clear").onclick = () => { resetRegister(); render(); };
     $("#reg-go").onclick = submitRegister;
   }
@@ -13264,24 +13860,32 @@ function submitRegister(){
   const l = loc(REG.locationId);
   if(!l || l.type !== "HQ") return showWhy("reg-why", "Step 1 — new devices can only be registered at an HQ location.");
   if(!REG.units.length)  return showWhy("reg-why", "Step 1 — scan at least one device.");
-  if(!(REG.checks.batchRelease && REG.checks.dmrSigned && REG.checks.qaApproval))
-    return showWhy("reg-why", "Step 2 — all three batch approvals are required before registering.");
+  if(!REG_CHECKS.every(c => REG.checks[c.k]))
+    return showWhy("reg-why", "Step 2 — every batch approval is required before registering.");
+  if(!REG.production)
+    return showWhy("reg-why", "Step 3 — confirm production before registering.");
   clearWhy("reg-why");
 
   const locationId = REG.locationId;
   const units = REG.units.map(u => Object.assign({}, u));
+  const prod = REG.production;
 
   function finish(res){
     const l2 = loc(locationId) || {};
     logAction("Registered " + res.created + " new device(s) into stock at " + l2.name, {
       locationId,
       stateChanges: res.created + " unit(s) added as In WH · batch " + res.batchId,
-      comments: "Batch approvals: batch release ✓, DMR signed ✓, QA approval ✓ | Serials: " +
-        units.map(u => u.sn).join(", ") + (res.failed ? " | " + res.failed + " rejected" : "")
+      comments: "Batch approvals: " + REG_CHECKS.map(c => c.t + " ✓").join(", ") +
+        " | Production confirmed by " + ((prod && (prod.byName || prod.by)) || "—") +
+        " | Serials: " + units.map(u => u.sn).join(", ") +
+        (res.failed ? " | " + res.failed + " rejected" : "")
     });
     queueBackup(l2.name + "/Device_Registrations", "registration_" + res.batchId + ".json", {
       type:"NEW_DEVICE_REGISTRATION", batchId:res.batchId, location:l2.name,
-      approvals:{ batchRelease:true, dmrSigned:true, qaApproval:true },
+      approvals:{ batchRelease:true, dhrSigned:true },
+      productionConfirmedBy: (prod && prod.by) || null,
+      productionConfirmedByName: (prod && prod.byName) || null,
+      productionConfirmedAt: (prod && prod.at) || null,
       units: units.map(u => ({ id:u.id, ref:u.ref, sn:u.sn, productType:u.productType,
         size:u.size, mfgDate:u.mfgDate, expiryDate:u.expiryDate })),
       registeredBy: res.registeredBy || (S.me && S.me.email),
@@ -13299,8 +13903,39 @@ function submitRegister(){
     const btn = $("#reg-go"); if(btn) btn.disabled = true;
     (async () => {
       try{
-        const res = await api("POST", "/api/devices/register",
+        /* Always create the batch record first, even when this user can release it
+           themselves. Both signatures then exist on one record, and a batch released
+           by one person is traceable in exactly the same way as one that passed
+           between two. */
+        const batch = await api("POST", "/api/device-batches",
           { locationId, checks:Object.assign({}, REG.checks), units });
+
+        if(!can("approveRegistration")){
+          /* Nothing is in stock. Say so plainly rather than reporting a registration. */
+          logAction("Prepared batch " + batch.batchId + " for QA confirmation at " + (loc(locationId) || {}).name, {
+            locationId,
+            stateChanges: units.length + " unit(s) awaiting QA · batch " + batch.batchId,
+            comments: "Batch approvals: " + REG_CHECKS.map(c => c.t + " ✓").join(", ") +
+              " | Production confirmed by " + ((prod && (prod.byName || prod.by)) || "—") +
+              " | Serials: " + units.map(u => u.sn).join(", ")
+          });
+          notify("Batch " + batch.batchId + " (" + units.length + " unit(s)) is awaiting QA confirmation, " +
+                 "produced by " + ((prod && (prod.byName || prod.by)) || "—") + ".",
+                 ["ADMIN","QA","MANAGER"], [], locationId);
+          await refreshBatches(batch);
+          resetRegister();
+          REG.done = { sentToQa:true, batchId:batch.batchId, count:units.length,
+                       location:(loc(locationId) || {}).name, by:(prod && (prod.byName || prod.by)) || "" };
+          saveDrafts(); renderNav(); render();
+          toast("Batch sent to QA.", "good");
+          return;
+        }
+
+        /* 4.1 — the person who confirmed production already holds QA approval, so
+           there is nobody to wait for. Sign and release in the same breath. */
+        const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batch.batchId) + "/approve", {});
+        const res = out.result;
+        try{ S.db.batches = await loadBatches(); }catch(_){}
         try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
         /* Merge the just-created devices on TOP of the reload. SharePoint can lag a
            moment before a new item appears in a list query, so the reload above may
@@ -13662,6 +14297,34 @@ let PID = null;
 function cf(p){ if(!p.caseFile) p.caseFile = {}; return p.caseFile; }
 function ro(p){ return p.fileLocked ? " disabled" : ""; }
 
+/* A report written before contrast was split into three injections holds one volume,
+   one form and one note. Fold them into injection 1 rather than leaving them stranded
+   in a shape nothing renders any more - a recorded contrast volume is procedure data.
+   Runs on read only, and only when the new shape is genuinely absent, so it can never
+   overwrite something the newer form recorded. A LOCKED report is left exactly as it
+   is: its record is closed, and the PDF reads the old keys for those. */
+/* The report's own date starts as the scheduled one, so nobody retypes what the system
+   already knows. Seeded only while it is empty: once the report carries a date, that
+   date is what was recorded, and a later change to the schedule must not rewrite it.
+   The reverse direction stays firmly shut - see the note in onEdit. */
+function seedProcDate(p){
+  const c = cf(p);
+  if(!c.procDate && p.procedureDate) c.procDate = String(p.procedureDate).slice(0, 10);
+}
+
+function migrateContrast(p){
+  const c = p && p.caseFile;
+  if(!c || p.fileLocked) return;
+  const hasNew = CONTRAST_ROWS.some(i => c["contrast" + i + "Vol"] != null && c["contrast" + i + "Vol"] !== "");
+  const hasOld = (c.contrast != null && c.contrast !== "") ||
+                 (c.contrastForm != null && c.contrastForm !== "") ||
+                 (c.contrastNote != null && c.contrastNote !== "");
+  if(hasNew || !hasOld) return;
+  c.contrast1Vol  = c.contrast;
+  c.contrast1Form = c.contrastForm || "";
+  c.contrast1Note = c.contrastNote || "";
+}
+
 function tf(p, key, label, type, opts){
   opts = opts || {};
   const v = cf(p)[key] == null ? "" : cf(p)[key];
@@ -13721,7 +14384,133 @@ function cbox(p, key, label, idx){
     (on ? " checked" : "") + ro(p) + '><span>' + esc(label) + '</span></label>';
 }
 
+/* ---- per-unit device verification ---------------------------------------------
+   c.devChecks is one entry per unit at the table:
+     { ref, sn, productType, size, ok:[bool per DEVICE_CHECKS], note }
+   Units are added by scanning the label, exactly as every other device screen does,
+   with a typed identifier accepted as the fallback for an unreadable label. */
+function devChecks(p){
+  const c = cf(p);
+  if(!Array.isArray(c.devChecks)) c.devChecks = [];
+  return c.devChecks;
+}
+function devUnitDone(u){
+  return DEVICE_CHECKS.every((_, i) => !!(u.ok || [])[i]);
+}
+function devVerificationDone(p){
+  const list = devChecks(p);
+  const room = cf(p).roomChecks || [];
+  return list.length > 0 && list.every(devUnitDone) &&
+         ROOM_CHECKS.every((_, i) => !!room[i]);
+}
+function ptAddDeviceUnit(code, manual){
+  const p = patient(PID);
+  if(!p || p.fileLocked) return;
+  const raw = String(code || "").trim();
+  if(!raw) return;
+  /* A full label scan carries REF, serial and size; a typed identifier only names a
+     unit we must look up. Either way the unit is identified before it is checked. */
+  let unit = null;
+  if(raw.indexOf("\n") >= 0 && window.DeviceQr){
+    try{
+      const parsed = window.DeviceQr.parseDeviceQr(raw);
+      unit = { ref:parsed.ref, sn:parsed.sn, productType:parsed.productType, size:parsed.size };
+    }catch(e){ return toast(e.message || "That does not look like a device label.", "bad"); }
+  }else{
+    const hit = findDeviceByCode(raw);
+    if(!hit) return toast("No unit matches “" + raw + "”.", "bad");
+    unit = { ref:hit.ref, sn:hit.sn, productType:hit.productType, size:hit.size };
+  }
+  const list = devChecks(p);
+  if(list.some(u => String(u.sn).toUpperCase() === String(unit.sn).toUpperCase())){
+    return toast("That unit is already on the list.", "bad");
+  }
+  unit.ok = DEVICE_CHECKS.map(() => false);
+  unit.note = "";
+  unit.handEntered = !!manual;
+  list.push(unit);
+  commit(); scheduleCaseFileSave(p); render();
+}
+function deviceCheckBlock(p){
+  const list = devChecks(p);
+  let h = (p.fileLocked ? "" :
+    scanField("pt-dev-scan", "Scan the device at the table", "", {}) +
+    '<div class="row" style="margin:6px 0 10px">' +
+      '<button class="btn btn-sm" id="pt-dev-more">Scan another device</button>' +
+      '<span class="hint">Each unit is checked on its own.</span>' +
+    '</div>');
+
+  if(!list.length){
+    return h + '<div class="empty">No device checked in yet. Scan the first unit.</div>' +
+      roomCheckBlock(p);
+  }
+  h += list.map((u, di) =>
+    '<div class="card" style="margin:0 0 10px"><div class="card-hd">' +
+      '<h3 style="margin:0">' + esc(u.productType || "") + ' ' + esc(u.size || "") +
+        ' · <span class="mono">' + esc(u.sn) + '</span></h3>' +
+      '<span class="pill ' + (devUnitDone(u) ? "p-green" : "p-grey") + '">' +
+        (devUnitDone(u) ? "Verified" : (u.ok || []).filter(Boolean).length + ' of ' + DEVICE_CHECKS.length) +
+      '</span>' +
+    '</div><div class="card-bd">' +
+      '<div class="hint" style="margin:0 0 6px">REF <span class="mono">' + esc(u.ref || "—") + '</span>' +
+        (u.handEntered ? ' · <span class="pill p-orange">typed</span>' : '') + '</div>' +
+      DEVICE_CHECKS.map((t, i) =>
+        '<label class="check' + ((u.ok || [])[i] ? " on" : "") + '">' +
+          '<input type="checkbox" data-cfd="' + di + '" data-i="' + i + '"' +
+          ((u.ok || [])[i] ? " checked" : "") + ro(p) + '><span>' + esc(t) + '</span></label>').join("") +
+      '<div class="field" style="margin-top:8px"><label for="dvn-' + di + '">Notes for this unit</label>' +
+        '<input type="text" id="dvn-' + di + '" data-cfdn="' + di + '" value="' + esc(u.note || "") + '"' +
+        ro(p) + '></div>' +
+    '</div>' +
+    (p.fileLocked ? '' :
+      '<div class="card-ft"><div class="row">' +
+        '<button class="btn btn-sm btn-danger" data-cfdrm="' + di + '">Remove this unit</button>' +
+      '</div></div>') +
+    '</div>').join("");
+  return h + roomCheckBlock(p);
+}
+function roomCheckBlock(p){
+  return '<h3 style="margin:14px 0 7px">For the room</h3>' +
+    ROOM_CHECKS.map((t, i) => cbox(p, "roomChecks", t, i)).join("");
+}
+
 let SITEID = null;    // chosen first; nothing about a patient is shown until both are set
+
+/* Contrast is injected more than once during a road map, and not always the same way -
+   a pure injection can be followed by a diluted one. Three optional rows therefore each
+   carry their own volume AND their own form, rather than one volume with one form
+   describing all of it, which could only ever be half true. The total is computed, never
+   typed: it is the one number that gets read back later, and a hand-typed sum that
+   disagrees with its parts is worse than no sum at all.
+   CONTRAST_ROWS drives the markup, the recalculation and the PDF, so the three stay
+   in step if a fourth injection is ever added. */
+const CONTRAST_ROWS = [1, 2, 3];
+function contrastTotal(c){
+  let sum = 0, any = false;
+  for(const i of CONTRAST_ROWS){
+    const v = parseFloat(c["contrast" + i + "Vol"]);
+    if(!isNaN(v)){ sum += v; any = true; }
+  }
+  return any ? sum : null;
+}
+function contrastBlock(p){
+  const c = cf(p);
+  return CONTRAST_ROWS.map(i =>
+    '<div class="grid g3">' +
+      tf(p, "contrast" + i + "Vol", "Injection " + i + " — volume (mL)", "number") +
+      '<div class="field"><label for="cf-contrast' + i + 'Form">Injection ' + i + ' — form</label>' +
+        '<select id="cf-contrast' + i + 'Form" data-cf="contrast' + i + 'Form"' + ro(p) + '>' +
+        ["","Pure","Diluted"].map(o =>
+          '<option' + (c["contrast" + i + "Form"] === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
+        '</select></div>' +
+      tf(p, "contrast" + i + "Note", "Injection " + i + " — notes", "text") +
+    '</div>').join("") +
+  '<div class="grid g2" style="margin:4px 0 12px">' +
+    '<div class="calc"><small>Total contrast volume (computed, mL)</small>' +
+      '<b id="calc-contrast">' + fmtContrast(contrastTotal(c)) + '</b></div>' +
+  '</div>';
+}
+function fmtContrast(v){ return v === null ? "—" : String(Math.round(v * 100) / 100); }
 
 /** Source-image control for one measurement field, plus what has already been filed. */
 function sourceImages(p, key, label){
@@ -13730,7 +14519,7 @@ function sourceImages(p, key, label){
     '<div class="row" style="gap:8px">' +
       (p.fileLocked ? '' :
         '<button type="button" class="btn btn-sm" data-img="' + key + '" ' +
-        'data-imglabel="' + esc(label) + '">Add source image</button>') +
+        'data-imglabel="' + esc(label) + '">Add photo</button>') +
       '<span class="hint" style="margin:0">' +
         (mine.length ? mine.length + ' image(s) filed under ' + esc(p.patientCode)
                      : 'Photograph the machine screen as the source for this value.') +
@@ -13767,11 +14556,12 @@ VIEWS.screening = {
   title:"Patient Screening & Evaluation",
   sub:"Clinical screening, anatomical evaluation, scheduling and the product order request.",
   body(){
-    const list = S.db.patients.filter(p => !scopedLocIds() || scopedLocIds().includes(p.siteId));
+    const list = activePatients().filter(p => !scopedLocIds() || scopedLocIds().includes(p.siteId));
     if(!list.length) return '<div class="empty">No patients yet. A CPM or App Admin can add one in the Patient Register.</div>';
     if(!SCR.patientId || !list.some(p => p.id === SCR.patientId)) SCR.patientId = list[0].id;
     const p = S.db.patients.find(x => x.id === SCR.patientId);
     if(!p.screening) { p.screening = blankScreening(); p.anat = blankAnat(); }
+    migrateAssignees(p);
 
     const rec = currentRecommendation(p);
     const missing = anatIncomplete(p);
@@ -13863,8 +14653,28 @@ VIEWS.screening = {
       ANAT_STAGES.forEach(s => { if(reconcileStageStatus(p, s)) healed = true; });
       if(healed) commit();
     }
-    h += ANAT_STAGES.map(s => anatStageHtml(p, s, ctReady)).join("");
+    /* The anatomical block, then - separately framed - what happens once the patient
+       is eligible. Scheduling and the product order are not part of deciding whether
+       the anatomy suits; putting them inside that block made them look like they were. */
+    h += ANAT_STAGES.filter(s => !s.eligible).map(s => anatStageHtml(p, s, ctReady)).join("");
     h += '</div></div>';
+
+    const eligibleStages = ANAT_STAGES.filter(s => s.eligible);
+    const armed = p.anat.approvals && p.anat.approvals.studyArm;
+    const gateOpen = anatIncomplete(p).length === 0 || !!p.anatOverride;
+    h += '<div class="card"><div class="card-hd"><h2>Patient is eligible</h2>' +
+      (armed
+        ? '<span class="pill ' + (armed === "CONTROL" ? "p-grey" : "p-green") + '">' +
+          esc((STUDY_ARMS.find(x => x.k === armed) || {}).label || armed) + '</span>'
+        : '<span class="pill p-grey">not yet</span>') +
+      '</div><div class="card-bd">' +
+      (gateOpen && armed
+        ? '<div class="note">The evaluation is finished and the patient has been allocated. ' +
+          'What follows is scheduling and product.</div>'
+        : '<div class="warn">These open once the anatomical evaluation is complete and ' +
+          'stage 8 has recorded the eligibility decision and the allocation.</div>') +
+      eligibleStages.map(s => anatStageHtml(p, s, ctReady)).join("") +
+    '</div></div>';
     return h;
   },
 
@@ -13918,38 +14728,20 @@ VIEWS.screening = {
         const before = { st:a.status, status:p.status };
         const stage = ANAT_STAGES.find(x => x.k === key);
 
-        /* Refuse "Completed" while required content is missing. Reverting the select
-           rather than accepting it keeps the badge, the gate and the dropdown telling
-           the same story - a stage can never look done and not be. */
-        if(field === "status" && el.value === "Completed"){
-          const probe = Object.assign({}, a, { status:"Completed" });
-          const saved = p.anat[key];
-          p.anat[key] = probe;
-          const gaps = stageMissing(p, stage);
-          p.anat[key] = saved;
-          if(gaps.length){
-            el.value = a.status;
-            showWhy("scr-why", "Stage " + stage.n + " needs " + gaps.join(", ") +
-              " before it can be marked completed.");
-            return;
-          }
-        }
         clearWhy("scr-why");
+        const prevAssignee = field === "assignedTo" ? String(a.assignedTo || "") : null;
         a[field] = el.type === "checkbox" ? el.checked : el.value;
 
-        /* Keep the dropdown and the badge telling one story as fields are edited:
-           a "Not started" stage that gets any input becomes "In progress", and a
-           "Completed" stage whose required fields are no longer all present drops back
-           to "In progress" - so a stage can never show "Completed" beside "Incomplete". */
-        if(field !== "status"){
-          if(a.status === "Not started") a.status = "In progress";
-          else reconcileStageStatus(p, stage);
-        }
+        /* A confirmed stage whose required fields are emptied withdraws its signature;
+           everything else about the state is derived, so there is nothing else to keep
+           in step here. */
+        reconcileStageStatus(p, stage);
 
-        /* Completing a stage stamps who and when, once. */
-        if(field === "status" && a.status === "Completed" && !a.completedBy){
-          a.completedBy = S.me.name;
-          if(!a.completionDate) a.completionDate = nowISO().slice(0,16);  // date + time (YYYY-MM-DDTHH:mm)
+        /* Handing the task to somebody tells them so, and tells the person it was taken
+           from. Both are notified because a task that moves silently leaves one person
+           working on something that is no longer theirs. */
+        if(field === "assignedTo" && String(a.assignedTo || "") !== prevAssignee){
+          announceAssignment(p, stage, prevAssignee, String(a.assignedTo || ""));
         }
         /* No pacemaker means PM insertion is not something anyone has to do. */
         if(key === "model3d" && field === "pmPresent"){
@@ -13959,13 +14751,18 @@ VIEWS.screening = {
            reads it from here rather than asking again. */
         if(key === "scheduling" && field === "completionDate") p.procedureDate = el.value;
 
-        /* The first time the Product Order stage leaves "Not started", the request has
+        /* The first time the Product Order stage is actually worked on, the request has
            gone out: stamp who raised it and notify admins + warehouse managers (in-app
-           now, email via the server). Guarded on requestedBy so it fires exactly once. */
-        if(key === "order" && a.status !== "Not started" && a.status !== "Not required" && !a.requestedBy){
-          a.requestedBy = S.me.name;
-          a.requestedAt = nowISO();
-          announceOrderRequest(p);
+           now, email via the server). Guarded on requestedBy so it fires exactly once.
+           Reads the derived state rather than the stored one, which no longer moves
+           off "Not started" by itself. */
+        if(key === "order" && !a.requestedBy){
+          const st = stageState(p, stage);
+          if(st !== "Not started" && st !== "Not required"){
+            a.requestedBy = S.me.name;
+            a.requestedAt = nowISO();
+            announceOrderRequest(p);
+          }
         }
 
         /* The anatomical evaluation is the single source of the implant/DS size.
@@ -13981,15 +14778,280 @@ VIEWS.screening = {
         commit();
         schedulePatientSave(p);
         flashSaved();
-        /* These three can unlock a later stage or change a summary line, so the view
-           is rebuilt - but in place. */
-        if(a.status !== before.st ||
-           ["status","pmPresent","completionDate","suitability","size","actualDate",
-            "hospital","physician","shippingDest","requestedDate"].includes(field)){
+        /* The derived state, an assignment or a mandatory field can unlock a later stage
+           or change a summary line, so the view is rebuilt - but in place. */
+        if(stageState(p, stage) !== before.st ||
+           ["assignedTo","dueDate","pmPresent","completionDate","suitability","size",
+            "actualDate","hospital","physician","shippingDest","requestedDate"].includes(field)){
           renderKeepingPlace();
         }
       };
       el.addEventListener("change", h);
+    });
+
+    /* ---- the borderline comparison ----
+       Its own handlers rather than the [data-anat] path, because it writes into a
+       nested structure rather than a flat field. Everything else - the save, the log,
+       the re-render - goes through the same afterScoring so it behaves identically. */
+    const scoringStage = ANAT_STAGES.find(x => x.scoring);
+    const afterScoring = (redraw) => {
+      commit(); schedulePatientSave(p); flashSaved();
+      if(redraw) renderKeepingPlace();
+    };
+    if(scoringStage){
+      const sc = () => scoringOf(p, scoringStage);
+      $$("[data-scsize]").forEach(el => el.onchange = () => {
+        sc().sizes[+el.dataset.scsize] = el.value; afterScoring(true);
+      });
+      $$("[data-scv]").forEach(el => el.onchange = () => {
+        const [i, k] = el.dataset.scv.split("|");
+        const s0 = sc(); (s0.scores[+i] = s0.scores[+i] || {})[k] = el.value;
+        afterScoring(true);          // the totals and the "higher" pill have to follow
+      });
+      $$("[data-scn]").forEach(el => el.onchange = () => {
+        const [i, k] = el.dataset.scn.split("|");
+        const s0 = sc(); (s0.notes[+i] = s0.notes[+i] || {})[k] = el.value;
+        afterScoring(false);
+      });
+      $$("[data-scdec]").forEach(el => el.onchange = () => {
+        sc().decision = el.value; afterScoring(true);
+      });
+      $$("[data-scchosen]").forEach(el => el.onchange = () => {
+        const s0 = sc();
+        s0.chosenSize = el.value;
+        /* A borderline conclusion IS the size decision for this stage, so it feeds the
+           stage's own size field - which is what the recommendation reads. */
+        if(el.value) p.anat[scoringStage.k].size = el.value;
+        afterScoring(true);
+      });
+      $$("[data-scproc]").forEach(el => el.onchange = () => { sc().proctorNotes = el.value; afterScoring(false); });
+      $$("[data-scdisc]").forEach(el => el.onchange = () => { sc().discussBetween = el.value; afterScoring(false); });
+    }
+
+    /* ---- confirming date and products, and reserving them ---- */
+    $$("[data-prodconfirm]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.prodconfirm);
+      const a = p.anat[stage.k];
+      if(!can("managePatients")) return;
+      const rec = currentRecommendation(p);
+      const needs = productNeeds(p, rec);
+      const taken = [], short = [];
+      for(const n of needs){
+        if(!n.size){ short.push(n.label); continue; }
+        const already = allocatedTo(p, n.productType);
+        if(already.length){ taken.push(already[0]); continue; }
+        /* Earliest expiry first, so reserving a unit does not quietly break FIFO. */
+        const free = usableFor(p, n.productType, n.size)
+          .filter(d => !d.allocatedTo)
+          .sort((x, y) => String(x.expiration).localeCompare(String(y.expiration)));
+        if(free.length) taken.push(free[0]); else short.push(n.label);
+      }
+      modal("Confirm date and products",
+        '<p>Confirming that the procedure for <b>' + esc(p.patientCode) + '</b> is set for <b>' +
+        esc(fmtDate(p.procedureDate) || "no date") + '</b>, and that these are the products required.</p>' +
+        (taken.length ? '<div class="okbox"><b>Reserved for this patient:</b><br>' +
+          taken.map(d => esc(d.productType + " " + d.size + " · " + d.sn +
+            " · expires " + String(d.expiration).slice(0,10))).join("<br>") + '</div>' : "") +
+        (short.length ? '<div class="warn" style="margin-top:8px"><b>Not available at this site:</b> ' +
+          esc(short.join(", ")) + '<br>The admins and warehouse managers will be told that stock ' +
+          'has to be sent.</div>' : ""),
+        '<div class="row"><button class="btn btn-primary" id="prod-go">Confirm</button>' +
+        '<button class="btn" data-close="1">Cancel</button></div>');
+      $("#prod-go").onclick = () => {
+        for(const d of taken){
+          d.allocatedTo = p.id;
+          d.allocatedAt = nowISO();
+          if(S.backend) api("POST", "/api/devices/" + encodeURIComponent(d.id) + "/allocate",
+            { patientId:p.id }).catch(() => {});
+        }
+        a.productsConfirmed = true;
+        a.productsConfirmedBy = S.me.name;
+        a.productsConfirmedAt = nowISO();
+        closeModal();
+        afterStageChange(p, stage, "Procedure date and products confirmed", {
+          highPriority: short.length > 0,
+          stateChanges: taken.length + " unit(s) reserved" +
+            (short.length ? "; " + short.length + " not available" : ""),
+          comments: "Patient " + p.patientCode + " · " +
+            (taken.length ? "reserved " + taken.map(d => d.sn).join(", ") : "nothing reserved") +
+            (short.length ? " · missing " + short.join(", ") : "") });
+        if(short.length){
+          notify("Stock needed at " + locName(p.siteId) + " for " + p.patientCode +
+                 " (procedure " + (fmtDate(p.procedureDate) || "date not set") + "): " +
+                 short.join(", ") + ".", ["ADMIN","WH_ADMIN"], [], p.siteId);
+          if(S.backend) api("POST", "/api/orders/notify", {
+            patientCode: p.patientCode, requestedBy: S.me.name,
+            implantSize: rec.size || "", dsSize: rec.size && window.DeviceQr
+              ? window.DeviceQr.requiredDsSize(rec.size) : "",
+            procedureDate: p.procedureDate || "", hospital: (p.anat.scheduling || {}).hospital || "",
+            fromSite: locName(p.siteId), shippingDest: (p.anat.order || {}).shippingDest || "",
+            accessories: "SHORTFALL: " + short.join(", ")
+          }).catch(() => {});
+        }
+      };
+    });
+    $$("[data-prodrelease]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.prodrelease);
+      const a = p.anat[stage.k];
+      if(!can("managePatients")) return;
+      const freed = S.db.devices.filter(d => d.allocatedTo === p.id);
+      for(const d of freed){
+        d.allocatedTo = ""; d.allocatedAt = "";
+        if(S.backend) api("POST", "/api/devices/" + encodeURIComponent(d.id) + "/allocate",
+          { patientId:"" }).catch(() => {});
+      }
+      a.productsConfirmed = false; a.productsConfirmedBy = ""; a.productsConfirmedAt = "";
+      afterStageChange(p, stage, "Product confirmation withdrawn", {
+        stateChanges: freed.length + " unit(s) released back to site stock" });
+    });
+
+    /* ---- releasing stage 3 for printing ---- */
+    $$("[data-printok]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.printok);
+      if(!PRINT_GATE.includes(S.me.role)) return;
+      const a = p.anat[stage.k];
+      a.printApproved = true;
+      a.printApprovedBy = S.me.name;
+      a.printApprovedAt = nowISO();
+      afterStageChange(p, stage, "Model printing approved", {
+        stateChanges: stage.k + " released for printing by " + S.me.name });
+    });
+    $$("[data-printrevoke]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.printrevoke);
+      if(!PRINT_GATE.includes(S.me.role)) return;
+      const a = p.anat[stage.k];
+      a.printApproved = false; a.printApprovedBy = ""; a.printApprovedAt = "";
+      afterStageChange(p, stage, "Model printing approval WITHDRAWN", {
+        highPriority:true, stateChanges: stage.k + " approval withdrawn by " + S.me.name });
+    });
+
+    /* ---- the four stage actions ---- */
+    const afterStageChange = (p2, stage, what, extra) => {
+      const rec = currentRecommendation(p2);
+      if(rec.size){ p2.unicaSize = rec.size; p2.dsSize = dsForUnica(rec.size); }
+      p2.status = recomputeWorkflow(p2);
+      logAction(what, Object.assign({ locationId:p2.siteId,
+        comments:"Patient " + p2.patientCode + " · stage " + stage.n + ". " + stage.label }, extra || {}));
+      commit(); schedulePatientSave(p2); renderKeepingPlace(); flashSaved();
+    };
+
+    $$("[data-stgdone]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgdone);
+      const a = p.anat[stage.k];
+      const gaps = stageMissing(p, stage);
+      /* Re-checked at the moment of confirming, not only when the button appeared:
+         a field could have been emptied in between. */
+      if(gaps.length) return showWhy("stg-why-" + stage.k,
+        "Still needed before this can be confirmed: " + gaps.join(", ") + ".");
+      /* A borderline anatomy must reach a conclusion before the stage can close, and
+         "we still need to talk about it" is not one - that is what the decision says. */
+      if(stage.scoring && a.suitability === "Borderline"){
+        const sc = a.scoring || {};
+        if(!sc.decision) return showWhy("stg-why-" + stage.k,
+          "The borderline comparison needs a conclusion before this stage can be confirmed.");
+        if(sc.decision === "DISCUSSION") return showWhy("stg-why-" + stage.k,
+          "This is held for internal discussion. Change the decision once it is resolved.");
+        if(sc.decision === "ELIGIBLE" && !sc.chosenSize) return showWhy("stg-why-" + stage.k,
+          "Choose the recommended implant size.");
+      }
+      modal("Confirm stage " + stage.n,
+        '<p>You are confirming <b>' + esc(stage.label) + '</b> for <b>' + esc(p.patientCode) + '</b>.</p>' +
+        '<p>Your name and the time are recorded against it. Reopening it afterwards ' +
+        'needs a Clinical PM, Manager or App Admin, and a written reason.</p>' +
+        (stageRequired(stage).length
+          ? '<div class="okbox">' + stageRequired(stage).map(([k, lbl]) =>
+              esc(lbl) + ": <b>" + esc(String(a[k] || "")) + "</b>").join("<br>") + '</div>'
+          : ""),
+        '<div class="row"><button class="btn btn-primary" id="stg-go">Confirm &amp; complete</button>' +
+        '<button class="btn" data-close="1">Back to editing</button></div>');
+      $("#stg-go").onclick = () => {
+        a.status = "Completed";
+        a.completedBy = S.me.name;
+        if(!a.completionDate) a.completionDate = nowISO().slice(0,16);
+        closeModal();
+
+        /* An anatomy judged unsuitable ends the pathway. Recording that as a cancellation
+           - with the stage it was reached at - is what stops the later stages opening and
+           what the register then reports. */
+        const sc = a.scoring || {};
+        if(stage.scoring && a.suitability === "Borderline" && sc.decision === "UNSUITABLE"){
+          p.cancelled = { is:true, reason:"Anatomically unsuitable (pliable model evaluation)",
+                          by:S.me.name, at:nowISO().slice(0,10), stage:stageName(stage) };
+          afterStageChange(p, stage, "Patient CANCELLED — anatomically unsuitable", {
+            highPriority:true,
+            stateChanges: stage.k + " → Completed; patient → Cancelled" });
+          notify("Patient " + p.patientCode + " was found anatomically unsuitable at " +
+                 stageName(stage) + " by " + S.me.name + ".",
+                 ["ADMIN","CPM","MANAGER"], [], p.siteId);
+          return;
+        }
+        /* A borderline conclusion IS this stage's size decision, so it becomes the
+           stage's size and therefore the operative recommendation. */
+        if(stage.scoring && sc.decision === "ELIGIBLE" && sc.chosenSize) a.size = sc.chosenSize;
+
+        afterStageChange(p, stage, "Stage confirmed complete", {
+          stateChanges: stage.k + " → Completed by " + S.me.name });
+      };
+    });
+
+    $$("[data-stgna]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgna);
+      const a = p.anat[stage.k];
+      modal("Mark stage " + stage.n + " not required",
+        '<p><b>' + esc(stage.label) + '</b> will be treated as not applicable for <b>' +
+        esc(p.patientCode) + '</b>, and the stages after it can proceed without it.</p>',
+        '<div class="row"><button class="btn btn-primary" id="stg-na-go">Not required</button>' +
+        '<button class="btn" data-close="1">Cancel</button></div>');
+      $("#stg-na-go").onclick = () => {
+        a.status = "Not required";
+        a.notRequiredBy = S.me.name;
+        a.notRequiredAt = nowISO();
+        closeModal();
+        afterStageChange(p, stage, "Stage marked not required", {
+          stateChanges: stage.k + " → Not required by " + S.me.name });
+      };
+    });
+
+    $$("[data-stgundona]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgundona);
+      const a = p.anat[stage.k];
+      a.status = "Not started";
+      a.notRequiredBy = ""; a.notRequiredAt = "";
+      afterStageChange(p, stage, "Stage brought back into the workflow", {
+        stateChanges: stage.k + " → Not started" });
+    });
+
+    $$("[data-stgreopen]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgreopen);
+      const a = p.anat[stage.k];
+      if(!can("reopenStage")) return;
+      modal("Reopen stage " + stage.n,
+        '<p><b>' + esc(stage.label) + '</b> was confirmed by <b>' + esc(a.completedBy || "") +
+        '</b>' + (a.completionDate ? ' on ' + esc(fmtDate(a.completionDate)) : "") +
+        '. Reopening withdraws that confirmation.</p>' +
+        '<div class="field"><label class="req" for="reopen-why">Reason</label>' +
+          '<textarea id="reopen-why" rows="3" placeholder="Why this has to be reopened"></textarea></div>' +
+        whyBox("reopen-err"),
+        '<div class="row"><button class="btn btn-danger" id="reopen-go">Reopen stage</button>' +
+        '<button class="btn" data-close="1">Cancel</button></div>');
+      $("#reopen-go").onclick = () => {
+        const why = ($("#reopen-why").value || "").trim();
+        if(why.length < 10) return showWhy("reopen-err",
+          "Please give a reason — it is what the next reader of this record will see.");
+        const wasBy = a.completedBy, wasAt = a.completionDate;
+        a.status = "In progress";
+        a.completedBy = ""; a.completionDate = "";
+        a.reopenedBy = S.me.name; a.reopenedAt = nowISO(); a.reopenReason = why;
+        closeModal();
+        afterStageChange(p, stage, "Stage REOPENED after confirmation", {
+          highPriority:true,
+          stateChanges: stage.k + ": Completed (" + (wasBy || "?") + ", " +
+            (wasAt ? String(wasAt).slice(0,10) : "?") + ") → In progress; reopened by " + S.me.name,
+          comments: "Patient " + p.patientCode + " · stage " + stage.n + ". " + stage.label +
+                    " · reason: " + why });
+        notify("Stage " + stage.n + " (" + stage.label + ") was reopened for " + p.patientCode +
+               " by " + S.me.name + ": " + why, ["ADMIN","CPM","MANAGER"], [], p.siteId);
+      };
     });
 
     const ov = $("#scr-override");
@@ -14042,11 +15104,14 @@ function anatStageHtml(p, s, ctReady){
   const missing = stageMissing(p, s);
   const isOpen = SCR.open === s.k && open;
 
+  const state = stageState(p, s);
+  const overdue = stageOverdue(p, s);
+
   /* Header summary, so a collapsed stage still answers "what was decided here". */
   let summary = "";
   if(a.status === "Not required") summary = s.needsPm ? "N/A · Deemed (No PM)" : "Not required";
   else if(settled){
-    summary = [s.kind === "eval" ? [a.size, a.angle ? a.angle + "\u00B0" : ""].filter(Boolean).join(", ") : "",
+    summary = [s.kind === "eval" ? [a.size, angleText(a, "angle") || a.angle].filter(Boolean).join(", ") : "",
                s.kind === "ops"  ? (a.actualDate ? fmtDate(a.actualDate) : "") : "",
                s.kind === "sched" ? [a.completionDate ? fmtDate(a.completionDate) : "", a.hospital].filter(Boolean).join(" \u00B7 ") : "",
                s.kind === "order" ? a.shippingDest : "",
@@ -14055,17 +15120,25 @@ function anatStageHtml(p, s, ctReady){
     summary = missing.length + " required field(s) still empty";
   }
 
-  const badgeCls = settled ? "p-green"
-                 : a.status === "Completed" ? "p-red"
-                 : a.status === "In progress" ? "p-orange" : "p-grey";
-  let badgeTxt = (a.status === "Completed" && !settled) ? "Incomplete" : a.status;
+  /* The badge reports the derived state. "Incomplete" survives as its own reading for
+     the one case the derivation cannot express: a stored signature over a stage whose
+     required fields have since gone. */
+  let badgeCls = ANAT_STATE_CLS[state] || "p-grey";
+  let badgeTxt = state;
+  if(a.status === "Completed" && !settled){ badgeCls = "p-red"; badgeTxt = "Incomplete"; }
   /* PM Insertion with no pacemaker reads as N/A rather than the internal "Not required". */
-  if(a.status === "Not required" && s.needsPm) badgeTxt = "N/A";
+  if(state === "Not required" && s.needsPm) badgeTxt = "N/A";
+
+  /* Who it is waiting on, shown on the collapsed header - the question people open
+     these stages to answer. */
+  const who = stageOpen(p, s) && a.assignedTo ? assigneeLabel(a.assignedTo) : "";
 
   const head = '<div class="card-hd acc-hd' + (open ? " is-clickable" : "") + '"' +
     (open ? ' data-acc="' + s.k + '" role="button" tabindex="0" aria-expanded="' + isOpen + '"' : "") + '>' +
     '<h2><span class="stage-n">' + s.n + '</span>' + esc(s.label) +
       (summary ? ' <span class="acc-sum">' + esc(summary) + '</span>' : "") + '</h2>' +
+    (who ? '<span class="pill p-grey">' + esc(who) + '</span>' : "") +
+    (overdue ? '<span class="pill p-red">Overdue</span>' : "") +
     '<span class="badge ' + badgeCls + '">' + esc(badgeTxt) + '</span>' +
     (open ? '<span class="acc-caret">' + (isOpen ? "\u2212" : "+") + '</span>' : "") +
     '</div>';
@@ -14097,21 +15170,31 @@ function anatStageHtml(p, s, ctReady){
     return '<div class="field"><label class="' + (req ? "req" : "") + '" for="' + id + '">' +
       esc(label) + '</label>' + ctl + '</div>';
   };
-  /* Clinical judgement is a CPM call, so evaluation stages only offer those names.
-     Operational stages can be assigned to anyone. */
-  const users = [""].concat(S.db.users
-    .filter(u => s.kind !== "eval" || ["CPM","ADMIN"].includes(u.role))
-    .map(u => u.name));
-
-  /* "Not required" is only meaningful for PM Insertion (no pacemaker) and for the
-     Product Order (a patient may need no product order). Every other stage must be
-     worked through, so it is not offered there. */
-  const statusOptions = (s.k === "pmins" || s.k === "order")
-    ? ANAT_STATUS : ANAT_STATUS.filter(x => x !== "Not required");
+  /* Evaluation stages used to offer only CPM and App Admin. Innoventric Employees do
+     this work too, and could already EDIT these stages - only the assignment was
+     withheld - so the list now includes them. The option VALUE is the person's email,
+     which is what a notification can be sent to, while the text stays their name,
+     because that is who the person choosing is thinking of. */
+  const EVAL_ASSIGNABLE = ["CPM", "ADMIN", "EMPLOYEE", "QA", "MANAGER"];
+  const pickable = S.db.users.filter(u => s.kind !== "eval" || EVAL_ASSIGNABLE.includes(u.role));
+  const assignedNow = String(a.assignedTo || "");
+  /* An assignee who is no longer in the pickable list (role changed, or a name that
+     the migration could not resolve) is still shown, so a save cannot silently drop
+     the person the task belongs to. */
+  const orphan = assignedNow && !pickable.some(u => u.email === assignedNow);
+  const assignSelect =
+    '<div class="field"><label for="an-' + s.k + '-assignedTo">Assigned to</label>' +
+      '<select id="an-' + s.k + '-assignedTo" data-anat="' + s.k + '|assignedTo"' + dis + '>' +
+        '<option value=""' + (assignedNow ? "" : " selected") + '>— nobody yet —</option>' +
+        (orphan ? '<option value="' + esc(assignedNow) + '" selected>' +
+                  esc(assignedNow) + ' (not a current user)</option>' : "") +
+        pickable.map(u => '<option value="' + esc(u.email) + '"' +
+          (u.email === assignedNow ? " selected" : "") + '>' + esc(u.name) + '</option>').join("") +
+      '</select></div>';
 
   let inner = '<div class="grid g3">' +
-    f("status","Status","select",{ options:statusOptions }) +
-    f("assignedTo","Assigned to","select",{ options:users });
+    assignSelect +
+    f("dueDate","Due date (optional)","date");
 
   if(s.kind === "eval"){
     inner += f("suitability","Anatomical suitability","select",{ options:SUITABILITY }) +
@@ -14119,15 +15202,20 @@ function anatStageHtml(p, s, ctReady){
       f("size", s.final ? "Final recommended implant size" : "Recommended implant size",
         "select",{ options:[""].concat(UNICA_SIZES) }) +
       (s.final ? "" : f("altSize","Alternative size (optional)","select",{ options:[""].concat(UNICA_SIZES) })) +
-      f("angle", s.final ? "Final recommended implantation angle" : "Recommended implantation angle","text");
-    if(s.sim) inner += f("simAngle","Implantation angle used in simulator","text");
-    inner += '</div>';
+      '</div>';
+    /* The pliable model carries no angle - that is decided later, under fluoroscopy. */
+    if(!s.noAngle){
+      inner += angleGroup(p, s, "angle",
+        s.final ? "Final recommended implantation angle" : "Recommended implantation angle", dis);
+    }
+    if(s.sim) inner += angleGroup(p, s, "simAngle", "Implantation angle used in simulator", dis);
     if(s.pm){
       inner += '<div class="grid g3">' +
         f("pmPresent","PM present","select",{ options:["","Yes","No"] }) +
-        f("pmLeads","Number of PM leads","number") +
-        f("pmCrossingAngle","PM crossing angle","text") + '</div>';
+        f("pmLeads","Number of PM leads","number") + '</div>' +
+        angleGroup(p, s, "pmCrossingAngle", "PM crossing angle", dis);
     }
+    if(s.scoring) inner += scoringBlock(p, s, dis);
     if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
     inner += '<div class="grid g2">' + f("completionDate","Completion date","datetime-local") +
       '<div class="field"><label>Completed by</label><input value="' + esc(a.completedBy || "") +
@@ -14141,15 +15229,90 @@ function anatStageHtml(p, s, ctReady){
       inner += '<div class="info">No pacemaker recorded in the 3D model evaluation, so this ' +
                'stage is deemed <b>N/A (No PM)</b> automatically.</div>';
     }
+    /* Printing is released by a CPM, Manager or App Admin. The work above can be filled
+       in before that - refusing to let an assigned person start would make the
+       assignment a lie - but the stage cannot be CONFIRMED without it. */
+    if(s.needsApproval){
+      const mayApprove = PRINT_GATE.includes(S.me.role);
+      inner += '<div class="' + (a.printApproved ? "okbox" : "warn") + '" style="margin-top:10px">' +
+        (a.printApproved
+          ? '<b>Released for printing by ' + esc(a.printApprovedBy || "") + '</b>' +
+            (a.printApprovedAt ? ' · ' + esc(fmtTs(a.printApprovedAt)) : "")
+          : '<b>Not yet released for printing.</b> A Clinical PM, Manager or App Admin ' +
+            'must approve before this stage can be confirmed.') +
+        '</div>';
+      if(mayApprove && !p.fileLocked){
+        inner += '<div class="row" style="margin-top:8px">' +
+          (a.printApproved
+            ? '<button class="btn btn-sm" data-printrevoke="' + s.k + '">Withdraw approval</button>'
+            : '<button class="btn btn-primary" data-printok="' + s.k + '">Approve for printing</button>') +
+          '</div>';
+      }
+    }
+  }
+  else if(s.kind === "approval"){
+    /* Eligibility: two sign-offs and the arm the patient is allocated to. The arm is
+       decided HERE, once. Stage 9 reads it and acts on it; it does not ask again. */
+    inner += '</div>' +
+      '<label class="check' + (a.eligibleByInnoventric ? " on" : "") + '">' +
+        '<input type="checkbox" data-anat="' + s.k + '|eligibleByInnoventric"' +
+        (a.eligibleByInnoventric ? " checked" : "") + dis + '>' +
+        '<span>Patient eligible by Innoventric</span></label>' +
+      '<label class="check' + (a.committeeApproval ? " on" : "") + '">' +
+        '<input type="checkbox" data-anat="' + s.k + '|committeeApproval"' +
+        (a.committeeApproval ? " checked" : "") + dis + '>' +
+        '<span>Eligibility committee approval</span></label>';
+
+    if(a.eligibleByInnoventric && a.committeeApproval){
+      inner += '<div class="field" style="margin-top:12px">' +
+        '<label class="req" for="an-' + s.k + '-studyArm">Allocation</label>' +
+        '<select id="an-' + s.k + '-studyArm" data-anat="' + s.k + '|studyArm"' + dis + '>' +
+          '<option value="">— choose —</option>' +
+          STUDY_ARMS.map(x => '<option value="' + x.k + '"' +
+            (a.studyArm === x.k ? " selected" : "") + '>' + esc(x.label) + '</option>').join("") +
+        '</select>' +
+        '<div class="hint">Decided once, here. A control-group patient keeps their whole ' +
+        'record but moves out of the screening list into <b>Eligible — in control</b>.</div></div>';
+      if(a.studyArm === "CONTROL"){
+        inner += '<div class="warn">This patient will move to the control list once this ' +
+          'stage is confirmed, and will no longer appear in screening, the register or ' +
+          'the home table.</div>';
+      }
+    }else{
+      inner += '<div class="hint" style="margin-top:10px">The allocation appears once both ' +
+        'approvals are ticked.</div>';
+    }
+    inner += '<div class="grid g2" style="margin-top:10px">' +
+      f("completionDate","Decision date","datetime-local") +
+      '<div class="field"><label>Confirmed by</label><input value="' + esc(a.completedBy || "") +
+      '" disabled></div></div>';
   }
   else if(s.kind === "sched"){
-    inner += '</div><div class="grid g3">' +
-      f("completionDate","Procedure date","datetime-local") +
-      f("hospital","Hospital","text") +
-      f("physician","Physician","text") + '</div>' +
-      f("schedNotes","Notes","textarea") +
-      '<div class="hint">Setting the procedure date here is what moves the patient to ' +
-      '<b>Procedure Scheduled</b> and feeds the clinical workflow. It is not asked again there.</div>';
+    /* Randomisation is READ here, not decided here - the arm was allocated at stage 8.
+       Showing it makes the consequence of that decision visible at the moment it takes
+       effect, without offering a second place to change it. */
+    const arm = p.anat.approvals ? p.anat.approvals.studyArm : "";
+    inner += '</div>' +
+      '<div class="' + (arm ? "okbox" : "warn") + '" style="margin-bottom:10px">' +
+        (arm
+          ? '<b>Allocated to ' + esc((STUDY_ARMS.find(x => x.k === arm) || {}).label || arm) +
+            '</b> at stage 8.' +
+            (arm === "CONTROL"
+              ? ' No procedure is scheduled for a control patient — this stage records the ' +
+                'allocation and nothing more.'
+              : ' Set the procedure date below; that also opens the product order.')
+          : '<b>No allocation yet.</b> Stage 8 decides whether this patient is in the study ' +
+            'or the control group, and this stage cannot be completed until it has.') +
+      '</div>';
+    if(arm !== "CONTROL"){
+      inner += '<div class="grid g3">' +
+        f("completionDate","Procedure date","datetime-local") +
+        f("hospital","Hospital","text") +
+        f("physician","Physician","text") + '</div>' +
+        f("schedNotes","Notes","textarea") +
+        '<div class="hint">Setting the procedure date here is what moves the patient to ' +
+        '<b>Procedure Scheduled</b> and feeds the clinical workflow. It is not asked again there.</div>';
+    }
     if(anatIncomplete(p).length && !p.anatOverride){
       inner += '<div class="warn">Mandatory stages are still open, so scheduling is blocked. ' +
                'An App Admin can record an override above.</div>';
@@ -14168,7 +15331,8 @@ function anatStageHtml(p, s, ctReady){
       f("shippingDest","Shipping destination","text") +
       '<div class="field"><label>Requested by</label><input value="' + esc(a.requestedBy || "") +
       '" disabled></div></div>' +
-      f("approvedBy","Approved by","select",{ options:users });
+      f("approvedBy","Approved by","select",{ options:users }) +
+      productConfirmBlock(p, s, rec);
   }
   else inner += '</div>';
 
@@ -14179,12 +15343,333 @@ function anatStageHtml(p, s, ctReady){
         ? '<b>This stage cannot count as completed yet.</b> Still empty: '
         : 'To complete this stage you will need: ') + esc(missing.join(", ")) + '.</div>';
   }
+  if(a.reopenReason){
+    inner += '<div class="warn" style="margin-top:8px"><b>Reopened by ' +
+      esc(a.reopenedBy || "") + '</b> · ' + esc(fmtTs(a.reopenedAt)) + '<br>' +
+      esc(a.reopenReason) + '</div>';
+  }
+  if(state === "Completed"){
+    inner += '<div class="okbox" style="margin-top:8px"><b>Confirmed by ' +
+      esc(a.completedBy || "") + '</b>' +
+      (a.completionDate ? ' · ' + esc(fmtDate(a.completionDate)) : "") + '</div>';
+  }
+  if(state === "Not required" && a.notRequiredBy){
+    inner += '<div class="note" style="margin-top:8px">Marked not required by ' +
+      esc(a.notRequiredBy) + ' · ' + esc(fmtTs(a.notRequiredAt)) + '</div>';
+  }
+  inner += whyBox("stg-why-" + s.k);
 
-  return '<div class="card stage">' + head + '<div class="card-bd">' + inner + '</div></div>';
+  return '<div class="card stage">' + head + '<div class="card-bd">' + inner + '</div>' +
+    stageActions(p, s, state) + '</div>';
+}
+
+/* ---- product availability and allocation ---------------------------------------
+   Confirming the order asks a question the app can actually answer: are the right
+   units at the right site, in date on the day, and not already promised to somebody
+   else. Anything it finds is stated before the CPM confirms, not after.
+
+   A unit is usable for this patient when it is:
+     · at the patient's site
+     · in stock there (IN_SITE or IN_WH)
+     · still in date ON THE PROCEDURE DATE - not merely today, which is the whole
+       point of checking against a future booking
+     · not allocated to another patient                                            */
+function usableFor(p, productType, size){
+  const when = String(p.procedureDate || "").slice(0, 10);
+  return S.db.devices.filter(d =>
+    d.locationId === p.siteId &&
+    d.productType === productType &&
+    d.size === size &&
+    (d.status === "IN_SITE" || d.status === "IN_WH") &&
+    (!when || !d.expiration || String(d.expiration).slice(0, 10) >= when) &&
+    (!d.allocatedTo || d.allocatedTo === p.id));
+}
+function allocatedTo(p, productType){
+  return S.db.devices.filter(d => d.allocatedTo === p.id && d.productType === productType);
+}
+function productNeeds(p, rec){
+  const unica = rec.size || p.unicaSize || "";
+  const ds = unica && window.DeviceQr ? window.DeviceQr.requiredDsSize(unica) : "";
+  return [
+    { productType:"UNICA", size:unica, label:"Unica " + (unica || "?") },
+    { productType:"DS",    size:ds,    label:"Delivery System " + (ds || "?") }
+  ];
+}
+function productConfirmBlock(p, s, rec){
+  const a = p.anat[s.k];
+  const needs = productNeeds(p, rec);
+  const when = String(p.procedureDate || "").slice(0, 10);
+  const rows = needs.map(n => {
+    const held = allocatedTo(p, n.productType);
+    const free = n.size ? usableFor(p, n.productType, n.size).filter(d => !d.allocatedTo) : [];
+    return { n, held, free };
+  });
+  const shortfall = rows.filter(r => !r.held.length && !r.free.length);
+
+  let h = '<div class="card" style="margin:12px 0 0"><div class="card-hd">' +
+    '<h3 style="margin:0">Confirm date and products</h3>' +
+    (a.productsConfirmed ? '<span class="pill p-green">Confirmed</span>'
+                         : '<span class="pill p-grey">Not confirmed</span>') +
+    '</div><div class="card-bd">';
+
+  h += '<div class="note" style="margin-bottom:8px">Procedure date <b>' +
+    esc(fmtDate(p.procedureDate) || "not set") + '</b>. Stock is checked at this site, ' +
+    'against that date.</div>';
+
+  h += '<div class="tbl-wrap"><table><thead><tr><th>Product</th><th>At this site</th>' +
+    '<th>Reserved for this patient</th></tr></thead><tbody>' +
+    rows.map(r =>
+      '<tr><td><b>' + esc(r.n.label) + '</b></td>' +
+      '<td>' + (r.n.size
+        ? (r.free.length ? r.free.length + ' available' : '<span class="pill p-red">none</span>')
+        : '<span class="hint">size not decided yet</span>') + '</td>' +
+      '<td>' + (r.held.length
+        ? r.held.map(d => '<span class="pill p-green">' + esc(d.sn) + '</span>').join(" ")
+        : '<span class="hint">—</span>') + '</td></tr>').join("") +
+    '</tbody></table></div>';
+
+  if(!when){
+    h += '<div class="warn" style="margin-top:8px">No procedure date, so nothing can be ' +
+      'checked against it. Set the date at stage 9 first.</div>';
+  }else if(shortfall.length){
+    h += '<div class="warn" style="margin-top:8px"><b>Not available at this site: ' +
+      esc(shortfall.map(r => r.n.label).join(", ")) + '.</b> Confirming will alert the ' +
+      'admins and warehouse managers that stock has to be sent.</div>';
+  }else{
+    h += '<div class="okbox" style="margin-top:8px">Everything needed is at the site and ' +
+      'in date on the day. Confirming reserves it for this patient.</div>';
+  }
+
+  if(!p.fileLocked && can("managePatients")){
+    h += '<div class="row" style="margin-top:10px">' +
+      (a.productsConfirmed
+        ? '<button class="btn btn-sm" data-prodrelease="' + s.k + '">Withdraw confirmation</button>' +
+          '<span class="hint">Releases anything reserved for this patient.</span>'
+        : '<button class="btn btn-primary" data-prodconfirm="' + s.k + '">' +
+          'I confirm the date and these products</button>') +
+      '</div>';
+  }else if(!a.productsConfirmed){
+    h += '<div class="hint" style="margin-top:10px">Only a Clinical PM or App Admin can ' +
+      'confirm this.</div>';
+  }
+  if(a.productsConfirmed){
+    h += '<div class="okbox" style="margin-top:8px">Confirmed by <b>' +
+      esc(a.productsConfirmedBy || "") + '</b>' +
+      (a.productsConfirmedAt ? ' · ' + esc(fmtTs(a.productsConfirmedAt)) : "") + '</div>';
+  }
+  return h + '</div></div>';
+}
+
+/* ---- borderline scoring --------------------------------------------------------
+   When the pliable model says the anatomy is Borderline, the question stops being
+   "does it fit" and becomes "which of these two would fit better". So two candidate
+   sizes are scored across nine criteria, 1 (bad) to 5 (good), each with room for a
+   note, and the totals are put side by side.
+
+   The system adds up and puts a size forward. It does NOT decide: the conclusion is
+   one of three explicit choices, recorded as the clinician's. A tie yields no
+   recommendation rather than an arbitrary pick - a coin toss dressed up as an answer
+   is worse than saying nothing.
+
+   Weights live in anatStages.js and are all 1 today; real ones are expected later, and
+   keeping them as data means that is a change of numbers, not of code. */
+const SCORING_CRITERIA  = window.AnatStages.SCORING_CRITERIA;
+const SCORING_DECISIONS = window.AnatStages.SCORING_DECISIONS;
+const PRINT_GATE        = window.AnatStages.PRINT_GATE;
+const STUDY_ARMS        = window.AnatStages.STUDY_ARMS;
+const isControl         = window.AnatStages.isControl;
+const stageName         = window.AnatStages.stageName;
+
+function blankScoring(){
+  return { sizes:["",""], scores:[{},{}], notes:[{},{}],
+           decision:"", chosenSize:"", proctorNotes:"", discussBetween:"" };
+}
+function scoringOf(p, s){
+  const a = p.anat[s.k];
+  if(!a.scoring) a.scoring = blankScoring();
+  return a.scoring;
+}
+function scoringTotal(sc, i){
+  let sum = 0, any = false;
+  for(const c of SCORING_CRITERIA){
+    const v = parseInt(sc.scores[i] && sc.scores[i][c.k], 10);
+    if(!isNaN(v)){ sum += v * (c.weight || 1); any = true; }
+  }
+  return any ? sum : null;
+}
+/* The higher total, or null when they tie or nothing has been scored. */
+function scoringLeader(sc){
+  const a = scoringTotal(sc, 0), b = scoringTotal(sc, 1);
+  if(a === null && b === null) return null;
+  if(a === null) return 1;
+  if(b === null) return 0;
+  if(a === b) return null;
+  return a > b ? 0 : 1;
+}
+function scoringBlock(p, s, dis){
+  const a = p.anat[s.k];
+  if(a.suitability !== "Borderline"){
+    return a.scoring && a.scoring.decision
+      ? '<div class="note" style="margin-top:8px">A borderline comparison was recorded ' +
+        'here earlier. Set suitability back to Borderline to see it.</div>'
+      : "";
+  }
+  const sc = scoringOf(p, s);
+  const totals = [scoringTotal(sc, 0), scoringTotal(sc, 1)];
+  const lead = scoringLeader(sc);
+  const sizeSel = i =>
+    '<select data-scsize="' + i + '"' + dis + '>' +
+      [""].concat(UNICA_SIZES).map(o => '<option' +
+        (String(sc.sizes[i] || "") === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
+    '</select>';
+
+  let h = '<div class="card" style="margin:12px 0 0"><div class="card-hd">' +
+    '<h3 style="margin:0">Borderline comparison</h3>' +
+    '<span class="pill p-orange">Suitability is Borderline</span></div><div class="card-bd">' +
+    '<div class="note" style="margin-bottom:8px">Score up to two candidate sizes, 1 (poor) ' +
+      'to 5 (good). The totals are a prompt — the conclusion at the end is yours.</div>' +
+    '<div class="tbl-wrap"><table><thead><tr>' +
+      '<th style="min-width:220px">Criterion</th>' +
+      '<th>Option A ' + sizeSel(0) + '</th>' +
+      '<th>Option B ' + sizeSel(1) + '</th>' +
+    '</tr></thead><tbody>' +
+    SCORING_CRITERIA.map(c =>
+      '<tr><td><b>' + esc(c.label) + '</b>' +
+        (c.hint ? '<br><small class="hint">' + esc(c.hint) + '</small>' : "") + '</td>' +
+      [0,1].map(i =>
+        '<td><div class="row" style="gap:6px;flex-wrap:nowrap">' +
+          '<select data-scv="' + i + '|' + c.k + '"' + dis + ' style="max-width:70px">' +
+            ["","1","2","3","4","5"].map(o => '<option' +
+              (String((sc.scores[i] || {})[c.k] || "") === o ? " selected" : "") + '>' +
+              esc(o) + '</option>').join("") + '</select>' +
+          '<input type="text" data-scn="' + i + '|' + c.k + '" placeholder="note"' +
+            ' value="' + esc((sc.notes[i] || {})[c.k] || "") + '"' + dis + '>' +
+        '</div></td>').join("") +
+      '</tr>').join("") +
+    '<tr><td><b>Total</b></td>' +
+      [0,1].map(i => '<td><b style="font-size:18px">' +
+        (totals[i] === null ? "—" : totals[i]) + '</b>' +
+        (lead === i ? ' <span class="pill p-green">higher</span>' : "") + '</td>').join("") +
+    '</tr></tbody></table></div>';
+
+  h += '<div class="' + (lead === null ? "note" : "okbox") + '" style="margin-top:8px">' +
+    (totals[0] === null && totals[1] === null
+      ? 'Nothing scored yet.'
+      : lead === null
+        ? '<b>The two score equally.</b> No size is put forward — this one is a judgement call.'
+        : '<b>Scoring favours ' + esc(sc.sizes[lead] || ("Option " + (lead ? "B" : "A"))) +
+          '.</b> It is a prompt, not a decision.') +
+  '</div>';
+
+  h += '<h4 style="margin:14px 0 6px">Conclusion</h4>' +
+    '<div class="field"><label class="req">Decision</label>' +
+      '<select data-scdec="1"' + dis + '>' +
+        '<option value="">— choose —</option>' +
+        SCORING_DECISIONS.map(d => '<option value="' + d.k + '"' +
+          (sc.decision === d.k ? " selected" : "") + '>' + esc(d.label) + '</option>').join("") +
+      '</select></div>';
+
+  if(sc.decision === "ELIGIBLE"){
+    h += '<div class="grid g2">' +
+      '<div class="field"><label class="req">Recommended implant size</label>' +
+        '<select data-scchosen="1"' + dis + '>' +
+          [""].concat(UNICA_SIZES).map(o => '<option' +
+            (String(sc.chosenSize || "") === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
+        '</select></div>' +
+      '<div class="field"><label>Notes for the proctor</label>' +
+        '<input type="text" data-scproc="1" value="' + esc(sc.proctorNotes || "") + '"' + dis + '></div>' +
+      '</div>';
+  }else if(sc.decision === "DISCUSSION"){
+    h += '<div class="field"><label class="req">What has to be decided</label>' +
+      '<input type="text" data-scdisc="1" placeholder="e.g. M versus L — which, and why"' +
+      ' value="' + esc(sc.discussBetween || "") + '"' + dis + '></div>' +
+      '<div class="warn">Progress is held here until this is resolved and the decision changed.</div>';
+  }else if(sc.decision === "UNSUITABLE"){
+    h += '<div class="warn"><b>The patient will be marked cancelled</b> when this stage is ' +
+      'confirmed, with this decision as the reason.</div>';
+  }
+  return h + '</div></div>';
+}
+
+/* ---- angles -------------------------------------------------------------------
+   An angle used to be one free-text box, which meant "30" and "LAO 30 / CRAN 20" and
+   "about 30 deg" all lived in the same field and none of them could be read back.
+   It is now four numbers on two axes. LAO and RAO are opposite tilts on the same axis,
+   as are CRAN and CAUD, so filling one of a pair disables the other rather than letting
+   a record claim both - which would describe no real projection.
+   Each field is a 0-90 picker that also accepts typing, via a datalist. */
+const ANGLE_FIELDS = window.AnatStages.ANGLE_FIELDS;
+function angleKey(base, f){ return base + f.k.charAt(0).toUpperCase() + f.k.slice(1); }
+function angleText(a, base){
+  const parts = ANGLE_FIELDS
+    .map(f => ({ f, v: String(a[angleKey(base, f)] || "").trim() }))
+    .filter(x => x.v !== "")
+    .map(x => x.f.label + " " + x.v + "°");
+  return parts.join(" / ");
+}
+function angleGroup(p, s, base, label, dis){
+  const a = p.anat[s.k];
+  /* Which side of each axis already has a value - the other is then locked. */
+  const filled = {};
+  for(const f of ANGLE_FIELDS){
+    if(String(a[angleKey(base, f)] || "").trim() !== "") filled[f.pair] = f.k;
+  }
+  const legacy = String(a[base] || "").trim();
+  return '<div class="field"><label>' + esc(label) + '</label>' +
+    '<div class="grid g4" style="margin:0">' +
+      ANGLE_FIELDS.map(f => {
+        const key = angleKey(base, f);
+        const locked = filled[f.pair] && filled[f.pair] !== f.k;
+        const id = "an-" + s.k + "-" + key;
+        return '<div class="field" style="margin:0">' +
+          '<label for="' + id + '" class="hint" style="margin:0 0 2px">' + esc(f.label) + '</label>' +
+          '<input type="number" min="0" max="90" step="1" list="angle-0-90" id="' + id + '"' +
+            ' data-anat="' + s.k + '|' + key + '" value="' + esc(a[key] == null ? "" : a[key]) + '"' +
+            (locked ? " disabled" : dis) +
+            ' placeholder="' + (locked ? "—" : "0–90") + '">' +
+        '</div>';
+      }).join("") +
+    '</div>' +
+    (legacy
+      ? '<div class="hint" style="margin-top:4px">Previously recorded as free text: <b>' +
+        esc(legacy) + '</b> — re-enter it above to keep it readable.</div>'
+      : '<div class="hint" style="margin-top:4px">One of LAO/RAO and one of CRAN/CAUD.</div>') +
+  '</div>';
+}
+
+/* The footer is where a stage is finished, set aside, or - by somebody else - reopened.
+   Nothing here is a dropdown: each is an action with a consequence and a record. */
+function stageActions(p, s, state){
+  const a = p.anat[s.k];
+  const may = can("editAnatomical");
+  const btns = [];
+
+  if(may && state === "Pending confirmation"){
+    btns.push('<button class="btn btn-primary" data-stgdone="' + s.k + '">I’m done</button>');
+    btns.push('<span class="hint">Everything needed is filled in. Confirming records you and the time.</span>');
+  }
+  if(may && (state === "In progress" || state === "Not started") && stageRequired(s).length){
+    btns.push('<span class="hint">Fill in what this stage needs and a confirmation button appears here.</span>');
+  }
+  /* "Not required" replaces what used to be a quiet dropdown choice, and only where it
+     is meaningful: no pacemaker to insert, or no product to order. */
+  if(may && (s.k === "pmins" || s.k === "order") && state !== "Completed" && state !== "Not required"){
+    btns.push('<button class="btn" data-stgna="' + s.k + '">Not required</button>');
+  }
+  if(may && state === "Not required"){
+    btns.push('<button class="btn btn-sm" data-stgundona="' + s.k + '">Bring it back</button>');
+  }
+  if(state === "Completed"){
+    btns.push(can("reopenStage")
+      ? '<button class="btn btn-danger" data-stgreopen="' + s.k + '">Reopen</button>'
+      : '<span class="hint">Confirmed. A Clinical PM, Manager or App Admin can reopen it.</span>');
+  }
+  if(!btns.length) return "";
+  return '<div class="card-ft"><div class="row">' + btns.join("") + '</div></div>';
 }
 
 VIEWS.clinical = {
-  title:"Procedure Case File",
+  title:"Procedure Report",
   sub:"Pick the site, then the patient. Everything saves as you type.",
   body(){
     /* Step 1 - site. Step 2 - patient. Only then any patient data at all: showing a
@@ -14193,7 +15678,7 @@ VIEWS.clinical = {
     const sites = visibleLocations().filter(l => l.type === "SITE");
     if(!sites.length) return '<div class="empty">No hospital sites are in your scope.</div>';
     if(SITEID && !sites.some(s => s.id === SITEID)) SITEID = null;
-    const atSite = SITEID ? S.db.patients.filter(x => x.siteId === SITEID) : [];
+    const atSite = SITEID ? activePatients().filter(x => x.siteId === SITEID) : [];
     if(PID && !atSite.some(x => x.id === PID)) PID = null;
 
     let h = '<div class="card"><div class="card-hd"><h2>Who are you working on?</h2>' +
@@ -14215,11 +15700,13 @@ VIEWS.clinical = {
     if(!SITEID) return h + '<div class="empty"><b>Start by choosing a site</b>' +
       'Nothing about a patient is shown until you have said which hospital you are at.</div>';
     if(!PID)    return h + '<div class="empty"><b>Now choose a patient</b>' +
-      'Their case file opens here, with a briefing on sizing, stock and open questions.</div>';
+      'Their procedure report opens here, with a briefing on sizing, stock and open questions.</div>';
 
     const p = patient(PID);
     const fifoU = fifoPick("UNICA", p.unicaSize, p.siteId);
     const fifoD = fifoPick("DS", p.dsSize, p.siteId);
+    seedProcDate(p);
+    migrateContrast(p);
     const c = cf(p);
 
     /* ---- the briefing: what is known about this patient, before any data entry ---- */
@@ -14235,7 +15722,7 @@ VIEWS.clinical = {
         '<div class="kv"><b>Site</b> ' + esc(locName(p.siteId)) + '</div>' +
         '<div class="kv"><b>Procedure date</b> ' + esc(fmtDate(p.procedureDate)) + '</div>' +
         '<div class="kv"><b>Assigned sizing</b> Unica ' + esc(p.unicaSize) + ' · DS ' + esc(p.dsSize) + '</div>' +
-        '<div class="kv"><b>Case file</b> ' + (p.fileLocked ? "Locked" :
+        '<div class="kv"><b>Procedure report</b> ' + (p.fileLocked ? "Locked" :
             p.submitted ? "Submitted, editable" : "In progress") + '</div>' +
       '</div>' +
 
@@ -14279,7 +15766,7 @@ VIEWS.clinical = {
         esc(p.notes) + '</div>' : "") +
     '</div></div>';
 
-    if(p.fileLocked) h += '<div class="locked-ov"><b>This case file is permanently locked.</b> ' +
+    if(p.fileLocked) h += '<div class="locked-ov"><b>This procedure report is permanently locked.</b> ' +
       'Every field is read-only and the complete file has been archived to OneDrive.</div>';
     else if(p.submitted) h += '<div class="info"><b>Submitted, still editable.</b> ' +
       'It stays editable until a Clinical PM or App Admin performs the final permanent lock.</div>';
@@ -14288,7 +15775,7 @@ VIEWS.clinical = {
        one screen that is used during a live procedure. The rail gives the position
        and the completeness that the long page was not communicating. */
     const stDone = stageDone(p);
-    h += '<div class="rail" role="navigation" aria-label="Case file stages">' +
+    h += '<div class="rail" role="navigation" aria-label="Procedure report stages">' +
       STAGES.map((s,i) =>
         '<button class="rail-i' + (stDone[i] ? " done" : "") + '" data-stage="' + i + '">' +
           '<span class="rail-n">' + (stDone[i] ? "&#10003;" : (i+1)) + '</span>' +
@@ -14302,7 +15789,9 @@ VIEWS.clinical = {
     h += '<div class="card stage" id="stage-0"><div class="card-hd"><h2><span class="stage-n">1</span>' +
       'Procedure info</h2><span class="saved" id="sv1"></span></div><div class="card-bd">' +
       '<div class="grid g2">' +
-        tf(p,"procDate","Date of procedure","date",{req:true}) +
+        tf(p,"procDate","Date of procedure","date",{req:true,
+          hint:"Filled in from the scheduled date. Change it here if the procedure " +
+               "actually happened on another day — that correction stays in this report."}) +
       '</div><div class="grid g4">' +
         tf(p,"proctor","Proctor","text") + tf(p,"tech1","Tech 1st","text") +
         tf(p,"tech2","Tech 2nd","text")  + tf(p,"clinical","Clinical","text") +
@@ -14341,8 +15830,10 @@ VIEWS.clinical = {
             '<input type="text" id="cq-' + i + '" data-cq="' + i + '" value="' + esc(q.a || "") + '"' +
             ro(p) + '></div>').join("")
         : '<div class="hint">None defined for this patient.</div>') +
-      '<h3 style="margin:14px 0 7px">Device verification (all five mandatory)</h3>' +
-      DEVICE_CONFIRMS.map((t,i) => cbox(p,"confirms",t,i)).join("") +
+      '<h3 style="margin:14px 0 7px">Device verification</h3>' +
+      '<div class="note" style="margin-bottom:8px">Scan each unit at the table and ' +
+        'verify it on its own. Every unit must be complete before the report can be submitted.</div>' +
+      deviceCheckBlock(p) +
     '</div></div>';
 
     /* ---- Stage 3 ---- */
@@ -14368,15 +15859,20 @@ VIEWS.clinical = {
       '<div class="grid g2">' + pressureField(p,"ivcPre","IVC pressure PRE (mmHg)") + tf(p,"ivcPreNote","IVC PRE notes","text") + '</div>' +
       sourceImages(p, "ivcPre", "IVC pressure PRE") +
       '<div class="grid g2">' + tf(p,"dsIn","DS insertion","time") + tf(p,"dsInNote","Notes","text") + '</div>' +
+      /* The road map is built once the delivery system is in and contrast can be run
+         through it, so it belongs here rather than at the end of the log. */
+      '<h3 style="margin:14px 0 8px">Road map definition &amp; contrast</h3>' +
+      contrastBlock(p) +
       /* Optional additional PRE measurement, taken before deployment starts. */
       '<div class="grid g2">' + pressureField(p,"ivcPre2","IVC pressure PRE — additional (optional, mmHg)") + tf(p,"ivcPre2Note","Additional PRE notes","text") + '</div>' +
       sourceImages(p, "ivcPre2", "IVC pressure PRE (additional)") +
       '<div class="grid g2">' + tf(p,"deployStart","Deployment initiation","time") + tf(p,"deployStartNote","Notes","text") + '</div>' +
       '<div class="grid g2">' + tf(p,"deployEnd","Deployment end","time") + tf(p,"deployEndNote","Notes","text") + '</div>' +
-      /* IVC pressure POST - taken after deployment ends. */
+      /* DS comes out first, and only then is the POST pressure taken - that is the
+         order of the procedure itself, and the log reads in the order it happens. */
+      '<div class="grid g2">' + tf(p,"dsOut","DS extraction","time") + tf(p,"dsOutNote","Notes","text") + '</div>' +
       '<div class="grid g2">' + pressureField(p,"ivcPost","IVC pressure POST (mmHg)") + tf(p,"ivcPostNote","IVC POST notes","text") + '</div>' +
       sourceImages(p, "ivcPost", "IVC pressure POST") +
-      '<div class="grid g2">' + tf(p,"dsOut","DS extraction","time") + tf(p,"dsOutNote","Notes","text") + '</div>' +
       '<div class="grid g2" style="margin:4px 0 12px">' +
         '<div class="calc"><small>Deployment Duration (computed)</small><b id="calc-dep">' + fmtDur(dep) + '</b></div>' +
         '<div class="calc"><small>Skin to Skin time (computed)</small><b id="calc-sts">' + fmtDur(sts) + '</b></div>' +
@@ -14389,16 +15885,6 @@ VIEWS.clinical = {
           '</select></div>' +
         tf(p,"closingTime","Closing time","time") +
         tf(p,"closingNote","Closing notes","text") +
-      '</div>' +
-      '<h3 style="margin:14px 0 8px">Contrast &amp; echo</h3>' +
-      '<div class="grid g3">' +
-        tf(p,"contrast","Total contrast volume (mL)","number") +
-        '<div class="field"><label for="cf-contrastForm">Contrast form</label>' +
-          '<select id="cf-contrastForm" data-cf="contrastForm"' + ro(p) + '>' +
-          ["","Pure","Diluted"].map(o =>
-            '<option' + (c.contrastForm === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
-          '</select></div>' +
-        tf(p,"contrastNote","Contrast notes","text") +
       '</div>' +
       tf(p,"echoParams","Echo parameter collection","textarea",{hint:"Free text; structured capture is a later change."}) +
       sourceImages(p, "echoParams", "Echo parameters") +
@@ -14447,7 +15933,7 @@ VIEWS.clinical = {
       /* Export is available whatever the file's state — including after the final lock,
          which is exactly when a shareable PDF of the whole procedure is wanted. */
       '<div class="row" style="margin-bottom:10px">' +
-        '<button class="btn" id="pt-pdf">Export case file (PDF)</button></div>' +
+        '<button class="btn" id="pt-pdf">Export procedure report (PDF)</button></div>' +
       (p.fileLocked ? '<div class="row"><span class="pill p-green">Permanently locked</span></div>' :
       whyBox("pt-why") +
       '<div class="row">' +
@@ -14455,7 +15941,7 @@ VIEWS.clinical = {
            action and it is the one that enforces the mandatory fields. */
         '<button class="btn" id="pt-save">Save and close</button>' +
         '<button class="btn btn-primary" id="pt-submit">' +
-          (p.submitted ? "Re-submit case file" : "Submit case file") + '</button>' +
+          (p.submitted ? "Re-submit procedure report" : "Submit procedure report") + '</button>' +
         (p.submitted && can("lockCaseFile")
           ? '<button class="btn btn-dark" id="pt-lock">Final permanent lock</button>' : "") +
         (p.submitted && !can("lockCaseFile")
@@ -14495,6 +15981,10 @@ VIEWS.clinical = {
     /* Source-image capture buttons (stage 3). */
     $$("[data-img]").forEach(b => b.onclick = () =>
       captureSourceImage(p, b.dataset.img, b.dataset.imglabel));
+
+    /* Stage 2: each unit at the table is scanned onto its own verification card. */
+    SCANFIELDS["pt-dev-scan"] = { label:"device label",
+      onCode:(code, manual) => ptAddDeviceUnit(code, manual) };
 
     /* The two scanned device identifiers in stage 4. */
     SCANFIELDS["fail-scan"] = { label:"failed device label", onCode:(code, manual) => {
@@ -14540,6 +16030,8 @@ VIEWS.clinical = {
       const de = $("#calc-dep"), ss = $("#calc-sts");
       if(de) de.textContent = fmtDur(minsBetween(c.deployStart, c.deployEnd));
       if(ss) ss.textContent = fmtDur(minsBetween(c.dsIn, c.dsOut));
+      const ct = $("#calc-contrast");
+      if(ct) ct.textContent = fmtContrast(contrastTotal(c));
       /* Sys\Dias(Mean) readouts follow the three inputs as they are typed, so the
          operator sees the value in the form it will be reported in. */
       ["ivcPre","ivcPost"].forEach(k => {
@@ -14585,6 +16077,26 @@ VIEWS.clinical = {
         const a = cf(p)[k] || (cf(p)[k] = []);
         a[i] = t.checked;
         t.closest(".check").classList.toggle("on", t.checked);
+      }else if(t.dataset.cfd){
+        /* A check that belongs to one scanned unit rather than to the whole report.
+           The unit's pill is updated in place rather than by re-rendering: ticking a
+           box mid-procedure must not throw the operator back to the top of the page. */
+        const u = devChecks(p)[+t.dataset.cfd];
+        if(!u) return;
+        if(!Array.isArray(u.ok)) u.ok = DEVICE_CHECKS.map(() => false);
+        u.ok[+t.dataset.i] = t.checked;
+        t.closest(".check").classList.toggle("on", t.checked);
+        const pillEl = t.closest(".card") && t.closest(".card").querySelector(".card-hd .pill");
+        if(pillEl){
+          const done = devUnitDone(u);
+          pillEl.textContent = done ? "Verified"
+                                    : u.ok.filter(Boolean).length + " of " + DEVICE_CHECKS.length;
+          pillEl.className = "pill " + (done ? "p-green" : "p-grey");
+        }
+      }else if(t.dataset.cfdn){
+        const u = devChecks(p)[+t.dataset.cfdn];
+        if(!u) return;
+        u.note = t.value;
       }else if(t.dataset.cq){
         p.customQuestions[+t.dataset.cq].a = t.value;
       }else return;
@@ -14592,6 +16104,12 @@ VIEWS.clinical = {
       scheduleCaseFileSave(p);
       if(structural) render();
     }
+    const dmore = $("#pt-dev-more");
+    if(dmore) dmore.onclick = () => startScan("pt-dev-scan", "device label");
+    $$("[data-cfdrm]").forEach(b => b.onclick = () => {
+      devChecks(p).splice(+b.dataset.cfdrm, 1);
+      commit(); scheduleCaseFileSave(p); render();
+    });
     const ma = $("#mark-all");
     if(ma) ma.onclick = () => {
       const cur = cf(p).training || [];
@@ -14617,10 +16135,9 @@ const STAGES = [
 ];
 function stageDone(p){
   const c = cf(p);
-  const conf = (c.confirms || []).filter(Boolean).length;
   return [
     !!c.procDate,
-    conf === DEVICE_CONFIRMS.length,
+    devVerificationDone(p),
     !!(c.deployStart && c.deployEnd && c.dsIn && c.dsOut),
     !!c.asExpected && !(c.asExpected === "NO" && !c.notExpectedBranch) &&
       !(c.asExpected === "NO" && c.notExpectedBranch === "ALTERNATIVE" &&
@@ -14633,9 +16150,17 @@ function stageDone(p){
 function missingForSubmit(p){
   const c = cf(p), out = [];
   if(!c.procDate) out.push("Stage 1 — date of procedure");
-  const conf = (c.confirms || []).filter(Boolean).length;
-  if(conf < DEVICE_CONFIRMS.length)
-    out.push("Stage 2 — device verification (" + conf + " of " + DEVICE_CONFIRMS.length + ")");
+  /* Name the units that are still short, rather than a bare count: at the end of a
+     procedure "2 of 5" tells you nothing about which device to go back to. */
+  const units = devChecks(p);
+  if(!units.length) out.push("Stage 2 — scan and verify the devices used");
+  else {
+    const short = units.filter(u => !devUnitDone(u));
+    if(short.length) out.push("Stage 2 — verification incomplete for " +
+      short.map(u => u.sn).join(", "));
+  }
+  const room = c.roomChecks || [];
+  ROOM_CHECKS.forEach((t, i) => { if(!room[i]) out.push("Stage 2 — " + t.toLowerCase()); });
   if(!c.asExpected) out.push("Stage 4 — were the devices used as expected");
   else if(c.asExpected === "NO" && !c.notExpectedBranch)
     out.push("Stage 4 — cancelled, or alternative devices used");
@@ -14667,7 +16192,7 @@ async function saveDraft(p){
     catch(e){ toast("Could not save to the server: " + (e.message || ""), "bad"); }
     try{ await releasePatientRemote(p.id); }catch(_){}   // let go of the soft check-out
   }
-  logAction("Case file saved as a draft for " + p.patientCode, { locationId:p.siteId,
+  logAction("Procedure report saved as a draft for " + p.patientCode, { locationId:p.siteId,
     stateChanges: m.length ? m.length + " item(s) still outstanding" : "complete, not yet submitted" });
   toast(m.length ? "Saved. " + m.length + " item(s) still outstanding." : "Saved.", "good");
   PID = null;                      // "and close" - back to the site/patient chooser
@@ -14690,7 +16215,7 @@ async function submitCase(p){
   const logSubmit = () => {
     if(cancelled && p.status === "CANCELLED") logAction("Procedure cancelled for " + p.patientCode,
       { locationId:p.siteId, stateChanges:"→ Cancelled", highPriority:true });
-    logAction("Case file submitted for " + p.patientCode, { locationId:p.siteId,
+    logAction("Procedure report submitted for " + p.patientCode, { locationId:p.siteId,
       stateChanges:"submitted = true", comments:"Editable until the final permanent lock" });
   };
 
@@ -14700,23 +16225,23 @@ async function submitCase(p){
       await submitPatientRemote(p.id, { status:newStatus, caseFile:p.caseFile || {}, customQuestions:p.customQuestions || [] });
     }catch(e){ return showWhy("pt-why", e.message || "Submit failed on the server."); }
     logSubmit();
-    toast("Case file submitted. Still editable until locked.", "good"); render();
+    toast("Procedure report submitted. Still editable until locked.", "good"); render();
     return;
   }
 
   p.submitted = true;
   if(newStatus === "CANCELLED") p.status = "CANCELLED";
   logSubmit();
-  commit(); toast("Case file submitted. Still editable until locked.", "good"); render();
+  commit(); toast("Procedure report submitted. Still editable until locked.", "good"); render();
 }
 function lockCase(p){
-  if(!can("lockCaseFile")) return toast("Only a Clinical PM or App Admin can lock a case file.", "bad");
+  if(!can("lockCaseFile")) return toast("Only a Clinical PM or App Admin can lock a procedure report.", "bad");
   /* The only irreversible action in the app that a normal day's work reaches.
      Typing the code is friction on purpose — it makes locking the wrong patient's
      file something you have to mean. */
   modal("Final permanent lock",
     '<p>Locking <b>' + esc(p.patientCode) + '</b> makes every field read-only for good and ' +
-    'archives the complete case file to OneDrive.</p>' +
+    'archives the complete procedure report to OneDrive.</p>' +
     '<div class="warn"><b>This cannot be undone.</b> Nobody, including an App Admin, ' +
     'can reopen the file afterwards.</div>' +
     '<div class="field"><label class="req" for="lk-code">Type <b>' + esc(p.patientCode) +
@@ -14748,7 +16273,7 @@ function lockCase(p){
         unicaSize:p.unicaSize, dsSize:p.dsSize, status:p.status,
         caseFile:p.caseFile, customQuestions:p.customQuestions,
         lockedBy:S.me.email, lockedAt:nowISO() });
-    logAction("Case file permanently locked for " + p.patientCode, { locationId:p.siteId,
+    logAction("Procedure report permanently locked for " + p.patientCode, { locationId:p.siteId,
       stateChanges:"fileLocked = true; status → " + PT_STATUS[p.status].label,
       comments:"Archived to Clinical_Procedures" });
     commit(); closeModal(); toast("Locked and archived.", "good"); render();
@@ -14826,7 +16351,7 @@ function pruneShipLines(){
   });
 }
 VIEWS.shipment = {
-  title:"Send a Device Out",
+  title:"Send Devices Out",
   sub:"Choose what and how many, scan each unit, then confirm the whole shipment at once.",
   body(){
     if(!SH && !restoreShip()) resetShip();
@@ -15136,7 +16661,7 @@ function doShip(){
   function finishShip(){
     notify("Shipment inbound: " + units.map(u => devName(u) + " (" + u.ref + ")").join(", ") +
            " from " + locName(from) + ", shipped by " + shipper + ".",
-           ["ADMIN","CPM","EMPLOYEE"], [], to);
+           ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"], [], to);
     commit();
     /* Amber, not red: an override shipment succeeded, it just carries a note. */
     toast(anyBypass ? "Sent, with the FIFO override recorded."
@@ -15430,7 +16955,9 @@ function stockSerialRow(productType, size, colIds, colspan){
   return '<tr class="stk-exp"><td colspan="' + colspan + '">' + inner + '</td></tr>';
 }
 VIEWS.stock = {
-  title(){ return S.me.role === "WH_ADMIN" ? "My Warehouse Stock" : "Stock by Location"; },
+  /* One title for everyone. The screen was never actually different per role - only
+     its name was - and the contents are scoped by visibleDevices() regardless. */
+  title:"Stock Overview",
   sub:"How many of each size are where. The header row and first column stay put as you scroll.",
   body(){
     const cols = stockCols();
@@ -15621,7 +17148,7 @@ function toCSV(rows){
 }
 function slugify(s){ return String(s || "").trim().replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "site"; }
 
-/* ======================================= SITE PRODUCT REPORT (feature 1) == */
+/* ==================================== SITE ACCOUNTABILITY LOG (feature 1) == */
 let SR = { siteId:"", from:"", to:"" };
 function srDefaults(){
   if(!SR.to) SR.to = new Date().toISOString().slice(0, 10);
@@ -15667,8 +17194,299 @@ function siteReportRows(siteId, from, to){
   rows.sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0));
   return rows;
 }
+/* ============================================== BATCHES AWAITING QA =========
+   The queue a QA person works from, and the place a producer watches their own
+   batch. The server decides which rows each of them may see; this screen only
+   decides which BUTTONS to show, and shows none it cannot honour. */
+const BATCH_STATUS = {
+  AWAITING_QA: { label:"Awaiting QA",   cls:"p-orange" },
+  HELD_MRB:    { label:"Held for MRB",  cls:"p-red"    },
+  COMPLETED:   { label:"Completed",     cls:"p-green"  }
+};
+let MRB = null;   // { batchId, decisions:{SN:RELEASED|REJECTED} } while a hold is judged
+
+function batchUnitRows(b, editable){
+  return '<div class="tbl-wrap"><table><thead><tr><th>#</th><th>REF</th><th>Serial</th>' +
+    '<th>Product</th><th>Size</th><th>Expiry</th><th>' +
+    (editable ? "MRB decision" : "Disposition") + '</th></tr></thead><tbody>' +
+    (b.units || []).map((u, i) => {
+      const sn = String(u.sn || "").toUpperCase();
+      const chosen = MRB && MRB.batchId === b.batchId ? MRB.decisions[sn] : null;
+      return '<tr><td>' + (i+1) + '</td><td class="mono">' + esc(u.ref) + '</td>' +
+        '<td class="mono">' + esc(u.sn) + '</td><td>' + esc(u.productType) + '</td>' +
+        '<td>' + esc(u.size) + '</td><td>' + esc(fmtDate(u.expiryDate || u.expiration)) + '</td>' +
+        '<td>' + (editable
+          ? '<div class="row">' +
+              '<button class="btn btn-sm' + (chosen === "RELEASED" ? " btn-primary" : "") +
+                '" data-mrb="RELEASED" data-sn="' + esc(sn) + '">Release</button>' +
+              '<button class="btn btn-sm' + (chosen === "REJECTED" ? " btn-danger" : "") +
+                '" data-mrb="REJECTED" data-sn="' + esc(sn) + '">Reject</button>' +
+            '</div>'
+          : (u.disposition === "RELEASED" ? '<span class="pill p-green">Released</span>'
+           : u.disposition === "REJECTED" ? '<span class="pill p-red">Rejected</span>'
+           : '<span class="pill p-grey">—</span>')) +
+        '</td></tr>';
+    }).join("") + '</tbody></table></div>';
+}
+
+VIEWS.batches = {
+  title:"Batches awaiting QA",
+  sub:"Produced batches held between the person who made them and the person who releases them. Only a QA confirmation puts units into stock.",
+  body(){
+    const all = (S.db && Array.isArray(S.db.batches)) ? S.db.batches : [];
+    const approver = can("approveRegistration");
+    if(!all.length){
+      return '<div class="empty">No batches yet. A batch appears here once production ' +
+        'has been confirmed on the New Device Registration screen.</div>';
+    }
+    const open = all.filter(b => b.status !== "COMPLETED");
+    const done = all.filter(b => b.status === "COMPLETED");
+
+    const card = b => {
+      const editable = approver && b.status === "HELD_MRB";
+      const l = loc(b.locationId) || {};
+      return '<div class="card"><div class="card-hd"><h2>' + esc(b.batchId) + '</h2>' +
+        pill(BATCH_STATUS, b.status) + '</div><div class="card-bd">' +
+        '<div class="grid g3">' +
+          '<div class="kv"><b>Location</b> ' + esc(l.name || "—") + '</div>' +
+          '<div class="kv"><b>Units</b> ' + ((b.units || []).length) + '</div>' +
+          '<div class="kv"><b>Produced by</b> ' + esc((b.production || {}).byName || (b.production || {}).by || "—") + '</div>' +
+          '<div class="kv"><b>Production confirmed</b> ' + esc(fmtTs((b.production || {}).at)) + '</div>' +
+          (b.qa ? '<div class="kv"><b>QA</b> ' + esc(b.qa.byName || b.qa.by) + ' · ' + esc(fmtTs(b.qa.at)) + '</div>' : '') +
+          (b.mrb ? '<div class="kv"><b>MRB</b> ' + esc(b.mrb.byName || b.mrb.by) + ' · ' + esc(fmtTs(b.mrb.at)) + '</div>' : '') +
+        '</div>' +
+        '<div class="note" style="margin-top:8px">Batch approvals: ' +
+          REG_CHECKS.map(c => esc(c.t) + ((b.checks || {})[c.k] ? " ✓" : " ✗")).join(" · ") + '</div>' +
+        (b.qa && b.qa.note ? '<div class="warn" style="margin-top:8px"><b>Held for MRB:</b> ' +
+          esc(b.qa.note) + '</div>' : '') +
+        (b.mrb && b.mrb.note ? '<div class="note" style="margin-top:8px"><b>MRB note:</b> ' +
+          esc(b.mrb.note) + '</div>' : '') +
+        batchUnitRows(b, editable) +
+        (editable ? whyBox("mrb-why-" + b.batchId) : "") +
+        '</div>' +
+        (approver && b.status === "AWAITING_QA"
+          ? '<div class="card-ft"><div class="row">' +
+              '<button class="btn btn-primary" data-bapprove="' + esc(b.batchId) + '">Approve &amp; register ' +
+                ((b.units || []).length) + ' device(s)</button>' +
+              '<button class="btn btn-danger" data-bhold="' + esc(b.batchId) + '">Hold for MRB</button>' +
+            '</div></div>'
+          : "") +
+        (editable
+          ? '<div class="card-ft"><div class="row">' +
+              '<button class="btn btn-primary" data-bdispose="' + esc(b.batchId) + '">Submit MRB disposition</button>' +
+              '<span class="hint">Every unit needs a decision.</span>' +
+            '</div></div>'
+          : "") +
+        '</div>';
+    };
+
+    return (open.length
+        ? open.map(card).join("")
+        : '<div class="empty">Nothing is waiting. Every batch has been dealt with.</div>') +
+      (done.length
+        ? '<div class="card"><div class="card-hd"><h2>Completed</h2>' +
+            '<span class="pill p-grey">' + done.length + '</span></div><div class="card-bd">' +
+          '<div class="tbl-wrap"><table><thead><tr><th>Batch</th><th>Location</th><th>Units</th>' +
+            '<th>Released</th><th>Rejected</th><th>QA</th></tr></thead><tbody>' +
+          done.map(b => {
+            const rel = (b.units || []).filter(u => u.disposition === "RELEASED").length;
+            const rej = (b.units || []).filter(u => u.disposition === "REJECTED").length;
+            return '<tr><td class="mono">' + esc(b.batchId) + '</td>' +
+              '<td>' + esc((loc(b.locationId) || {}).name || "—") + '</td>' +
+              '<td>' + ((b.units || []).length) + '</td><td>' + rel + '</td><td>' + rej + '</td>' +
+              '<td>' + esc((b.qa || {}).byName || (b.qa || {}).by || "—") + '</td></tr>';
+          }).join("") + '</tbody></table></div></div></div>'
+        : "");
+  },
+  wire(){
+    $$("[data-bapprove]").forEach(btn => btn.onclick = () => confirmApprove(btn.dataset.bapprove));
+    $$("[data-bhold]").forEach(btn => btn.onclick = () => askHold(btn.dataset.bhold));
+    $$("[data-mrb]").forEach(btn => btn.onclick = () => {
+      const b = btn.closest(".card");
+      const batchId = (b.querySelector("[data-bdispose]") || {}).dataset.bdispose;
+      if(!MRB || MRB.batchId !== batchId) MRB = { batchId, decisions:{} };
+      MRB.decisions[btn.dataset.sn] = btn.dataset.mrb;
+      render();
+    });
+    $$("[data-bdispose]").forEach(btn => btn.onclick = () => confirmDispose(btn.dataset.bdispose));
+  }
+};
+
+/* All three QA actions are irreversible in the way that matters — they either create
+   stock or close a batch — so each one states its consequence and waits for a second
+   press. None of them is a bare button that acts on the first click. */
+function findBatch(id){
+  return ((S.db && S.db.batches) || []).find(b => b.batchId === id) || null;
+}
+/* Reload the queue, then put the row the server just handed back on TOP of it.
+   A SharePoint list query can still return the pre-write copy for a moment, and
+   without this the batch you just approved reappears as "Awaiting QA" — inviting a
+   second press, which then fails with a conflict for no visible reason. The server
+   response is authoritative; the reload is only there to pick up other people's
+   changes. Same treatment the device screens already give a fresh registration. */
+async function refreshBatches(authoritative){
+  try{ S.db.batches = await loadBatches(); }catch(e){}
+  if(!Array.isArray(S.db.batches)) S.db.batches = [];
+  if(authoritative && authoritative.batchId){
+    const i = S.db.batches.findIndex(b => b.batchId === authoritative.batchId);
+    if(i >= 0) S.db.batches[i] = authoritative; else S.db.batches.unshift(authoritative);
+  }
+}
+function confirmApprove(batchId){
+  const b = findBatch(batchId); if(!b) return;
+  const n = (b.units || []).filter(u => u.disposition !== "REJECTED").length;
+  modal("Approve batch " + b.batchId,
+    '<p>This is the QA confirmation. It puts <b>' + n + '</b> unit(s) into usable stock at <b>' +
+      esc((loc(b.locationId) || {}).name || "—") + '</b>, under your name.</p>' +
+    '<p class="hint">Produced by ' + esc((b.production || {}).byName || (b.production || {}).by || "—") +
+      ' · ' + esc(fmtTs((b.production || {}).at)) + '</p>' +
+    whyBox("bapp-why"),
+    '<div class="row"><button class="btn btn-primary" id="bapp-go">Approve &amp; register</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#bapp-go").onclick = async () => {
+    const go = $("#bapp-go"); go.disabled = true;
+    try{
+      const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/approve", {});
+      logAction("QA approved batch " + batchId + " — " + out.result.created + " device(s) into stock", {
+        locationId: b.locationId, highPriority:true,
+        stateChanges: out.result.created + " unit(s) added as In WH · batch " + batchId,
+        comments: "Produced by " + ((b.production || {}).byName || (b.production || {}).by || "—") +
+          " | Serials: " + (b.units || []).map(u => u.sn).join(", ")
+      });
+      try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+      if(Array.isArray(out.result.devices)){
+        for(const nd of out.result.devices){
+          const i = S.db.devices.findIndex(x => x.id === nd.id);
+          if(i >= 0) S.db.devices[i] = nd; else S.db.devices.push(nd);
+        }
+      }
+      await refreshBatches(out.batch);
+      closeModal(); renderNav(); render();
+      toast(out.result.created + " device(s) registered.", "good");
+    }catch(e){ go.disabled = false; showWhy("bapp-why", e.message || "The server refused the approval."); }
+  };
+}
+function askHold(batchId){
+  const b = findBatch(batchId); if(!b) return;
+  modal("Hold batch " + b.batchId + " for MRB",
+    '<p>No unit enters stock. The batch is passed to the Material Review Board, which ' +
+      'then decides <b>unit by unit</b> what is released and what is rejected.</p>' +
+    '<div class="field"><label class="req" for="hold-note">Reason for the hold</label>' +
+      '<textarea id="hold-note" rows="3" placeholder="What was found, and on which units"></textarea></div>' +
+    whyBox("hold-why"),
+    '<div class="row"><button class="btn btn-danger" id="hold-go">Hold for MRB</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#hold-go").onclick = async () => {
+    const note = ($("#hold-note").value || "").trim();
+    if(!note) return showWhy("hold-why", "A reason is required — it is what the MRB reads first.");
+    const go = $("#hold-go"); go.disabled = true;
+    try{
+      const heldBatch = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/hold", { note });
+      logAction("QA held batch " + batchId + " for MRB", {
+        locationId: b.locationId, highPriority:true,
+        stateChanges: (b.units || []).length + " unit(s) held · batch " + batchId,
+        comments: note
+      });
+      notify("Batch " + batchId + " was held for MRB: " + note,
+             ["ADMIN","QA","MANAGER"], [], b.locationId);
+      await refreshBatches(heldBatch);
+      closeModal(); renderNav(); render();
+      toast("Batch held for MRB.", "bad");
+    }catch(e){ go.disabled = false; showWhy("hold-why", e.message || "The server refused the hold."); }
+  };
+}
+function confirmDispose(batchId){
+  const b = findBatch(batchId); if(!b) return;
+  const decisions = (MRB && MRB.batchId === batchId) ? MRB.decisions : {};
+  const undecided = (b.units || []).filter(u => !decisions[String(u.sn || "").toUpperCase()]);
+  if(undecided.length){
+    return showWhy("mrb-why-" + batchId,
+      undecided.length + " unit(s) still need a decision: " +
+      undecided.map(u => u.sn).join(", "));
+  }
+  const rel = (b.units || []).filter(u => decisions[String(u.sn || "").toUpperCase()] === "RELEASED");
+  const rej = (b.units || []).filter(u => decisions[String(u.sn || "").toUpperCase()] === "REJECTED");
+  modal("Confirm MRB disposition — " + b.batchId,
+    '<p>This closes the batch. It cannot be revisited afterwards.</p>' +
+    '<div class="grid g2">' +
+      '<div class="kv"><b>Released into stock</b> ' + rel.length + '</div>' +
+      '<div class="kv"><b>Rejected</b> ' + rej.length + '</div>' +
+    '</div>' +
+    (rel.length ? '<div class="okbox" style="margin-top:8px"><b>Released:</b> ' +
+      esc(rel.map(u => u.sn).join(", ")) + '</div>' : '') +
+    (rej.length ? '<div class="warn" style="margin-top:8px"><b>Rejected — these never become stock:</b> ' +
+      esc(rej.map(u => u.sn).join(", ")) + '</div>' : '') +
+    '<div class="field" style="margin-top:8px"><label for="mrb-note">MRB note (optional)</label>' +
+      '<textarea id="mrb-note" rows="2" placeholder="Board reference, decision summary"></textarea></div>' +
+    whyBox("mrb-why"),
+    '<div class="row"><button class="btn btn-primary" id="mrb-go">Confirm disposition</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#mrb-go").onclick = async () => {
+    const go = $("#mrb-go"); go.disabled = true;
+    try{
+      const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/dispose",
+        { decisions, note: ($("#mrb-note").value || "").trim() });
+      logAction("MRB disposition on batch " + batchId + " — " + out.released +
+                " released, " + out.rejected + " rejected", {
+        locationId: b.locationId, highPriority:true,
+        stateChanges: out.released + " unit(s) added as In WH · batch " + batchId,
+        comments: "Released: " + (rel.map(u => u.sn).join(", ") || "none") +
+                  " | Rejected: " + (rej.map(u => u.sn).join(", ") || "none")
+      });
+      try{ S.db.devices = (await loadRemoteStore()).devices; }catch(_){}
+      if(out.result && Array.isArray(out.result.devices)){
+        for(const nd of out.result.devices){
+          const i = S.db.devices.findIndex(x => x.id === nd.id);
+          if(i >= 0) S.db.devices[i] = nd; else S.db.devices.push(nd);
+        }
+      }
+      MRB = null;
+      await refreshBatches(out.batch);
+      closeModal(); renderNav(); render();
+      toast(out.released + " released, " + out.rejected + " rejected.", out.rejected ? "bad" : "good");
+    }catch(e){ go.disabled = false; showWhy("mrb-why", e.message || "The server refused the disposition."); }
+  };
+}
+
+/* ============================================ ELIGIBLE — IN CONTROL =========
+   Patients allocated to the control arm. They were evaluated in full and are eligible;
+   they simply receive no device, so they leave the screening and scheduling lists.
+   This screen exists so that "left the list" never means "lost". Read-only: the way
+   back is to change the allocation at stage 8, which is where it was decided. */
+VIEWS.control = {
+  title:"Eligible — in control",
+  sub:"Patients allocated to the control group. Their record is kept in full; no product is ordered and no procedure is scheduled.",
+  body(){
+    const list = controlPatients();
+    if(!list.length){
+      return '<div class="empty">No patients in the control group yet. ' +
+        'The allocation is made at stage 8, Eligibility &amp; Approvals.</div>';
+    }
+    return '<div class="card"><div class="card-hd"><h2>Control group</h2>' +
+      '<span class="pill p-grey">' + list.length + '</span></div><div class="card-bd">' +
+      '<div class="tbl-wrap"><table><thead><tr>' +
+        '<th>Code</th><th>Site</th><th>Allocated</th><th>Decided by</th>' +
+        '<th>Evaluation</th><th>Notes</th></tr></thead><tbody>' +
+      list.map(p => {
+        const a = (p.anat && p.anat.approvals) || {};
+        const open = anatIncomplete(p).length;
+        return '<tr><td><b>' + esc(p.patientCode) + '</b></td>' +
+          '<td>' + esc(locName(p.siteId)) + '</td>' +
+          '<td>' + esc(fmtDate(a.completionDate) || "—") + '</td>' +
+          '<td>' + esc(a.completedBy || "—") + '</td>' +
+          '<td>' + (open ? '<span class="pill p-orange">' + open + ' open</span>'
+                         : '<span class="pill p-green">complete</span>') + '</td>' +
+          '<td>' + esc(p.notes || "") + '</td></tr>';
+      }).join("") +
+      '</tbody></table></div>' +
+      '<div class="hint" style="margin-top:8px">To move somebody back into the study, change ' +
+      'the allocation at stage 8 — the same place it was decided.</div>' +
+      '</div></div>';
+  }
+};
+
 VIEWS.sitereport = {
-  title:"Site Product Report",
+  title:"Site Accountability Log",
   sub:"Units received at a site between two dates — who received each, and any found compromised. Export to Excel (CSV) or PDF.",
   body(){
     srDefaults();
@@ -15729,7 +17547,7 @@ VIEWS.sitereport = {
 function siteReportCSV(){
   const rows = siteReportRows(SR.siteId, SR.from, SR.to);
   const out = [
-    ["Site product report"],
+    ["Site accountability log"],
     ["Site", locName(SR.siteId)],
     ["From", SR.from], ["To", SR.to],
     ["Generated", fmtTs(nowISO())], ["By", (S.me && S.me.name) || ""],
@@ -15737,7 +17555,7 @@ function siteReportCSV(){
     ["Date received", "Product", "REF", "Received by", "Condition", "Details"]
   ].concat(rows.map(r => [fmtTs(r.ts), r.product, r.ref, r.receivedBy,
     r.compromised ? "COMPROMISED" : "OK", r.detail]));
-  downloadTextFile("site_report_" + slugify(locName(SR.siteId)) + "_" + SR.from + "_to_" + SR.to + ".csv",
+  downloadTextFile("site_accountability_log_" + slugify(locName(SR.siteId)) + "_" + SR.from + "_to_" + SR.to + ".csv",
     toCSV(out), "text/csv;charset=utf-8");
   toast("CSV exported.", "good");
 }
@@ -15762,7 +17580,7 @@ function siteReportPDF(){
           '<td>' + esc(r.detail) + '</td></tr>').join("") +
         '</tbody></table>'
       : '<div class="pr-empty">No units were received in this period.</div>');
-  printHtml(printDoc("Site Product Report — " + locName(SR.siteId), body));
+  printHtml(printDoc("Site Accountability Log — " + locName(SR.siteId), body));
 }
 
 /* ============================================ CASE-FILE PDF (feature 2) === */
@@ -15825,7 +17643,7 @@ function caseFilePdfBody(p, imgMap){
     ["Procedure date", fmtDate(p.procedureDate)],
     ["Unica size", p.unicaSize], ["Delivery System size", p.dsSize],
     ["Submitted", p.submitted ? "Yes" : "No"],
-    ["Case file locked", p.fileLocked ? "Yes" : "No"]
+    ["Procedure report locked", p.fileLocked ? "Yes" : "No"]
   ]);
   if(p.piNotes) h += '<h3>To discuss with the PI</h3><div>' + esc(p.piNotes) + '</div>';
   if(p.notes)   h += '<h3>Notes</h3><div>' + esc(p.notes) + '</div>';
@@ -15842,21 +17660,62 @@ function caseFilePdfBody(p, imgMap){
   if(p.customQuestions && p.customQuestions.length){
     h += '<h3>Custom clinical questions</h3>' + prKv(p.customQuestions.map(q => [q.q, q.a]));
   }
-  h += '<h3>Device verification</h3>' + prChecklist(DEVICE_CONFIRMS, c.confirms);
+  /* Device verification prints per unit. A report written before verification became
+     per-unit has no devChecks and its single old checklist is printed instead, so an
+     older locked record still reads exactly as it was signed. */
+  h += '<h3>Device verification</h3>';
+  const units = Array.isArray(c.devChecks) ? c.devChecks : [];
+  if(units.length){
+    for(const u of units){
+      h += '<h4>' + esc((u.productType || "") + " " + (u.size || "")) +
+           ' — ' + esc(u.sn || "") + (u.handEntered ? " (hand-entered)" : "") + '</h4>' +
+           prKv([["REF", u.ref]]) +
+           prChecklist(DEVICE_CHECKS, u.ok) +
+           (u.note ? prKv([["Notes", u.note]]) : "");
+    }
+    h += '<h4>For the room</h4>' + prChecklist(ROOM_CHECKS, c.roomChecks);
+  }else{
+    h += prChecklist(DEVICE_CONFIRMS, c.confirms);
+  }
 
+  /* The PDF prints the log in the order it is recorded on screen. If the two ever
+     disagree, the document stops being a faithful account of the procedure - which is
+     the only thing it is for. */
   h += '<h2>Stage 3 — Real-time clinical event logger</h2>' + prKv([
     ["Introducer insertion time", c.introducerTime], ["— notes", c.introducerTimeNote],
     ["ACT >250s achieved", c.actTime], ["— notes", c.actTimeNote],
     ["IVC pressure PRE", prPressure(c, "ivcPre")], ["— notes", c.ivcPreNote],
-    ["DS insertion", c.dsIn], ["— notes", c.dsInNote],
+    ["DS insertion", c.dsIn], ["— notes", c.dsInNote]
+  ]);
+
+  /* Contrast: the road map is built once the delivery system is in, so it prints here,
+     between DS insertion and what follows it. A locked report written before the split
+     still holds the single old volume, and migrateContrast leaves locked records alone,
+     so fall back to the old keys rather than printing nothing. */
+  h += '<h3>Road map definition &amp; contrast</h3>';
+  const anyInjection = CONTRAST_ROWS.some(i => c["contrast" + i + "Vol"] || c["contrast" + i + "Form"]);
+  if(anyInjection){
+    h += prKv(CONTRAST_ROWS.flatMap(i => [
+      ["Injection " + i + " — volume (mL)", c["contrast" + i + "Vol"]],
+      ["Injection " + i + " — form", c["contrast" + i + "Form"]],
+      ["Injection " + i + " — notes", c["contrast" + i + "Note"]]
+    ]).concat([["Total contrast volume (mL)", fmtContrast(contrastTotal(c))]]));
+  } else {
+    h += prKv([
+      ["Total contrast volume (mL)", c.contrast], ["Contrast form", c.contrastForm],
+      ["Contrast notes", c.contrastNote]
+    ]);
+  }
+  /* ...and the rest of the log continues from there. */
+  h += prKv([
     ["IVC pressure PRE (additional)", prPressure(c, "ivcPre2")], ["— notes", c.ivcPre2Note],
     ["Deployment initiation", c.deployStart], ["— notes", c.deployStartNote],
     ["Deployment end", c.deployEnd], ["— notes", c.deployEndNote],
-    ["IVC pressure POST", prPressure(c, "ivcPost")], ["— notes", c.ivcPostNote],
+    /* Same order as the screen: the DS comes out, then the POST pressure is taken. */
     ["DS extraction", c.dsOut], ["— notes", c.dsOutNote],
+    ["IVC pressure POST", prPressure(c, "ivcPost")], ["— notes", c.ivcPostNote],
     ["Deployment duration (computed)", dep], ["Skin to skin (computed)", sts],
     ["Closing method", c.closingMethod], ["Closing time", c.closingTime], ["Closing notes", c.closingNote],
-    ["Total contrast volume (mL)", c.contrast], ["Contrast form", c.contrastForm], ["Contrast notes", c.contrastNote],
     ["Echo parameter collection", c.echoParams]
   ]);
   h += prImageGroup(p, "ivcPre", "IVC pressure PRE", imgMap);
@@ -15884,10 +17743,10 @@ async function exportCaseFilePDF(p){
     const imgMap = {};
     await Promise.all(imgs.map(async im => { imgMap[im.id] = await fetchImageDataUrl(im); }));
     const missing = imgs.filter(im => !imgMap[im.id]).length;
-    printHtml(printDoc("Case File — " + (p.patientCode || "patient"), caseFilePdfBody(p, imgMap)));
+    printHtml(printDoc("Procedure Report — " + (p.patientCode || "patient"), caseFilePdfBody(p, imgMap)));
     if(missing) toast(missing + " image(s) could not be loaded; they are marked in the PDF.", "bad");
   }catch(e){
-    toast("Could not prepare the case-file PDF.", "bad");
+    toast("Could not prepare the procedure-report PDF.", "bad");
   }finally{
     if(btn){ btn.disabled = false; btn.textContent = label; }
   }
@@ -15953,13 +17812,13 @@ VIEWS.patients = {
   sub:"Register a patient and set up what the team needs at the table: sizing, " +
       "medical questions, reminders and notes for the PI.",
   body(){
-    const list = S.db.patients.filter(p => inScope(p.siteId));
+    const list = activePatients().filter(p => inScope(p.siteId));
     return '<div class="row" style="margin-bottom:12px">' +
         (can("managePatients") ? '<button class="btn btn-primary" id="pt-new">Register a patient</button>' : "") +
       '</div>' +
       (!list.length ? '<div class="empty">No patients in your scope.</div>' :
       '<div class="tbl-wrap"><table><thead><tr><th>Code</th><th>Site</th><th>Procedure date</th>' +
-        '<th>Unica</th><th>DS</th><th>Time to/from procedure</th><th>Status</th><th>Case file</th><th></th>' +
+        '<th>Unica</th><th>DS</th><th>Time to/from procedure</th><th>Status</th><th>With</th><th>Procedure report</th><th></th>' +
         '</tr></thead><tbody>' +
       list.map(p => '<tr>' + patientRowCells(p) +
         '<td class="row" style="gap:5px">' +
@@ -15979,7 +17838,7 @@ VIEWS.patients = {
     $$("[data-edit]").forEach(b => b.onclick = () => patientForm(patient(b.dataset.edit)));
     $$("[data-del]").forEach(b => b.onclick = () => {
       const p = patient(b.dataset.del);
-      modal("Delete patient", '<p>Delete <b>' + esc(p.patientCode) + '</b> and its case file? ' +
+      modal("Delete patient", '<p>Delete <b>' + esc(p.patientCode) + '</b> and its procedure report? ' +
         'This cannot be undone.</p>',
         '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
         '<button class="btn btn-danger" id="d-go">Delete</button></div>');
@@ -16018,7 +17877,7 @@ function questionsBlock(){
   return '<h3 style="margin:4px 0 7px">Medical questions for this patient</h3>' +
     '<div class="hint" style="margin-bottom:8px">Free-form and specific to this patient. ' +
     'Enter the answer / information now if it is known — the question and its answer are ' +
-    'carried into stage 2 of the case file and the briefing panel, and stay editable there.</div>' +
+    'carried into stage 2 of the procedure report and the briefing panel, and stay editable there.</div>' +
     (PFQ.length
       ? PFQ.map((q,i) => '<div class="row" style="gap:6px;margin-bottom:6px;flex-wrap:nowrap">' +
           '<input type="text" data-q="' + i + '" value="' + esc(q.q) + '" placeholder="question" style="flex:1">' +
@@ -16073,7 +17932,7 @@ function patientFormRender(p, isNew){
     '<div class="field"><label for="p-notes">Notes</label><textarea id="p-notes">' + esc(p.notes || "") + '</textarea></div>' +
     '<div class="field"><label for="p-pi">To discuss with the PI</label>' +
       '<textarea id="p-pi">' + esc(p.piNotes || "") + '</textarea>' +
-      '<div class="hint">Shown prominently in the briefing before the case file opens.</div></div>' +
+      '<div class="hint">Shown prominently in the briefing before the procedure report opens.</div></div>' +
     screeningChecksBlock(p) + questionsBlock() + remindersBlock(),
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn btn-primary" id="p-save">' + (isNew ? "Register" : "Save") + '</button>' +
@@ -16527,6 +18386,16 @@ async function removeLoc(l){
   logAction("Removed location " + l.name, { highPriority:true });
   commit(); render();
 }
+
+/* Fill the shared angle picker once, rather than emitting ninety-one <option> tags
+   into every angle field on every render. */
+(function(){
+  const dl = document.getElementById("angle-0-90");
+  if(!dl) return;
+  let h = "";
+  for(let d = 0; d <= 90; d++) h += '<option value="' + d + '">';
+  dl.innerHTML = h;
+})();
 
 boot();
 </script>
