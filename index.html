@@ -183,8 +183,10 @@ textarea{min-height:70px; resize:vertical;}
 /* g5 added 12 Sep 2026 for the Stock Overview tile row, when "Packed to go" became a
    fifth population that had to be counted out of usable stock rather than hidden in it. */
 .g5{grid-template-columns:repeat(5,minmax(0,1fr));}
-@media(max-width:1200px){.g5{grid-template-columns:repeat(2,minmax(0,1fr));}}
-@media(max-width:900px){.g2,.g3,.g4,.g5{grid-template-columns:1fr;}}
+/* g6 (4 Oct 2026): the sixth Stock Overview tile, In rework. */
+.g6{grid-template-columns:repeat(6,minmax(0,1fr));}
+@media(max-width:1200px){.g5{grid-template-columns:repeat(2,minmax(0,1fr));} .g6{grid-template-columns:repeat(3,minmax(0,1fr));}}
+@media(max-width:900px){.g2,.g3,.g4,.g5,.g6{grid-template-columns:1fr;}}
 .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
 .spread{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
 .spacer{flex:1;}
@@ -11032,7 +11034,13 @@ var SN_PRODUCTS = {
   DS: { productType: "DS",    sizes: { S: "Short", L: "Long" } }
 };
 
-var SN_PATTERN = /^([A-Z]{2})-([A-Z]{1,2})-(\d{6})-(\d{4})$/;
+/* "-R" at the end (4 Oct 2026, the owner): a unit that went through REWORK carries it after its
+   serial - IM-SU-080726-0001-R. Once only: a second rework does not add another. It marks
+   the SAME unit, not a different one, so snKey() below strips it and every lookup by serial
+   compares keys - an old label still finds the reworked unit, and a reworked unit cannot be
+   registered a second time under its old serial. */
+var SN_PATTERN = /^([A-Z]{2})-([A-Z]{1,2})-(\d{6})-(\d{4})(-R)?$/;
+var REWORK_SUFFIX = "-R";
 var ISO_DATE    = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 function QrError(code, message, detail){
@@ -11078,7 +11086,7 @@ function parseSn(raw){
   if(!m){
     throw QrError("BAD_SN",
       "Serial number does not match the expected format " +
-      "IM-{SU|MU|LU|XU}-DDMMYY-0000 or DS-{S|L}-DDMMYY-0000.", sn);
+      "IM-{SU|MU|LU|XU}-DDMMYY-0000 or DS-{S|L}-DDMMYY-0000 (with -R after a rework).", sn);
   }
   var prefix = m[1], sizeCode = m[2], product = SN_PRODUCTS[prefix];
   if(!product){
@@ -11095,8 +11103,30 @@ function parseSn(raw){
     productType: product.productType,
     size: size,
     productionDate: parseSnDate(m[3]),
-    unitNumber: m[4]
+    unitNumber: m[4],
+    reworked: !!m[5],
+    lot: m[1] + "-" + m[2] + "-" + m[3]
   };
+}
+
+/** The serial without its rework marker, upper-cased: what identifies the unit. */
+function snKey(raw){
+  var s = String(raw == null ? "" : raw).trim().toUpperCase();
+  return s.slice(-REWORK_SUFFIX.length) === REWORK_SUFFIX ? s.slice(0, -REWORK_SUFFIX.length) : s;
+}
+function isReworked(raw){
+  return String(raw == null ? "" : raw).trim().toUpperCase().slice(-REWORK_SUFFIX.length) === REWORK_SUFFIX;
+}
+/** The serial a unit carries after rework: "-R" added once, never twice. */
+function withRework(raw){
+  var s = String(raw == null ? "" : raw).trim();
+  return isReworked(s) ? s : s + REWORK_SUFFIX;
+}
+/** The production lot - product, size and production date, IM-SU-080726. Every unit of a
+    lot shares its serial up to the unit number. "" for a serial of any other shape. */
+function lotOf(raw){
+  var m = SN_PATTERN.exec(String(raw == null ? "" : raw).trim().toUpperCase());
+  return m ? m[1] + "-" + m[2] + "-" + m[3] : "";
 }
 
 /* ---- GS1 -----------------------------------------------------------------
@@ -11262,6 +11292,8 @@ function parseDeviceQr(raw, opts){
     expiryDate: expiry,
     productionDate: snInfo.productionDate,
     unitNumber: snInfo.unitNumber,
+    reworked: snInfo.reworked,
+    lot: snInfo.lot,
     expired: expired,
     sizeConfirmedBy: "REF+SN"      // both agreed; recorded for the audit trail
   };
@@ -11276,6 +11308,10 @@ var api = {
   parseDeviceQr: parseDeviceQr,
   parseGs1: parseGs1,
   parseSn: parseSn,
+  snKey: snKey,
+  isReworked: isReworked,
+  withRework: withRework,
+  lotOf: lotOf,
   normaliseRef: normaliseRef,
   requiredDsSize: requiredDsSize,
   REF_MAP: REF_MAP,
@@ -13285,7 +13321,8 @@ const CAPABILITIES = {
      table - so the screens check isExternalUser() beside can("markObsolete"). */
   markObsolete:    ["ADMIN","WH_ADMIN"],
   restoreObsolete: ["ADMIN"],
-  recordPastMove:  ["ADMIN"]   // document a move that already happened; see roleStore.js
+  recordPastMove:  ["ADMIN"],  // document a move that already happened; see roleStore.js
+  manageRework:    ["ADMIN"]   // send a unit or a lot for rework and bring it back; roleStore.js
 };
 /* Every role the signed-in user holds, primary first. A user can carry a second role
    alongside their own - a site employee who also runs a warehouse - and capabilities are
@@ -13411,7 +13448,10 @@ const DEV_STATUS = {
   /* The product must no longer be used - see deviceService.markObsolete, which is the
      authority. Display metadata only: stock:false is what takes it out of every count on
      every screen, and grey rather than red because nothing is wrong with the unit. */
-  OBSOLETE:  { label:"Obsolete",              cls:"p-grey",  stock:false }
+  OBSOLETE:  { label:"Obsolete",              cls:"p-grey",  stock:false },
+  /* Away for rework (4 Oct 2026) - see deviceService.sendForRework. Out of every count of
+     available stock until it comes back to HQ with "-R" on its serial. */
+  REWORK:    { label:"In rework",             cls:"p-orange",stock:false }
 };
 /* The patient workflow. CREATED..TREATED is a forward sequence and is DERIVED from
    the screening record, not typed in - see recomputeWorkflow().
@@ -16076,6 +16116,13 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.53.0", date: "4 October 2026", groups: [
+    { h:"Rework", items:[
+      "An <b>App Admin</b> can now press <b>Send for rework</b> beside a unit in <b>Stock Overview</b>, for that unit alone or for its <b>whole lot</b> — every unit of the same product, size and production date. The unit leaves available stock and shows <b>In rework</b>; a reservation for a patient is released, and the patient’s Clinical PM is alerted.",
+      "Units away for rework are under the new <b>In rework</b> tile. There the button reads <b>Back to stock</b>: the unit returns to stock at <b>HQ</b> with <b>-R</b> added to its serial (for example <b>IM-SU-080726-0001-R</b>), and you are asked whether to raise the product version, and to which version.",
+      "Labels carrying <b>-R</b> are read on every screen that scans a unit. A reworked unit is still found if its old label is scanned, and its old serial cannot be registered again."
+    ] }
+  ] },
   { version: "2.52.0", date: "4 October 2026", groups: [
     { h:"Innoventric Employees see every patient", items:[
       "An <b>Innoventric Employee</b> now sees every patient in the study, at every site — not only the patients at the location they are assigned to. QA and Managers too.",
@@ -19304,10 +19351,10 @@ function treatedPatients(){ return allPatients().filter(p => isPostProcedure(p) 
 function implantedSerials(p, productKey){
   const c = cf(p);
   const known = devChecks(p).concat(
-    (c.replSn && !devChecks(p).some(u => String(u.sn).toUpperCase() === String(c.replSn).toUpperCase()))
+    (c.replSn && !devChecks(p).some(u => sameSn(u.sn, c.replSn)))
       ? [{ sn:c.replSn, productType:(findDeviceByCode(c.replSn) || {}).productType }] : []);
   const typeOf = sn => {
-    const u = known.find(x => String(x.sn).toUpperCase() === String(sn).toUpperCase());
+    const u = known.find(x => sameSn(x.sn, sn));
     return (u && u.productType) || (findDeviceByCode(sn) || {}).productType || "";
   };
   if(Array.isArray(c.consumedUnits) && c.usedConfirmedAt){
@@ -20636,9 +20683,9 @@ function regAddScan(code){
   try{ parsed = window.DeviceQr.parseDeviceQr(code); }
   catch(e){ return toast(e.message || "That does not look like an Innoventric device label.", "bad"); }
   const sn = String(parsed.sn).toUpperCase();
-  if(REG.units.some(u => String(u.sn).toUpperCase() === sn))
+  if(REG.units.some(u => sameSn(u.sn, sn)))
     return toast("That unit (" + parsed.sn + ") is already in this batch.", "warn");
-  if(S.db.devices.some(d => String(d.sn || "").toUpperCase() === sn))
+  if(S.db.devices.some(d => sameSn(d.sn, sn)))
     return toast("A device with serial " + parsed.sn + " already exists in the system.", "bad");
   if(parsed.expired)
     return toast("That label is already past its expiry date — a new unit should not be. Quarantine it.", "bad");
@@ -21001,7 +21048,7 @@ function submitRegister(){
   let created = 0; const errors = [];
   for(const u of units){
     const sn = String(u.sn).toUpperCase();
-    if(S.db.devices.some(d => String(d.sn || "").toUpperCase() === sn)){
+    if(S.db.devices.some(d => sameSn(d.sn, sn))){
       errors.push({ ref:u.ref, sn:u.sn, message:"Duplicate serial." }); continue;
     }
     S.db.devices.push({ id:u.id, ref:u.ref, sn:u.sn, productType:u.productType, size:u.size,
@@ -21020,10 +21067,20 @@ let AR = null;
    match on a unique id would be a way to hit the wrong unit. REF is deliberately NOT
    used as an identity here: many units share a REF, so it can only ever narrow to a
    product and size, never to a device. */
+/* "-R" AFTER A REWORK (4 Oct 2026, the owner). A unit that came back from rework carries "-R"
+   at the end of its serial - IM-SU-080726-0001-R. It is a marker on the SAME unit, so every
+   serial comparison in this page goes through sameSn: a new label and an old one find the
+   same unit, and the old serial cannot be registered again. deviceQr.snKey is the authority. */
+function snKey(sn){
+  return window.DeviceQr ? window.DeviceQr.snKey(sn)
+    : String(sn == null ? "" : sn).trim().toUpperCase().replace(/-R$/, "");
+}
+function sameSn(a, b){ const k = snKey(a); return !!k && k === snKey(b); }
+function lotOf(sn){ return window.DeviceQr ? window.DeviceQr.lotOf(sn) : ""; }
 function findDeviceByCode(code){
   const c = String(code || "").trim().toUpperCase();
   if(!c) return null;
-  return S.db.devices.find(d => String(d.sn).toUpperCase() === c) ||
+  return S.db.devices.find(d => sameSn(d.sn, c)) ||
          S.db.devices.find(d => String(d.id).toUpperCase() === c) || null;
 }
 
@@ -21057,7 +21114,7 @@ function resolveScannedDevice(raw){
        so if GS1 yields one, that is the answer. */
     const g1 = window.DeviceQr.parseGs1(s);
     if(g1 && g1.serial){
-      const hit = S.db.devices.find(d => String(d.sn).toUpperCase() === g1.serial.toUpperCase());
+      const hit = S.db.devices.find(d => sameSn(d.sn, g1.serial));
       if(hit) return { device:hit, parsed:null, gs1:g1, viaLabel:true };
       /* A well-formed GS1 label naming a unit we do not hold is a real answer, not a
          decode failure, and the message has to say which. */
@@ -21068,7 +21125,7 @@ function resolveScannedDevice(raw){
     try{
       const parsed = window.DeviceQr.parseDeviceQr(s);
       return {
-        device: S.db.devices.find(d => String(d.sn).toUpperCase() === parsed.sn) || null,
+        device: S.db.devices.find(d => sameSn(d.sn, parsed.sn)) || null,
         parsed, viaLabel:true
       };
     }catch(e){
@@ -21115,7 +21172,7 @@ function withScanEcho(err, raw){
    Returns { device, parsed } or throws the parser's error. */
 function findDeviceByScan(rawQr){
   const parsed = window.DeviceQr.parseDeviceQr(rawQr);
-  const device = S.db.devices.find(d => String(d.sn).toUpperCase() === parsed.sn);
+  const device = S.db.devices.find(d => sameSn(d.sn, parsed.sn));
   return { device: device || null, parsed };
 }
 
@@ -21828,7 +21885,10 @@ function ptAddDeviceUnit(code, manual){
   else if(/\s/.test(raw.trim()) && window.DeviceQr){
     try{
       const parsed = window.DeviceQr.parseDeviceQr(raw);
-      unit = { ref:parsed.ref, sn:parsed.sn, productType:parsed.productType, size:parsed.size };
+      /* The unit's serial as the system holds it: an old label on a reworked unit still
+         reads without its "-R", and the report must name the unit by its current serial. */
+      const held = findDeviceByCode(parsed.sn);
+      unit = { ref:parsed.ref, sn:held ? held.sn : parsed.sn, productType:parsed.productType, size:parsed.size };
     }catch(e){ return toast(e.message || "That does not look like a device label.", "bad"); }
   }else{
     const hit = findDeviceByCode(raw);
@@ -21836,7 +21896,7 @@ function ptAddDeviceUnit(code, manual){
     unit = { ref:hit.ref, sn:hit.sn, productType:hit.productType, size:hit.size };
   }
   const list = devChecks(p);
-  if(list.some(u => String(u.sn).toUpperCase() === String(unit.sn).toUpperCase())){
+  if(list.some(u => sameSn(u.sn, unit.sn))){
     return toast("That unit is already on the list.", "bad");
   }
   unit.ok = DEVICE_CHECKS.map(() => false);
@@ -21974,7 +22034,7 @@ function usedCandidates(p){
   const c = cf(p);
   const out = devChecks(p).map(u => ({ sn:u.sn, ref:u.ref, productType:u.productType,
                                        size:u.size, source:"TABLE", verified:devUnitDone(u) }));
-  if(c.replSn && !out.some(u => String(u.sn).toUpperCase() === String(c.replSn).toUpperCase())){
+  if(c.replSn && !out.some(u => sameSn(u.sn, c.replSn))){
     const d = findDeviceByCode(c.replSn);
     out.push({ sn:c.replSn, ref:d ? d.ref : "", productType:d ? d.productType : "",
                size:d ? d.size : "", source:"REPLACEMENT", verified:true });
@@ -22044,7 +22104,7 @@ async function confirmUsedProducts(p){
   const c = cf(p);
   const want = usedSet(p).filter(Boolean);
   const done = Array.isArray(c.consumedUnits) ? c.consumedUnits.slice() : [];
-  const eq = (a, b) => String(a).toUpperCase() === String(b).toUpperCase();
+  const eq = (a, b) => sameSn(a, b);
   const failSn = c.failSn || "";
 
   const toConsume = want.filter(sn => !done.some(x => eq(x, sn)));
@@ -22102,7 +22162,7 @@ async function confirmUsedProducts(p){
    is one un-tick out of date. */
 function usedPending(p){
   const c = cf(p);
-  const eq = (a, b) => String(a).toUpperCase() === String(b).toUpperCase();
+  const eq = (a, b) => sameSn(a, b);
   const want = usedSet(p), done = Array.isArray(c.consumedUnits) ? c.consumedUnits : [];
   const diff = want.filter(sn => !done.some(x => eq(x, sn))).length +
                done.filter(sn => !want.some(x => eq(x, sn))).length;
@@ -22113,7 +22173,7 @@ function usedProductsBlock(p){
   const c = cf(p);
   const cand = usedCandidates(p);
   const want = usedSet(p);
-  const on = sn => want.some(x => String(x).toUpperCase() === String(sn).toUpperCase());
+  const on = sn => want.some(x => sameSn(x, sn));
   const pending = usedPending(p);
 
   let h = '<h3 style="margin:16px 0 4px">Products used in this procedure</h3>' +
@@ -22245,7 +22305,7 @@ function deviceFifoCard(p){
     }
     /* Has a unit of this type already been put on the table, and is it the one? */
     const here = onTable.filter(u => u.productType === x.productType);
-    const took = here.find(u => String(u.sn).toUpperCase() === String(x.pick.sn).toUpperCase());
+    const took = here.find(u => sameSn(u.sn, x.pick.sn));
     const other = here.length && !took ? here[0] : null;
     return '<div style="margin:4px 0">· <b>' + esc(x.label) + '</b> — use ' +
       '<span class="mono"><b>' + esc(x.pick.sn) + '</b></span> ' +
@@ -22296,7 +22356,7 @@ function devicePickerCard(p){
       'it in their hand.</div>' +
     picks.map(x => {
       const opts = x.pool.filter(d =>
-        !onTable.some(u => String(u.sn).toUpperCase() === String(d.sn).toUpperCase()));
+        !onTable.some(u => sameSn(u.sn, d.sn)));
       if(!opts.length){
         return '<div class="hint" style="margin:6px 0">' + esc(x.label) +
           ' — every usable unit is already on the table.</div>';
@@ -22331,7 +22391,7 @@ function ptPickDeviceUnit(productType){
   const d = sel && device(sel.value);
   if(!d) return toast("That unit could not be found.", "bad");
   const list = devChecks(p);
-  if(list.some(u => String(u.sn).toUpperCase() === String(d.sn).toUpperCase())){
+  if(list.some(u => sameSn(u.sn, d.sn))){
     return toast("That unit is already on the list.", "bad");
   }
   list.push({
@@ -25306,7 +25366,7 @@ VIEWS.clinical = {
            tick like any other, and confirming is still what consumes it. */
         const cc = cf(p);
         const list = Array.isArray(cc.usedUnits) ? cc.usedUnits.slice() : usedSet(p);
-        if(!list.some(x => String(x).toUpperCase() === String(d.sn).toUpperCase())) list.push(d.sn);
+        if(!list.some(x => sameSn(x, d.sn))) list.push(d.sn);
         cc.usedUnits = list;
         noteUnitPresent(p, d.sn);            // a replacement used here was here
         logAction("Replacement device " + d.ref + " · " + d.sn + " recorded for " + p.patientCode, {
@@ -26229,7 +26289,7 @@ function shipCounts(){
    and that in turn is what the server will accept. Two orderings would mean a line shown
    as correct being refused on send. */
 function serialRank(sn){
-  const m = /-([0-9]+)[ ]*$/.exec(String(sn || ""));
+  const m = /-([0-9]+)(?:-R)?[ ]*$/i.exec(String(sn || ""));   // "-R" is a rework marker, not the number
   return m ? parseInt(m[1], 10) : null;
 }
 function fifoCompare(a, b){
@@ -26866,11 +26926,11 @@ SCANFIELDS["sh-scan"] = {
       return showWhy("sh-why", "You have already scanned all " + req[parsed.productType] + " " +
         productTypeLabel(parsed.productType) + " unit(s). Remove one to swap it.");
     }
-    if(SH.lines.some(l => l.sn === parsed.sn)){
+    if(SH.lines.some(l => sameSn(l.sn, parsed.sn))){
       render();
       return showWhy("sh-why", "That unit is already scanned.");
     }
-    const known = S.db.devices.find(d => String(d.sn).toUpperCase() === parsed.sn);
+    const known = S.db.devices.find(d => sameSn(d.sn, parsed.sn));
     SH.lines.push({
       sn: parsed.sn, ref: parsed.ref,
       size: parsed.size, productType: parsed.productType,
@@ -26929,7 +26989,7 @@ function addPickedUnit(productType){
     return showWhy("sh-why", "You have already added all " + (req[productType] || 0) + " " +
       productTypeLabel(productType) + " unit(s). Remove one to swap it.");
   }
-  if(SH.lines.some(l => l.deviceId === d.id || l.sn === d.sn)){
+  if(SH.lines.some(l => l.deviceId === d.id || sameSn(l.sn, d.sn))){
     render(); return showWhy("sh-why", "That unit is already on this shipment.");
   }
   SH.lines.push({
@@ -29534,6 +29594,184 @@ document.addEventListener("click", e => {
   else askRestoreObsolete(t.dataset.unobsolete);
 });
 
+/* REWORK (4 Oct 2026, the owner). An App Admin sends a unit - or its whole lot - out of available
+   stock for rework; the button then reads "Back to stock", which brings it to HQ with "-R"
+   added to its serial and asks whether the product version was raised, and to what.
+
+   A LOT is product + size + production date: the serial up to the unit number
+   (IM-SU-080726). Sending the whole lot is an option in the dialog, never the default, and
+   it is done one unit at a time against the same route, so every serial has its own audit
+   line and one refusal (a packed unit, say) does not stop the rest - it is reported by name.
+   Only units that CAN go are offered: stock, and not packed into a shipment. */
+function reworkLot(d, pick){
+  const lot = lotOf(d.sn);
+  if(!lot) return [d];
+  return S.db.devices.filter(x => lotOf(x.sn) === lot && pick(x));
+}
+function reworkSendable(x){
+  return !!(DEV_STATUS[x.status] && DEV_STATUS[x.status].stock) && !committedUnitIds().has(x.id);
+}
+function reworkScopeHtml(name, d, lotUnits, verb){
+  const lot = lotOf(d.sn);
+  const others = lotUnits.filter(x => x.id !== d.id);
+  if(!lot || !others.length) return "";
+  return '<div class="field"><label>Which units?</label>' +
+    '<label class="row" style="margin:2px 0"><input type="radio" name="' + name + '" value="one" checked> ' +
+      'This unit only — <span class="mono">' + esc(d.sn) + '</span></label>' +
+    '<label class="row" style="margin:2px 0"><input type="radio" name="' + name + '" value="lot"> ' +
+      'The whole lot <span class="mono">' + esc(lot) + '</span> — ' + lotUnits.length + ' units ' + esc(verb) + '</label>' +
+    '<div class="hint" style="margin:4px 0 0 22px">' + lotUnits.map(x => '<span class="mono">' + esc(x.sn) + '</span>' +
+      ' <span class="hint">(' + esc(locName(x.locationId)) + (x.allocatedTo ? ', reserved for ' + esc(reservedForCode(x)) : '') + ')</span>').join("<br>") +
+    '</div></div>';
+}
+function reworkChosen(name, d, lotUnits){
+  const r = document.querySelector('input[name="' + name + '"]:checked');
+  return r && r.value === "lot" ? lotUnits : [d];
+}
+/* Run one route over several units in turn. Never stops at the first refusal. */
+async function reworkEach(units, path, body){
+  const done = [], failed = [];
+  for(const u of units){
+    try{
+      const out = await api("POST", "/api/devices/" + encodeURIComponent(u.id) + path, body);
+      const i = S.db.devices.findIndex(x => x.id === u.id);
+      if(i >= 0 && out.device) S.db.devices[i] = out.device;
+      if(out.audit) S.db.logs.unshift(out.audit);
+      done.push(Object.assign({ unit:u }, out));
+    }catch(e){ failed.push({ unit:u, message:e.message || "refused" }); }
+  }
+  commit();
+  return { done, failed };
+}
+function reworkReport(done, failed, what){
+  const lostLog = done.filter(o => o.auditFailed).length;
+  const released = done.filter(o => o.releasedFromCode).map(o => o.releasedFromCode);
+  if(failed.length){
+    toast(done.length + " " + what + ". Not done: " +
+      failed.map(f => f.unit.sn + " — " + f.message).join("; "), "bad");
+  }else if(lostLog){
+    toast(done.length + " " + what + ", but " + lostLog + " log line(s) could not be written. Record it by hand.", "bad");
+  }else{
+    toast(done.length + " " + what + "." + (released.length ? " Reservation released for " +
+      released.join(", ") + "." : ""), "good");
+  }
+}
+function askSendRework(deviceId){
+  const d = S.db.devices.find(x => x.id === deviceId);
+  if(!d) return;
+  const lotUnits = reworkLot(d, reworkSendable);
+  const held = lotUnits.concat([d]).some(x => x.allocatedTo);
+  modal("Send for rework",
+    '<p>Unit <b class="mono">' + esc(d.sn || d.id) + '</b> (' +
+      esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + ') at <b>' +
+      esc(locName(d.locationId)) + '</b> will be marked <b>In rework</b>.</p>' +
+    reworkScopeHtml("rw-scope", d, lotUnits, "in stock") +
+    '<div class="warn" style="margin:8px 0">It leaves available stock at once: it will not be offered for shipping or picked by FIFO. When it comes back, press <b>Back to stock</b> — it returns to HQ with <b>-R</b> added to its serial.</div>' +
+    (held ? '<div class="warn" style="margin:8px 0"><b>A unit here is reserved for a patient.</b> That reservation will be released and the patient will need another unit. A high-priority line goes into the log and an alert goes to the Clinical PMs and App Admins.</div>' : '') +
+    '<div class="field"><label class="req" for="rw-why">Why is it being reworked?</label>' +
+      '<input type="text" id="rw-why" maxlength="400" placeholder="e.g. label correction per ECO-120"></div>' +
+    whyBox("rw-why-box"),
+    '<div class="row"><button class="btn btn-primary" id="rw-go">Send for rework</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  const go = $("#rw-go");
+  go.onclick = async () => {
+    const reason = ($("#rw-why").value || "").trim();
+    if(reason.length < 3) return showWhy("rw-why-box", "A reason is required — why is it being reworked?");
+    clearWhy("rw-why-box"); go.disabled = true;
+    const units = reworkChosen("rw-scope", d, lotUnits);
+    if(S.backend){
+      const { done, failed } = await reworkEach(units, "/rework", { reason });
+      closeModal(); render();
+      reworkReport(done, failed, done.length === 1 ? "unit sent for rework" : "units sent for rework");
+      return;
+    }
+    /* Standalone: mirror deviceService.sendForRework. */
+    for(const u of units){
+      const code = u.allocatedTo ? reservedForCode(u) : "";
+      const from = locName(u.locationId);
+      u.status = "REWORK"; u.allocatedTo = ""; u.allocatedAt = "";
+      logAction("Sent " + u.sn + " for REWORK from " + from, { locationId:u.locationId, highPriority:true,
+        stateChanges:"Stock → In rework" + (code ? " · reservation for " + code + " released" : ""),
+        comments:"Reason: " + reason + (code ? " | THE UNIT WAS RESERVED FOR " + code +
+          " — that reservation is released and the patient needs another unit." : "") });
+    }
+    commit(); closeModal(); render();
+    toast(units.length + (units.length === 1 ? " unit" : " units") + " sent for rework.", "good");
+  };
+}
+function askReturnRework(deviceId){
+  const d = S.db.devices.find(x => x.id === deviceId);
+  if(!d) return;
+  const lotUnits = reworkLot(d, x => x.status === "REWORK");
+  const hqs = S.db.locations.filter(l => l.type === "HQ");
+  const today = todayISO();
+  const versions = Array.from(new Set(lotUnits.concat([d]).map(x => x.version || ""))).filter(Boolean);
+  modal("Back to stock",
+    '<p>Unit <b class="mono">' + esc(d.sn) + '</b> comes back from rework as <b class="mono">' +
+      esc(window.DeviceQr ? window.DeviceQr.withRework(d.sn) : d.sn + "-R") + '</b>, in stock at HQ.</p>' +
+    reworkScopeHtml("rwb-scope", d, lotUnits, "in rework") +
+    (hqs.length > 1
+      ? '<div class="field"><label class="req" for="rwb-hq">Into stock at</label><select id="rwb-hq">' +
+          hqs.map(l => '<option value="' + esc(l.id) + '">' + esc(l.name) + '</option>').join("") + '</select></div>'
+      : hqs.length ? '<p class="hint">Into stock at <b>' + esc(hqs[0].name) + '</b>.</p>'
+      : '<div class="warn">There is no HQ location, so the unit has nowhere to come back to.</div>') +
+    (lotUnits.concat([d]).some(x => x.expiration && x.expiration < today)
+      ? '<div class="warn" style="margin:8px 0"><b>An expiry date has passed.</b> Such a unit comes back as <b>expired</b>, not as usable stock.</div>' : '') +
+    '<div class="field"><label>Raise the product version?</label>' +
+      '<label class="row" style="margin:2px 0"><input type="radio" name="rwb-ver" value="keep" checked> No — keep ' +
+        (versions.length ? 'version <b>' + esc(versions.join(", ")) + '</b>' : 'the current version (none recorded)') + '</label>' +
+      '<label class="row" style="margin:2px 0"><input type="radio" name="rwb-ver" value="new"> Yes, to version</label>' +
+      '<input type="text" id="rwb-new" maxlength="100" placeholder="e.g. Rev C" disabled style="margin-left:22px;max-width:260px">' +
+    '</div>' +
+    whyBox("rwb-why-box"),
+    '<div class="row"><button class="btn btn-primary" id="rwb-go"' + (hqs.length ? '' : ' disabled') + '>Back to stock</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $$('input[name="rwb-ver"]').forEach(r => r.onchange = () => {
+    const on = ($('input[name="rwb-ver"]:checked') || {}).value === "new";
+    $("#rwb-new").disabled = !on; if(on) $("#rwb-new").focus();
+  });
+  const go = $("#rwb-go");
+  go.onclick = async () => {
+    const raise = ($('input[name="rwb-ver"]:checked') || {}).value === "new";
+    const version = raise ? ($("#rwb-new").value || "").trim() : "";
+    if(raise && !version) return showWhy("rwb-why-box", "Type the new version, or choose No.");
+    clearWhy("rwb-why-box"); go.disabled = true;
+    const hqId = hqs.length > 1 ? $("#rwb-hq").value : (hqs[0] || {}).id;
+    const units = reworkChosen("rwb-scope", d, lotUnits);
+    if(S.backend){
+      const { done, failed } = await reworkEach(units, "/rework-return", { version, hqId });
+      closeModal(); render();
+      const exp = done.filter(o => o.expired).length;
+      reworkReport(done, failed, (done.length === 1 ? "unit back in stock" : "units back in stock") +
+        (exp ? " (" + exp + " expired)" : ""));
+      return;
+    }
+    /* Standalone: mirror deviceService.returnFromRework. */
+    const hq = loc(hqId) || {};
+    for(const u of units){
+      const oldSn = u.sn, oldVer = u.version || "";
+      u.status = u.expiration && u.expiration < today ? "EXPIRED" : "IN_WH";
+      u.locationId = hqId; u.sn = window.DeviceQr ? window.DeviceQr.withRework(u.sn) : u.sn;
+      if(version) u.version = version;
+      u.destinationId = null; u.masterPackId = null; u.shippedFromId = null; u.shippedAt = null; u.shippedBy = null;
+      u.receivedVia = "REWORK"; u.receivedAt = nowISO(); u.receivedBy = (S.me && S.me.email) || null;
+      logAction("Back from REWORK: " + oldSn + " is now " + u.sn + ", in stock at " + (hq.name || hqId),
+        { locationId:hqId, highPriority:true,
+          stateChanges:"In rework → " + u.status + " · serial " + oldSn + " → " + u.sn +
+            (version && version !== oldVer ? " · version " + (oldVer || "not set") + " → " + version : ""),
+          comments: version && version !== oldVer ? "Product version raised to " + version + "." : "Product version unchanged." });
+    }
+    commit(); closeModal(); render();
+    toast(units.length + (units.length === 1 ? " unit" : " units") + " back in stock.", "good");
+  };
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-rework],[data-unrework]");
+  if(!t) return;
+  if(t.dataset.rework) askSendRework(t.dataset.rework);
+  else askReturnRework(t.dataset.unrework);
+});
+
 /* ====================================================== STOCK DASHBOARD == */
 /* locId replaced a free-text "search site name" box. Typing a name to filter columns
    meant guessing at its exact spelling and punctuation - several site names contain an
@@ -29774,7 +30012,10 @@ function unitDetailTable(units, opts){
      press it and be told no. */
   const mayObsolete = can("markObsolete") && !isExternalUser();
   const mayRestore  = can("restoreObsolete") && !isExternalUser();
-  const acts = mayObsolete || mayRestore;
+  /* REWORK (4 Oct 2026): App Admin only. "Send for rework" on a stock unit becomes "Back to
+     stock" once the unit is away, as the owner asked - the same cell, the other state. */
+  const mayRework   = can("manageRework") && !isExternalUser();
+  const acts = mayObsolete || mayRestore || mayRework;
   const ncol = acts ? 7 : 6;
   const row = d => {
       const here = deviceAtLocation(d);
@@ -29783,7 +30024,8 @@ function unitDetailTable(units, opts){
           esc(locName(d.destinationId)) + '</span>';
       const exp = d.expiration || "";
       return '<tr' + (o.rowAttr ? ' ' + o.rowAttr(d) : '') + '>' +
-        '<td class="mono">' + (o.rowAttr ? '<span class="stk-caret">▸</span> ' : '') + esc(d.sn || "—") + '</td>' +
+        '<td class="mono">' + (o.rowAttr ? '<span class="stk-caret">▸</span> ' : '') + esc(d.sn || "—") +
+          (d.version ? ' <span class="hint" title="product version">v ' + esc(d.version) + '</span>' : '') + '</td>' +
         '<td>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</td>' +
         '<td>' + where + '</td>' +
         '<td>' + unitStatusPill(d) + '</td>' +
@@ -29799,6 +30041,11 @@ function unitDetailTable(units, opts){
             ? '<button class="btn btn-sm" data-obsolete="' + esc(d.id) + '">Obsolete</button>'
             : mayRestore && d.status === "OBSOLETE"
             ? '<button class="btn btn-sm" data-unobsolete="' + esc(d.id) + '">Put back</button>'
+            : '') +
+          (mayRework && DEV_STATUS[d.status] && DEV_STATUS[d.status].stock
+            ? ' <button class="btn btn-sm" data-rework="' + esc(d.id) + '">Send for rework</button>'
+            : mayRework && d.status === "REWORK"
+            ? '<button class="btn btn-sm btn-primary" data-unrework="' + esc(d.id) + '">Back to stock</button>'
             : '') + '</td>' : '') +
         '</tr>' + (o.after ? o.after(d, ncol) : '');
   };
@@ -29836,7 +30083,10 @@ function stockTiles(pool, packedIds){
     { k:"expired",   label:"Expired",                cls:"p-red",    pick:d => d.status === "EXPIRED" },
     /* Stock promised to a patient - still on a shelf, not available to anybody else. */
     { k:"reserved",  label:"Reserved for patients",  cls:"p-blue",
-      pick:d => DEV_STATUS[d.status].stock && !!d.allocatedTo }
+      pick:d => DEV_STATUS[d.status].stock && !!d.allocatedTo },
+    /* Away for rework (4 Oct 2026): out of stock, so the list never shows it unless asked -
+       and this is where an App Admin finds it to press "Back to stock". */
+    { k:"rework",    label:"In rework",              cls:"p-orange", pick:d => d.status === "REWORK" }
   ].map(t => Object.assign(t, { n:pool.filter(t.pick).length }));
 }
 /* The one answer to "which units does the list show right now", read by the screen and by
@@ -29860,9 +30110,12 @@ function stockSections(units){
   const out = [], seen = new Set();
   const prods = PRODUCTS.filter(p => !FL.product || p.key === FL.product);
   const head = (label, list) => {
-    const r = list.filter(d => d.allocatedTo).length, f = list.length - r;
+    /* A unit away for rework is neither free nor reserved - it cannot be promised. */
+    const rw = list.filter(d => d.status === "REWORK").length;
+    const r = list.filter(d => d.allocatedTo).length, f = list.length - r - rw;
     return '<b>' + esc(label) + '</b> <span class="hint">· ' + list.length + ' unit' + (list.length === 1 ? '' : 's') + '</span>' +
       ' <span class="stk-split" style="display:inline-flex;margin:0 0 0 6px">' +
+      (rw ? '<span class="pill p-orange">' + rw + ' in rework</span>' : '') +
       (f ? '<span class="stk-chip f">' + f + ' free</span>' : '') +
       (r ? '<span class="stk-chip r">' + r + ' reserved</span>' : '') + '</span>';
   };
@@ -29962,6 +30215,9 @@ function mvText(m){
     case "REJECTED_ON_ARRIVAL": return "Failed its arrival checks";
     case "OBSOLETE":            return "Marked obsolete";
     case "RESTORED":            return "Put back into stock (was obsolete)";
+    case "REWORK":              return "Sent for rework";
+    case "REWORK_RETURNED":     return "Back from rework, into stock at " + locName(m.toId) +
+                                       (m.note ? " (version " + m.note + ")" : "");
     case "PUT_BACK":            return "Put back into stock (was used)";
     case "EXPIRED":             return "Expired";
     default:                    return "Status changed" + (m.note ? ": " + m.note : "");
@@ -30012,7 +30268,7 @@ VIEWS.stock = {
     /* The tiles are buttons: pressing one narrows the list to the units behind its count,
        pressing it again shows everything. An empty tile is not a button - offering a
        control that does nothing is worse than not offering it. */
-    let h = '<div class="grid g5">' +
+    let h = '<div class="grid g' + tiles.length + '">' +
       tiles.map(t => {
         const open  = FL.tile === t.k;
         const empty = t.n === 0;
@@ -30542,7 +30798,7 @@ function siteReportRows(siteId, from, to){
     const rm = SR_RETRO_RE.exec(l.action || "");
     if(rm){
       const rsn = rm[2];
-      const rdev = (S.db.devices || []).find(d => String(d.sn || "").toUpperCase() === rsn.toUpperCase()) || null;
+      const rdev = (S.db.devices || []).find(d => sameSn(d.sn, rsn)) || null;
       rows.push({ ts: rm[3], ref: rm[1].trim(), sn: rsn, dev: rdev, retro: true,
         receivedBy: "Recorded retroactively by " + (l.userName || "—"),
         compromised: false, detail: l.comments || "" });
@@ -30556,7 +30812,7 @@ function siteReportRows(siteId, from, to){
       ref = sp[1].trim(); sn = sp[2];
       /* The line named the unit. Look it up for its product and its movements, but keep
          the serial either way — a unit deleted from the register was still received. */
-      dev = (S.db.devices || []).find(d => String(d.sn || "").toUpperCase() === sn.toUpperCase()) || null;
+      dev = (S.db.devices || []).find(d => sameSn(d.sn, sn)) || null;
     }
     const comments = l.comments || "";
     /* BOTH wordings. "COMPROMISED: <note>" is what arrival wrote until v2.2.0; since then
