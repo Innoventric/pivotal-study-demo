@@ -13318,6 +13318,14 @@ const DEMO = (typeof window !== "undefined" && window.PIVOTAL_DEMO === true);
 if(DEMO){ const tr = document.getElementById("test-ribbon"); if(tr) tr.hidden = false; }
 const STORE_KEY   = DEMO ? "pivotal.demo.store.v6"   : "pivotal.store.v6";
 const SESSION_KEY = DEMO ? "pivotal.demo.session"    : "pivotal.localsession";
+/* THE DEMO'S SAMPLE DATA HAS A VERSION (4 Oct 2026). The demo keeps its sample data in the
+   visitor's browser under one key that has never changed, so a browser that first opened it
+   in early August still held units seeded by the builds of 31 Jul - 1 Aug, which had no
+   serial numbers - every Serial cell read "—" two months later. A stored copy stamped with
+   any other value (or none) is replaced by a fresh seed, once. Raise this whenever seed()
+   changes in a way an old copy would show wrongly. Demo only: in the live app the local
+   copy is a cache of the server and is never reseeded. */
+const DEMO_SEED_VERSION = 2;
 /* Half-finished inspections and shipments. The case file has autosaved from the
    start; these two screens did not, so a phone locking mid-inspection threw the
    work away silently. Two adjacent screens behaving oppositely is its own bug. */
@@ -14145,7 +14153,7 @@ function seed(){
     { id:uid("bkp"), path:"Riverside Medical Center/Clinical_Procedures", filename:"case_RVS-007_locked.json", content:"{}", ts:nowISO(), synced:true,  syncNote:"Uploaded" },
     { id:uid("bkp"), path:"Innoventric WH — Israel/Inventory_Logs",   filename:"shipment_dev-1011.json",  content:"{}", ts:nowISO(), synced:false, syncNote:"Queued — no backend reachable" }
   ];
-  return { version:SCHEMA_VERSION, users:U, locations:L, devices:D, patients:P,
+  return { version:SCHEMA_VERSION, seedVersion:DEMO_SEED_VERSION, users:U, locations:L, devices:D, patients:P,
            logs:G, notifications:N, notifyRecipients:[], backupQueue:B };
 }
 
@@ -14169,8 +14177,11 @@ function loadDB(){
   if(raw){
     try{
       const db = JSON.parse(raw);
-      if(validate(db)) return db;
-      console.warn("[store] existing data failed validation for schema v" + SCHEMA_VERSION + "; reseeding.");
+      if(DEMO && db && db.seedVersion !== DEMO_SEED_VERSION){
+        console.warn("[store] demo sample data is from an older version (" + (db.seedVersion || "unstamped") +
+          "); replacing it with fresh sample data.");
+      }else if(validate(db)) return db;
+      else console.warn("[store] existing data failed validation for schema v" + SCHEMA_VERSION + "; reseeding.");
     }catch(e){ console.warn("[store] unreadable, reseeding.", e); }
   }
   const fresh = seed();
