@@ -11299,6 +11299,47 @@ function parseDeviceQr(raw, opts){
   };
 }
 
+/* THE NEW LABEL ON A UNIT BACK FROM REWORK (4 Oct 2026, the owner). One definition, read by the
+   server (deviceService, the authority) and by the page (so the screen says what the server
+   will say before anything is sent).
+
+   readLabel: any payload a scanner or a person can produce - GS1, the four-line label, or a
+   bare serial - as { sn, expiry, format }. expiry is "" when the payload carries none.
+   Throws a DeviceQrError when a label-shaped payload will not parse.
+
+   reworkLabelProblem: null when the scanned label is the right one, otherwise
+   { code, message }. The right label is THIS unit's serial WITH "-R" (the old label, or
+   another unit's, is refused), and - when the label carries an expiry date - that date is
+   the one the unit will have after the return. */
+function readLabel(code){
+  var raw = String(code == null ? "" : code).trim();
+  if(!raw) throw QrError("EMPTY", "Nothing was scanned.");
+  var g = parseGs1(raw);
+  if(g && g.serial) return { sn: g.serial.toUpperCase(), expiry: g.expiry || "", format: "GS1" };
+  var multi = /\n/.test(raw.replace(/\r/g, "\n")) || raw.split(/\s+/).length > 1;
+  if(multi){
+    var p = parseDeviceQr(raw);
+    return { sn: p.sn, expiry: p.expiryDate, format: "LABEL" };
+  }
+  return { sn: raw.toUpperCase(), expiry: "", format: "SN" };
+}
+function reworkLabelProblem(deviceSn, expectedExpiry, label){
+  if(!label || !label.sn) return { code: "NO_LABEL_SCAN", message: "Scan the new label on the unit." };
+  if(snKey(label.sn) !== snKey(deviceSn)){
+    return { code: "LABEL_WRONG_UNIT", message: "That label is " + label.sn + ", not " +
+      withRework(deviceSn) + ". Scan the label on this unit." };
+  }
+  if(!isReworked(label.sn)){
+    return { code: "LABEL_NOT_REWORKED", message: "That label still reads " + label.sn +
+      " - the old label. The new label must read " + withRework(deviceSn) + "." };
+  }
+  if(label.expiry && expectedExpiry && label.expiry !== expectedExpiry){
+    return { code: "LABEL_EXPIRY_MISMATCH", message: "The label's expiry date is " + label.expiry +
+      ", but the unit's will be " + expectedExpiry + ". Fix the label or the expiry date." };
+  }
+  return null;
+}
+
 /** The DS size this Unica size requires. Mirrors UNICA_TO_DS in the app. */
 function requiredDsSize(unicaSize){
   return ({ S: "Short", M: "Short", L: "Long", XL: "Long" })[unicaSize] || null;
@@ -11312,6 +11353,8 @@ var api = {
   isReworked: isReworked,
   withRework: withRework,
   lotOf: lotOf,
+  readLabel: readLabel,
+  reworkLabelProblem: reworkLabelProblem,
   normaliseRef: normaliseRef,
   requiredDsSize: requiredDsSize,
   REF_MAP: REF_MAP,
@@ -13322,7 +13365,9 @@ const CAPABILITIES = {
   markObsolete:    ["ADMIN","WH_ADMIN"],
   restoreObsolete: ["ADMIN"],
   recordPastMove:  ["ADMIN"],  // document a move that already happened; see roleStore.js
-  manageRework:    ["ADMIN"]   // send a unit or a lot for rework and bring it back; roleStore.js
+  manageRework:    ["ADMIN"],  // send a unit or a lot for rework and bring it back; roleStore.js
+  editExpiry:      ["ADMIN","QA"],  // change one unit's expiry date, with a reason; roleStore.js
+  releaseRework:   ["QA"]   // QA releases a unit back from rework into stock; never the admin who brought it back
 };
 /* Every role the signed-in user holds, primary first. A user can carry a second role
    alongside their own - a site employee who also runs a warehouse - and capabilities are
@@ -14283,8 +14328,13 @@ function openBatches(){
    an approver who produced three of the four open batches has ONE thing to do, and a
    badge saying 4 would send them looking for work that is not theirs to sign. */
 function qaTodoCount(){
-  if(!can("approveRegistration")) return 0;
-  return openBatches().filter(b => !iProducedBatch(b)).length;
+  const me = String((S.me && S.me.email) || "").toLowerCase();
+  /* Units back from rework wait for QA too (4 Oct 2026) - but not for the admin who brought
+     them back, who cannot sign them. */
+  const rw = can("releaseRework")
+    ? reworkReleases().filter(r => r.status === "AWAITING_QA" && String(r.requestedBy || "").toLowerCase() !== me).length : 0;
+  if(!can("approveRegistration")) return rw;
+  return openBatches().filter(b => !iProducedBatch(b)).length + rw;
 }
 
 async function loadRemoteStore(){
@@ -16116,6 +16166,18 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.54.0", date: "4 October 2026", groups: [
+    { h:"Change a unit’s expiry date", items:[
+      "An <b>App Admin</b> or <b>QA</b> can now press <b>Change expiry</b> beside any unit in <b>Stock Overview</b>, choose the new date and give a reason. The change is written to the log with the old and the new date.",
+      "The unit’s status follows the date: a unit given a date that has passed becomes <b>Expired</b>, and an expired unit given a date still ahead is usable again. The dialog says so before you confirm.",
+      "Used and rejected units cannot be changed. The label on the unit still shows the old date."
+    ] },
+    { h:"Back from rework: new label and QA release", items:[
+      "<b>Back to stock</b> now opens a screen that asks whether there is a <b>new expiry date</b>, and whether the <b>label was replaced</b>. Until the new label — ending in <b>-R</b> — is on the unit, it cannot go back.",
+      "The new label of every unit is <b>scanned</b>. It must show the serial with <b>-R</b>, and its expiry date must match. A wrong or old label is refused.",
+      "The unit then waits as <b>Awaiting QA</b>, still in rework. In <b>QA Approval</b>, a QA person — never the one who brought it back — may scan the label again, and either <b>approves</b> it into stock at HQ or <b>sends it back</b> with a reason."
+    ] }
+  ] },
   { version: "2.53.0", date: "4 October 2026", groups: [
     { h:"Rework", items:[
       "An <b>App Admin</b> can now press <b>Send for rework</b> beside a unit in <b>Stock Overview</b>, for that unit alone or for its <b>whole lot</b> — every unit of the same product, size and production date. The unit leaves available stock and shows <b>In rework</b>; a reservation for a patient is released, and the patient’s Clinical PM is alerted.",
@@ -18660,6 +18722,7 @@ async function boot(){
         S.db = fresh;
         // Role-scoped, so it is a separate call; a refusal must not blank the app.
         S.db.batches = await loadBatches();
+        S.db.reworkReleases = await loadReworkReleases();
       }
       catch(e){ toast("Could not load live data from the server: " + (e.message || "unknown error"), "bad"); }
       for(const local of held){
@@ -29699,77 +29762,282 @@ function askSendRework(deviceId){
     toast(units.length + (units.length === 1 ? " unit" : " units") + " sent for rework.", "good");
   };
 }
+/* BACK FROM REWORK, IN TWO SIGNATURES (4 Oct 2026, the owner). "Back to stock" no longer puts the
+   unit into stock. It opens this screen - a screen and not a dialog, because the camera
+   scanner is a dialog of its own and would close one already open - where the App Admin:
+     · chooses the version and whether there is a new expiry date (as before),
+     · answers "Was the label replaced?" - No stops here: the serial now ends in -R, so the
+       label must say so first,
+     · scans the NEW label of every unit, which must read the serial WITH -R and, if the
+       label carries an expiry date, the date the unit will have,
+   and sends it to QA. The unit stays In rework until a QA person - never the admin who
+   brought it back - releases it in QA Approval. deviceQr.reworkLabelProblem is the one rule
+   for the label, read here and by the server. */
+let RWB = null;
+function reworkReleases(){ return (S.db && Array.isArray(S.db.reworkReleases)) ? S.db.reworkReleases : []; }
+function openReworkRelease(deviceId){
+  return reworkReleases().find(r => r.deviceId === deviceId && r.status === "AWAITING_QA") || null;
+}
+function lastReworkRelease(deviceId){
+  return reworkReleases().filter(r => r.deviceId === deviceId)
+    .sort((a, b) => String(b.requestedAt || "").localeCompare(String(a.requestedAt || "")))[0] || null;
+}
+async function loadReworkReleases(){
+  if(!S.backend) return reworkReleases();
+  try{ return await api("GET", "/api/rework-releases"); }
+  catch(e){ return []; }
+}
 function askReturnRework(deviceId){
   const d = S.db.devices.find(x => x.id === deviceId);
   if(!d) return;
-  const lotUnits = reworkLot(d, x => x.status === "REWORK");
   const hqs = S.db.locations.filter(l => l.type === "HQ");
-  const today = todayISO();
-  const versions = Array.from(new Set(lotUnits.concat([d]).map(x => x.version || ""))).filter(Boolean);
-  modal("Back to stock",
-    '<p>Unit <b class="mono">' + esc(d.sn) + '</b> comes back from rework as <b class="mono">' +
-      esc(window.DeviceQr ? window.DeviceQr.withRework(d.sn) : d.sn + "-R") + '</b>, in stock at HQ.</p>' +
-    reworkScopeHtml("rwb-scope", d, lotUnits, "in rework") +
-    (hqs.length > 1
-      ? '<div class="field"><label class="req" for="rwb-hq">Into stock at</label><select id="rwb-hq">' +
-          hqs.map(l => '<option value="' + esc(l.id) + '">' + esc(l.name) + '</option>').join("") + '</select></div>'
-      : hqs.length ? '<p class="hint">Into stock at <b>' + esc(hqs[0].name) + '</b>.</p>'
-      : '<div class="warn">There is no HQ location, so the unit has nowhere to come back to.</div>') +
-    (lotUnits.concat([d]).some(x => x.expiration && x.expiration < today)
-      ? '<div class="warn" style="margin:8px 0"><b>An expiry date has passed.</b> Such a unit comes back as <b>expired</b>, not as usable stock.</div>' : '') +
-    '<div class="field"><label>Raise the product version?</label>' +
-      '<label class="row" style="margin:2px 0"><input type="radio" name="rwb-ver" value="keep" checked> No — keep ' +
-        (versions.length ? 'version <b>' + esc(versions.join(", ")) + '</b>' : 'the current version (none recorded)') + '</label>' +
-      '<label class="row" style="margin:2px 0"><input type="radio" name="rwb-ver" value="new"> Yes, to version</label>' +
-      '<input type="text" id="rwb-new" maxlength="100" placeholder="e.g. Rev C" disabled style="margin-left:22px;max-width:260px">' +
-    '</div>' +
-    whyBox("rwb-why-box"),
-    '<div class="row"><button class="btn btn-primary" id="rwb-go"' + (hqs.length ? '' : ' disabled') + '>Back to stock</button>' +
-    '<button class="btn" data-close="1">Cancel</button></div>');
-  $$('input[name="rwb-ver"]').forEach(r => r.onchange = () => {
-    const on = ($('input[name="rwb-ver"]:checked') || {}).value === "new";
-    $("#rwb-new").disabled = !on; if(on) $("#rwb-new").focus();
-  });
-  const go = $("#rwb-go");
-  go.onclick = async () => {
-    const raise = ($('input[name="rwb-ver"]:checked') || {}).value === "new";
-    const version = raise ? ($("#rwb-new").value || "").trim() : "";
-    if(raise && !version) return showWhy("rwb-why-box", "Type the new version, or choose No.");
-    clearWhy("rwb-why-box"); go.disabled = true;
-    const hqId = hqs.length > 1 ? $("#rwb-hq").value : (hqs[0] || {}).id;
-    const units = reworkChosen("rwb-scope", d, lotUnits);
-    if(S.backend){
-      const { done, failed } = await reworkEach(units, "/rework-return", { version, hqId });
-      closeModal(); render();
-      const exp = done.filter(o => o.expired).length;
-      reworkReport(done, failed, (done.length === 1 ? "unit back in stock" : "units back in stock") +
-        (exp ? " (" + exp + " expired)" : ""));
-      return;
-    }
-    /* Standalone: mirror deviceService.returnFromRework. */
-    const hq = loc(hqId) || {};
-    for(const u of units){
-      const oldSn = u.sn, oldVer = u.version || "";
-      u.status = u.expiration && u.expiration < today ? "EXPIRED" : "IN_WH";
-      u.locationId = hqId; u.sn = window.DeviceQr ? window.DeviceQr.withRework(u.sn) : u.sn;
-      if(version) u.version = version;
-      u.destinationId = null; u.masterPackId = null; u.shippedFromId = null; u.shippedAt = null; u.shippedBy = null;
-      u.receivedVia = "REWORK"; u.receivedAt = nowISO(); u.receivedBy = (S.me && S.me.email) || null;
-      logAction("Back from REWORK: " + oldSn + " is now " + u.sn + ", in stock at " + (hq.name || hqId),
-        { locationId:hqId, highPriority:true,
-          stateChanges:"In rework → " + u.status + " · serial " + oldSn + " → " + u.sn +
-            (version && version !== oldVer ? " · version " + (oldVer || "not set") + " → " + version : ""),
-          comments: version && version !== oldVer ? "Product version raised to " + version + "." : "Product version unchanged." });
-    }
-    commit(); closeModal(); render();
-    toast(units.length + (units.length === 1 ? " unit" : " units") + " back in stock.", "good");
-  };
+  RWB = { deviceId, scope:"one", hqId:(hqs[0] || {}).id || "", verMode:"keep", version:"",
+          expMode:"keep", expiration:"", replaced:null, scans:{} };
+  S.view = "reworkback"; renderNav(); render();
+}
+function rwbUnits(){
+  if(!RWB) return [];
+  const d = S.db.devices.find(x => x.id === RWB.deviceId);
+  if(!d) return [];
+  const free = x => x.status === "REWORK" && !openReworkRelease(x.id);
+  return RWB.scope === "lot" ? reworkLot(d, free) : [d];
+}
+function rwbExpected(u){ return (RWB.expMode === "new" && RWB.expiration) || u.expiration || ""; }
+function rwbReady(units, hqs){
+  return RWB.replaced === true && units.length > 0 && units.every(u => !rwbProblem(u)) &&
+    (RWB.verMode !== "new" || !!RWB.version.trim()) && (RWB.expMode !== "new" || !!RWB.expiration) &&
+    hqs.length > 0;
+}
+function rwbProblem(u){
+  const sc = RWB.scans[u.id];
+  return window.DeviceQr.reworkLabelProblem(u.sn, rwbExpected(u), sc || null);
+}
+SCANFIELDS["rwb-scan"] = { label:"new label", onCode:(code, manual) => {
+  if(!RWB) return;
+  let lab;
+  try{ lab = window.DeviceQr.readLabel(code); }
+  catch(e){ return toast("The label could not be read: " + (e.message || "unknown"), "bad"); }
+  const u = rwbUnits().find(x => sameSn(x.sn, lab.sn));
+  if(!u) return toast("That label is " + lab.sn + " — not one of the units being brought back.", "bad");
+  RWB.scans[u.id] = { code, manual:!!manual, sn:lab.sn, expiry:lab.expiry };
+  const p = rwbProblem(u);
+  toast(p ? p.message : lab.sn + " ✓", p ? "bad" : "good");
+  render();
+}};
+VIEWS.reworkback = {
+  title:"Back from rework",
+  sub:"Confirm the new label, scan it, and send the unit to QA. It goes into stock only when QA releases it.",
+  body(){
+    const d = RWB && S.db.devices.find(x => x.id === RWB.deviceId);
+    if(!d) return '<div class="empty">Nothing to bring back. Open Stock Overview and press <b>Back to stock</b> on a unit in rework.</div>';
+    if(!can("manageRework")) return '<div class="empty">Only an App Admin can bring a unit back from rework.</div>';
+    const lotAll = reworkLot(d, x => x.status === "REWORK" && !openReworkRelease(x.id));
+    const units = rwbUnits();
+    const hqs = S.db.locations.filter(l => l.type === "HQ");
+    const versions = Array.from(new Set(units.map(x => x.version || ""))).filter(Boolean);
+    const exps = Array.from(new Set(units.map(x => x.expiration || ""))).filter(Boolean).sort();
+    const last = lastReworkRelease(d.id);
+    const ok = rwbReady(units, hqs);
+    const radio = (name, val, cur, text) => '<label class="row" style="margin:2px 0"><input type="radio" name="' + name +
+      '" value="' + val + '"' + (cur === val ? " checked" : "") + '> ' + text + '</label>';
+    return '<div class="card"><div class="card-hd"><h2>' + esc(d.sn) + ' → ' + esc(window.DeviceQr.withRework(d.sn)) + '</h2>' +
+        '<span class="pill p-orange">In rework</span></div><div class="card-bd">' +
+      (last && last.status === "SENT_BACK" ? '<div class="warn" style="margin:0 0 10px"><b>QA sent the last request back</b> (' +
+        esc((last.qa || {}).byName || (last.qa || {}).by || "") + ', ' + esc(fmtTs((last.qa || {}).at)) + '): ' + esc((last.qa || {}).note || "") + '</div>' : '') +
+      (lotAll.filter(x => x.id !== d.id).length
+        ? '<div class="field"><label>Which units?</label>' +
+            radio("rwb-scope", "one", RWB.scope, 'This unit only — <span class="mono">' + esc(d.sn) + '</span>') +
+            radio("rwb-scope", "lot", RWB.scope, 'The whole lot <span class="mono">' + esc(lotOf(d.sn)) + '</span> — ' + lotAll.length + ' units in rework') +
+          '</div>' : '') +
+      (hqs.length > 1
+        ? '<div class="field"><label class="req" for="rwb-hq">Into stock at</label><select id="rwb-hq">' +
+            hqs.map(l => '<option value="' + esc(l.id) + '"' + (l.id === RWB.hqId ? " selected" : "") + '>' + esc(l.name) + '</option>').join("") + '</select></div>'
+        : hqs.length ? '<p class="hint">Into stock at <b>' + esc(hqs[0].name) + '</b>, once QA releases it.</p>'
+        : '<div class="warn">There is no HQ location, so the unit has nowhere to come back to.</div>') +
+      '<div class="field"><label>Raise the product version?</label>' +
+        radio("rwb-ver", "keep", RWB.verMode, 'No — keep ' + (versions.length ? 'version <b>' + esc(versions.join(", ")) + '</b>' : 'the current version (none recorded)')) +
+        radio("rwb-ver", "new", RWB.verMode, 'Yes, to version') +
+        '<input type="text" id="rwb-new" maxlength="100" placeholder="e.g. Rev C" value="' + esc(RWB.version) + '"' +
+          (RWB.verMode === "new" ? "" : " disabled") + ' style="margin-left:22px;max-width:260px">' +
+      '</div>' +
+      '<div class="field"><label>Is there a new expiry date?</label>' +
+        radio("rwb-exp", "keep", RWB.expMode, 'No — keep ' + (exps.length ? '<b>' + esc(exps.map(fmtDate).join(", ")) + '</b>' : 'the current date (none recorded)')) +
+        radio("rwb-exp", "new", RWB.expMode, 'Yes, new expiry date') +
+        '<input type="date" id="rwb-exp-new" value="' + esc(RWB.expiration) + '"' +
+          (RWB.expMode === "new" ? "" : " disabled") + ' style="margin-left:22px;max-width:200px">' +
+      '</div>' +
+      '<div class="field"><label class="req">Was the label replaced?</label>' +
+        radio("rwb-lab", "yes", RWB.replaced === true ? "yes" : RWB.replaced === false ? "no" : "", 'Yes — the new label, ending in <b>-R</b>, is on the unit') +
+        radio("rwb-lab", "no", RWB.replaced === true ? "yes" : RWB.replaced === false ? "no" : "", 'No') +
+      '</div>' +
+      (units.some(u => rwbExpected(u) && rwbExpected(u) < todayISO())
+        ? '<div class="warn" style="margin:8px 0"><b>An expiry date has passed.</b> Such a unit comes back as <b>expired</b>, not as usable stock — unless you give it a new expiry date above.</div>' : '') +
+      (RWB.replaced === false
+        ? '<div class="warn" style="margin:8px 0"><b>Replace the label first.</b> The serial now ends in <b>-R</b>, so the unit cannot go back to stock until the new label is on it and scanned.</div>'
+        : '') +
+      (RWB.replaced === true
+        ? scanField("rwb-scan", "Scan the new label of " + (units.length === 1 ? "the unit" : "each unit"), "", {}) +
+          '<div class="tbl-wrap"><table><thead><tr><th>Unit</th><th>The label must read</th><th>Expiry</th><th>Scanned</th><th></th></tr></thead><tbody>' +
+          units.map(u => {
+            const sc = RWB.scans[u.id], p = rwbProblem(u);
+            return '<tr><td class="mono">' + esc(u.sn) + '</td><td class="mono">' + esc(window.DeviceQr.withRework(u.sn)) + '</td>' +
+              '<td>' + esc(rwbExpected(u) ? fmtDate(rwbExpected(u)) : "—") + '</td>' +
+              '<td class="mono">' + (sc ? esc(sc.sn) + (sc.expiry ? ' <span class="hint">exp ' + esc(fmtDate(sc.expiry)) + '</span>' : '') +
+                (sc.manual ? ' <span class="pill p-orange">hand-entered</span>' : '') : '<span class="hint">not scanned</span>') + '</td>' +
+              '<td style="white-space:normal;min-width:200px">' + (!sc ? '' : p ? '<span class="pill p-red">✗ wrong label</span><div class="hint">' + esc(p.message) + '</div>' : '<span class="pill p-green">✓ matches</span>') + '</td></tr>';
+          }).join("") + '</tbody></table></div>'
+        : '') +
+      whyBox("rwb-why-box") +
+      '</div><div class="card-ft"><div class="row">' +
+        '<button class="btn btn-primary" id="rwb-go"' + (ok ? '' : ' disabled') + '>Send to QA for approval' +
+          (units.length > 1 ? ' (' + units.length + ' units)' : '') + '</button>' +
+        '<button class="btn" id="rwb-cancel">Cancel</button>' +
+        '<span class="hint">The unit stays <b>In rework</b> until a QA person — not you — releases it.</span>' +
+      '</div></div></div>';
+  },
+  wire(){
+    if(!RWB) return;
+    const pick = name => ($('input[name="' + name + '"]:checked') || {}).value;
+    $$('input[name="rwb-scope"]').forEach(r => r.onchange = () => { RWB.scope = pick("rwb-scope"); render(); });
+    $$('input[name="rwb-ver"]').forEach(r => r.onchange = () => { RWB.verMode = pick("rwb-ver"); render(); });
+    $$('input[name="rwb-exp"]').forEach(r => r.onchange = () => { RWB.expMode = pick("rwb-exp"); render(); });
+    $$('input[name="rwb-lab"]').forEach(r => r.onchange = () => { RWB.replaced = pick("rwb-lab") === "yes"; render(); });
+    const v = $("#rwb-new"); if(v) v.oninput = () => { RWB.version = v.value; const g = $("#rwb-go");
+      if(g) g.disabled = !rwbReady(rwbUnits(), S.db.locations.filter(l => l.type === "HQ")); };
+    const x = $("#rwb-exp-new"); if(x) x.onchange = () => { RWB.expiration = x.value; render(); };
+    const h = $("#rwb-hq"); if(h) h.onchange = () => { RWB.hqId = h.value; };
+    const c = $("#rwb-cancel"); if(c) c.onclick = () => { RWB = null; S.view = "stock"; renderNav(); render(); };
+    const go = $("#rwb-go"); if(go) go.onclick = () => submitReworkReturn(go);
+  }
+};
+async function submitReworkReturn(go){
+  const units = rwbUnits();
+  const version = RWB.verMode === "new" ? RWB.version.trim() : "";
+  const expiration = RWB.expMode === "new" ? RWB.expiration : "";
+  if(RWB.replaced !== true) return showWhy("rwb-why-box", "Replace the label first.");
+  const bad = units.find(u => rwbProblem(u));
+  if(bad) return showWhy("rwb-why-box", bad.sn + ": " + rwbProblem(bad).message);
+  clearWhy("rwb-why-box"); go.disabled = true;
+  const done = [], failed = [];
+  if(!Array.isArray(S.db.reworkReleases)) S.db.reworkReleases = [];
+  for(const u of units){
+    const sc = RWB.scans[u.id];
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/devices/" + encodeURIComponent(u.id) + "/rework-return",
+          { version, hqId:RWB.hqId, expiration, labelReplaced:true, labelCode:sc.code, labelManual:sc.manual });
+        if(out.release && !S.db.reworkReleases.some(r => r.releaseId === out.release.releaseId)) S.db.reworkReleases.unshift(out.release);
+        if(out.audit) S.db.logs.unshift(out.audit);
+        done.push(Object.assign({ unit:u }, out));
+      }else{
+        /* Standalone: mirror deviceService.requestReworkReturn. */
+        const now = nowISO();
+        const r = { releaseId:"RWK-" + now.replace(/[^0-9]/g, "").slice(0, 14) + "-" + Math.random().toString(16).slice(2, 8).toUpperCase(),
+          deviceId:u.id, sn:u.sn, newSn:window.DeviceQr.withRework(u.sn), productType:u.productType || "", size:u.size || "",
+          hqId:RWB.hqId, version, expiration, oldExpiration:u.expiration || "", oldVersion:u.version || "",
+          label:{ sn:sc.sn, expiry:sc.expiry, manual:sc.manual, at:now },
+          requestedBy:(S.me && S.me.email) || "", requestedByName:(S.me && S.me.name) || "", requestedAt:now, status:"AWAITING_QA" };
+        S.db.reworkReleases.unshift(r);
+        logAction("Back from REWORK, awaiting QA: " + r.sn + " → " + r.newSn + " (" + r.releaseId + ")", {
+          locationId:RWB.hqId, highPriority:true, stateChanges:"In rework → awaiting QA release",
+          comments:"Label replaced: yes. New label " + (sc.manual ? "HAND-ENTERED" : "scanned") + ": " + sc.sn + "." });
+        notify(r.sn + " is back from rework as " + r.newSn + " and waits for QA release (QA Approval).", ["QA"], [], RWB.hqId);
+        done.push({ unit:u, release:r });
+      }
+    }catch(e){ failed.push({ unit:u, message:e.message || "refused" }); }
+  }
+  commit();
+  if(!failed.length){ RWB = null; S.view = "stock"; }
+  renderNav(); render();
+  if(failed.length) toast(done.length + " sent to QA. Not done: " + failed.map(f => f.unit.sn + " — " + f.message).join("; "), "bad");
+  else toast(done.length + (done.length === 1 ? " unit" : " units") + " sent to QA. It stays in rework until QA releases it.", "good");
 }
 document.addEventListener("click", e => {
   const t = e.target && e.target.closest && e.target.closest("[data-rework],[data-unrework]");
   if(!t) return;
   if(t.dataset.rework) askSendRework(t.dataset.rework);
   else askReturnRework(t.dataset.unrework);
+});
+
+/* CHANGE A UNIT'S EXPIRY DATE (4 Oct 2026, the owner). App Admin and QA, one unit at a time, with
+   a reason; the server is the authority (deviceService.changeExpiry) and writes the log line.
+   The dialog says before the press what the new date will do to the unit's status. */
+function askChangeExpiry(deviceId){
+  const d = S.db.devices.find(x => x.id === deviceId);
+  if(!d) return;
+  const today = todayISO();
+  const expirable = ["IN_WH","IN_SITE","DELIVERED","ON_WAY"].indexOf(d.status) >= 0;
+  modal("Change expiry date",
+    '<p>Unit <b class="mono">' + esc(d.sn || d.id) + '</b> (' +
+      esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + ') at <b>' +
+      esc(locName(d.locationId)) + '</b> — status <b>' + esc((DEV_STATUS[d.status] || {}).label || d.status) +
+      '</b>, expires <b>' + esc(d.expiration ? fmtDate(d.expiration) : "—") + '</b>.</p>' +
+    '<div class="field"><label class="req" for="exp-new">New expiry date</label>' +
+      '<input type="date" id="exp-new" value="' + esc(d.expiration || "") + '" style="max-width:200px"></div>' +
+    '<div id="exp-effect"></div>' +
+    '<div class="field"><label class="req" for="exp-why">Why is the expiry date changing?</label>' +
+      '<input type="text" id="exp-why" maxlength="400" placeholder="e.g. shelf-life extension per QA report"></div>' +
+    '<div class="hint">The label on the unit still shows the old date. A high-priority line goes into the log.</div>' +
+    whyBox("exp-why-box"),
+    '<div class="row"><button class="btn btn-primary" id="exp-go">Change expiry date</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  const effect = () => {
+    const v = $("#exp-new").value || "";
+    let msg = "";
+    if(v && v < today && expirable) msg = '<b>That date has passed.</b> The unit becomes <b>expired</b> and leaves usable stock' +
+      (d.allocatedTo ? ' — and it is reserved for <b>' + esc(reservedForCode(d)) + '</b>' : '') + '.';
+    else if(v && v >= today && d.status === "EXPIRED") msg = 'The unit is <b>usable again</b>: it goes back to ' +
+      (d.destinationId || d.receivedVia === "HAND_CARRY" ? 'waiting to be checked in at its destination.' : 'stock where it is.');
+    $("#exp-effect").innerHTML = msg ? '<div class="warn" style="margin:8px 0">' + msg + '</div>' : '';
+  };
+  $("#exp-new").oninput = effect; effect();
+  const go = $("#exp-go");
+  go.onclick = async () => {
+    const expiration = ($("#exp-new").value || "").trim();
+    const reason = ($("#exp-why").value || "").trim();
+    if(!expiration) return showWhy("exp-why-box", "Choose the new expiry date.");
+    if(expiration === (d.expiration || "")) return showWhy("exp-why-box", "That is the date it already has.");
+    if(d.mfgDate && expiration <= d.mfgDate) return showWhy("exp-why-box", "The expiry date must be after the manufacturing date (" + fmtDate(d.mfgDate) + ").");
+    if(reason.length < 3) return showWhy("exp-why-box", "A reason is required — why is the expiry date changing?");
+    clearWhy("exp-why-box"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/devices/" + encodeURIComponent(deviceId) + "/expiry", { expiration, reason });
+        const i = S.db.devices.findIndex(x => x.id === deviceId);
+        if(i >= 0 && out.device) S.db.devices[i] = out.device;
+        if(out.audit) S.db.logs.unshift(out.audit);
+        commit(); closeModal(); render();
+        if(out.auditFailed) toast("The date is changed, but the log line could not be written. Record it by hand.", "bad");
+        else toast(out.expired ? "Expiry date changed — the unit is now expired."
+                 : out.revived ? "Expiry date changed — the unit is usable again." : "Expiry date changed.", "good");
+        return;
+      }
+      /* Standalone: mirror deviceService.changeExpiry. */
+      if(d.status === "USED" || d.status === "REJECTED") throw new Error("That unit is spent; its date cannot change.");
+      const oldExp = d.expiration || "", was = d.status;
+      d.expiration = expiration;
+      if(expiration < today && expirable) d.status = "EXPIRED";
+      else if(expiration >= today && was === "EXPIRED"){
+        const l = loc(d.locationId) || {};
+        d.status = d.destinationId ? "ON_WAY" : d.receivedVia === "HAND_CARRY" ? "DELIVERED"
+          : (l.type && l.type !== "WAREHOUSE" && l.type !== "HQ") ? "IN_SITE" : "IN_WH";
+      }
+      commit();
+      logAction("Changed the expiry date of " + (d.sn || deviceId) + " to " + expiration, {
+        locationId: d.locationId, highPriority: true,
+        stateChanges: "Expiry " + (oldExp || "not set") + " → " + expiration + (was !== d.status ? " · " + was + " → " + d.status : ""),
+        comments: "Reason: " + reason });
+      closeModal(); render();
+      toast("Expiry date changed.", "good");
+    }catch(e){
+      go.disabled = false;
+      showWhy("exp-why-box", e.message || "The server refused that.");
+    }
+  };
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-expiry]");
+  if(t) askChangeExpiry(t.dataset.expiry);
 });
 
 /* ====================================================== STOCK DASHBOARD == */
@@ -30015,7 +30283,9 @@ function unitDetailTable(units, opts){
   /* REWORK (4 Oct 2026): App Admin only. "Send for rework" on a stock unit becomes "Back to
      stock" once the unit is away, as the owner asked - the same cell, the other state. */
   const mayRework   = can("manageRework") && !isExternalUser();
-  const acts = mayObsolete || mayRestore || mayRework;
+  /* CHANGE EXPIRY (4 Oct 2026): App Admin and QA, any unit that is not spent. */
+  const mayExpiry   = can("editExpiry") && !isExternalUser();
+  const acts = mayObsolete || mayRestore || mayRework || mayExpiry;
   const ncol = acts ? 7 : 6;
   const row = d => {
       const here = deviceAtLocation(d);
@@ -30044,8 +30314,13 @@ function unitDetailTable(units, opts){
             : '') +
           (mayRework && DEV_STATUS[d.status] && DEV_STATUS[d.status].stock
             ? ' <button class="btn btn-sm" data-rework="' + esc(d.id) + '">Send for rework</button>'
+            : d.status === "REWORK" && openReworkRelease(d.id)
+            ? '<span class="pill p-orange" title="Back from rework - waiting for QA release in QA Approval">Awaiting QA</span>'
             : mayRework && d.status === "REWORK"
             ? '<button class="btn btn-sm btn-primary" data-unrework="' + esc(d.id) + '">Back to stock</button>'
+            : '') +
+          (mayExpiry && d.status !== "USED" && d.status !== "REJECTED"
+            ? ' <button class="btn btn-sm" data-expiry="' + esc(d.id) + '">Change expiry</button>'
             : '') + '</td>' : '') +
         '</tr>' + (o.after ? o.after(d, ncol) : '');
   };
@@ -30219,6 +30494,7 @@ function mvText(m){
     case "REWORK_RETURNED":     return "Back from rework, into stock at " + locName(m.toId) +
                                        (m.note ? " (version " + m.note + ")" : "");
     case "PUT_BACK":            return "Put back into stock (was used)";
+    case "EXPIRY_CHANGED":      return "Expiry date changed" + (m.note ? ": " + m.note : "");
     case "EXPIRED":             return "Expired";
     default:                    return "Status changed" + (m.note ? ": " + m.note : "");
   }
@@ -30901,8 +31177,9 @@ VIEWS.batches = {
   body(){
     const all = (S.db && Array.isArray(S.db.batches)) ? S.db.batches : [];
     const approver = can("approveRegistration");
+    const rw = reworkQaSection();
     if(!all.length){
-      return '<div class="empty">No batches yet. A batch appears here once production ' +
+      return rw + '<div class="empty">No batches yet. A batch appears here once production ' +
         'has been confirmed on the New Device Registration screen.</div>';
     }
     const open = all.filter(b => b.status !== "COMPLETED");
@@ -30954,7 +31231,7 @@ VIEWS.batches = {
         '</div>';
     };
 
-    return (open.length
+    return rw + (open.length
         ? open.map(card).join("")
         : '<div class="empty">Nothing is waiting. Every batch has been dealt with.</div>') +
       (done.length
@@ -30973,6 +31250,8 @@ VIEWS.batches = {
         : "");
   },
   wire(){
+    $$("[data-rwapprove]").forEach(btn => btn.onclick = () => confirmReworkRelease(btn.dataset.rwapprove));
+    $$("[data-rwsendback]").forEach(btn => btn.onclick = () => askReworkSendBack(btn.dataset.rwsendback));
     $$("[data-bapprove]").forEach(btn => btn.onclick = () => confirmApprove(btn.dataset.bapprove));
     $$("[data-bhold]").forEach(btn => btn.onclick = () => askHold(btn.dataset.bhold));
     $$("[data-mrb]").forEach(btn => btn.onclick = () => {
@@ -30985,6 +31264,152 @@ VIEWS.batches = {
     $$("[data-bdispose]").forEach(btn => btn.onclick = () => confirmDispose(btn.dataset.bdispose));
   }
 };
+
+/* UNITS BACK FROM REWORK, WAITING FOR QA (4 Oct 2026, the owner). Shown to everybody who opens
+   this screen; acted on only by QA, and never by the admin who brought the unit back - the
+   server enforces both (approveReworkReturn). QA may scan the label again; it is optional,
+   and a re-scan that does not match is refused here and by the server. */
+const RWQ = {};   // releaseId -> { code, manual, sn, expiry } : QA's optional re-scan
+SCANFIELDS["rwq-scan"] = { label:"label (optional re-check)", onCode:(code, manual) => {
+  let lab;
+  try{ lab = window.DeviceQr.readLabel(code); }
+  catch(e){ return toast("The label could not be read: " + (e.message || "unknown"), "bad"); }
+  const r = reworkReleases().find(x => x.status === "AWAITING_QA" && sameSn(x.sn, lab.sn));
+  if(!r) return toast("No unit waiting for QA has the serial " + lab.sn + ".", "bad");
+  const d = S.db.devices.find(x => x.id === r.deviceId) || { sn:r.sn, expiration:r.oldExpiration };
+  const p = window.DeviceQr.reworkLabelProblem(d.sn, r.expiration || d.expiration || "", lab);
+  if(p) return toast(p.message, "bad");
+  RWQ[r.releaseId] = { code, manual:!!manual, sn:lab.sn, expiry:lab.expiry };
+  toast(lab.sn + " ✓ re-checked", "good");
+  render();
+}};
+function reworkQaSection(){
+  const open = reworkReleases().filter(r => r.status === "AWAITING_QA");
+  if(!open.length) return "";
+  const me = String((S.me && S.me.email) || "").toLowerCase();
+  const qa = can("releaseRework");
+  const row = r => {
+    const mine = String(r.requestedBy || "").toLowerCase() === me;
+    const re = RWQ[r.releaseId];
+    const lab = r.label || {};
+    return '<tr><td class="mono">' + esc(r.sn) + ' → <b>' + esc(r.newSn || window.DeviceQr.withRework(r.sn)) + '</b></td>' +
+      '<td>' + esc((r.productType === "UNICA" ? "Unica " : r.productType ? "DS " : "") + (r.size || "")) + '</td>' +
+      '<td>' + esc(locName(r.hqId)) + '</td>' +
+      '<td>' + (r.version ? esc((r.oldVersion || "—") + " → " + r.version) : '<span class="hint">unchanged</span>') + '</td>' +
+      '<td>' + (r.expiration ? esc(fmtDate(r.oldExpiration) + " → " + fmtDate(r.expiration)) : '<span class="hint">unchanged</span>') + '</td>' +
+      '<td class="mono">' + esc(lab.sn || "—") + (lab.expiry ? ' <span class="hint">exp ' + esc(fmtDate(lab.expiry)) + '</span>' : '') +
+        (lab.manual ? ' <span class="pill p-orange">hand-entered</span>' : '') +
+        (re ? '<br><span class="pill p-green">✓ re-checked by you</span>' : '') + '</td>' +
+      '<td>' + esc(r.requestedByName || r.requestedBy) + '<br><span class="hint">' + esc(fmtTs(r.requestedAt)) + '</span></td>' +
+      '<td>' + (qa && !mine
+        ? '<div class="row"><button class="btn btn-sm btn-primary" data-rwapprove="' + esc(r.releaseId) + '">Approve — into stock</button>' +
+          '<button class="btn btn-sm btn-danger" data-rwsendback="' + esc(r.releaseId) + '">Send back</button></div>'
+        : qa && mine ? '<span class="hint">You brought it back — another QA person must approve.</span>'
+        : '<span class="hint">Waiting for QA</span>') + '</td></tr>';
+  };
+  return '<div class="card"><div class="card-hd"><h2>Back from rework — waiting for QA</h2>' +
+      '<span class="pill p-orange">' + open.length + '</span></div><div class="card-bd">' +
+    '<p class="hint" style="margin-top:0">These units are still <b>In rework</b>. Approving puts the unit into stock at HQ with its new serial' +
+      ' (and version or expiry date, if changed), under your name.</p>' +
+    (qa ? scanField("rwq-scan", "Re-check a label (optional)", "", {}) : '') +
+    '<div class="tbl-wrap"><table><thead><tr><th>Serial</th><th>Product</th><th>Into</th><th>Version</th><th>Expiry</th>' +
+      '<th>New label scanned</th><th>Brought back by</th><th></th></tr></thead><tbody>' +
+      open.map(row).join("") + '</tbody></table></div>' + whyBox("rwq-why") +
+    '</div></div>';
+}
+async function refreshReworkReleases(authoritative){
+  const fresh = await loadReworkReleases();
+  S.db.reworkReleases = Array.isArray(fresh) ? fresh : reworkReleases();
+  if(authoritative && authoritative.releaseId){
+    const i = S.db.reworkReleases.findIndex(r => r.releaseId === authoritative.releaseId);
+    if(i >= 0) S.db.reworkReleases[i] = authoritative; else S.db.reworkReleases.unshift(authoritative);
+  }
+}
+function confirmReworkRelease(releaseId){
+  const r = reworkReleases().find(x => x.releaseId === releaseId); if(!r) return;
+  const re = RWQ[releaseId];
+  modal("Release " + (r.newSn || r.sn) + " into stock",
+    '<p>This is the QA release. <b class="mono">' + esc(r.sn) + '</b> goes into stock at <b>' + esc(locName(r.hqId)) +
+      '</b> as <b class="mono">' + esc(r.newSn || r.sn) + '</b>, under your name.</p>' +
+    '<p class="hint">Brought back by ' + esc(r.requestedByName || r.requestedBy) + ' · ' + esc(fmtTs(r.requestedAt)) +
+      '. New label ' + ((r.label || {}).manual ? 'hand-entered' : 'scanned') + ': <span class="mono">' + esc((r.label || {}).sn || "") + '</span>.' +
+      (re ? ' You re-checked it.' : ' You did not re-scan it (optional).') + '</p>' +
+    whyBox("rwa-why"),
+    '<div class="row"><button class="btn btn-primary" id="rwa-go">Approve — into stock</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#rwa-go").onclick = async () => {
+    const go = $("#rwa-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(releaseId) + "/approve",
+          re ? { rescanCode:re.code, rescanManual:re.manual } : {});
+        const i = S.db.devices.findIndex(x => x.id === r.deviceId);
+        if(i >= 0 && out.device) S.db.devices[i] = out.device;
+        if(out.audit) S.db.logs.unshift(out.audit);
+        await refreshReworkReleases(out.release);
+        delete RWQ[releaseId];
+        commit(); closeModal(); renderNav(); render();
+        if(out.auditFailed) toast("Released, but the log line could not be written. Record it by hand.", "bad");
+        else toast(out.expired ? "Released — but its expiry date has passed, so it is on the record as expired."
+                               : (out.device ? out.device.sn : r.newSn) + " is in stock.", "good");
+        return;
+      }
+      /* Standalone: mirror deviceService.approveReworkReturn. */
+      const me = String((S.me && S.me.email) || "").toLowerCase();
+      if(String(r.requestedBy || "").toLowerCase() === me) throw new Error("You brought it back, so you cannot also release it.");
+      const u = S.db.devices.find(x => x.id === r.deviceId);
+      if(!u || u.status !== "REWORK") throw new Error("That unit is not in rework any more.");
+      const oldSn = u.sn;
+      if(r.expiration) u.expiration = r.expiration;
+      u.status = u.expiration && u.expiration < todayISO() ? "EXPIRED" : "IN_WH";
+      u.locationId = r.hqId; u.sn = window.DeviceQr.withRework(u.sn);
+      if(r.version) u.version = r.version;
+      u.destinationId = null; u.masterPackId = null; u.shippedFromId = null; u.shippedAt = null; u.shippedBy = null;
+      u.receivedVia = "REWORK"; u.receivedAt = nowISO(); u.receivedBy = r.requestedBy;
+      r.status = "APPROVED"; r.qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"APPROVED",
+        rescan: re ? { sn:re.sn, expiry:re.expiry, manual:re.manual } : null };
+      logAction("Back from REWORK: " + oldSn + " is now " + u.sn + ", in stock at " + locName(r.hqId) + " — QA released",
+        { locationId:r.hqId, highPriority:true, stateChanges:"In rework → " + u.status + " · serial " + oldSn + " → " + u.sn,
+          comments:"Brought back by " + (r.requestedByName || r.requestedBy) + (re ? "; QA re-scanned the label." : "; QA did not re-scan.") });
+      delete RWQ[releaseId];
+      commit(); closeModal(); renderNav(); render();
+      toast(u.sn + " is in stock.", "good");
+    }catch(e){ go.disabled = false; showWhy("rwa-why", e.message || "The server refused the release."); }
+  };
+}
+function askReworkSendBack(releaseId){
+  const r = reworkReleases().find(x => x.releaseId === releaseId); if(!r) return;
+  modal("Send " + r.sn + " back",
+    '<p>The unit stays <b>In rework</b> and is not released. The App Admin is told why and can bring it back again.</p>' +
+    '<div class="field"><label class="req" for="rwsb-why">Why is it not released?</label>' +
+      '<input type="text" id="rwsb-why" maxlength="400" placeholder="e.g. the label is crooked and the expiry is smudged"></div>' +
+    whyBox("rwsb-box"),
+    '<div class="row"><button class="btn btn-danger" id="rwsb-go">Send back</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#rwsb-go").onclick = async () => {
+    const reason = ($("#rwsb-why").value || "").trim();
+    if(reason.length < 3) return showWhy("rwsb-box", "Say why it is being sent back.");
+    const go = $("#rwsb-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(releaseId) + "/send-back", { reason });
+        if(out.audit) S.db.logs.unshift(out.audit);
+        await refreshReworkReleases(out.release);
+      }else{
+        const me = String((S.me && S.me.email) || "").toLowerCase();
+        if(String(r.requestedBy || "").toLowerCase() === me) throw new Error("You brought it back, so you cannot also send it back.");
+        r.status = "SENT_BACK";
+        r.qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"SENT_BACK", note:reason };
+        logAction("QA sent " + r.sn + " back — not released from rework (" + r.releaseId + ")",
+          { locationId:r.hqId, highPriority:true, stateChanges:"Awaiting QA → still in rework", comments:"Reason: " + reason });
+        notify("QA did not release " + r.sn + " from rework: " + reason, ["ADMIN"], [], r.hqId);
+      }
+      delete RWQ[releaseId];
+      commit(); closeModal(); renderNav(); render();
+      toast("Sent back. The unit stays in rework.", "good");
+    }catch(e){ go.disabled = false; showWhy("rwsb-box", e.message || "The server refused that."); }
+  };
+}
 
 /* All three QA actions are irreversible in the way that matters — they either create
    stock or close a batch — so each one states its consequence and waits for a second
