@@ -16143,10 +16143,12 @@ function toast(msg, kind){
    is permanent, so re-binding accumulated one dead listener per dialog opened. */
 let MODAL_CLEANUP = null;     // set by whoever needs teardown, cleared on close
 let MODAL_RETURN  = null;     // element that had focus when the dialog opened
+let MODAL_DIRTY   = false;    // a person has typed or chosen something in the open dialog
 
 function closeModal(){
   if(MODAL_CLEANUP){ try{ MODAL_CLEANUP(); }catch(e){} MODAL_CLEANUP = null; }
   $("#modal-root").innerHTML = "";
+  MODAL_DIRTY = false;   // after: removing a focused, edited field fires its change event
   if(MODAL_RETURN && document.contains(MODAL_RETURN)){
     try{ MODAL_RETURN.focus(); }catch(e){}
   }
@@ -16156,6 +16158,7 @@ function modalOpen(){ return !!$("#modal-root .modal"); }
 
 function modal(title, bodyHTML, footerHTML){
   MODAL_RETURN = document.activeElement;
+  MODAL_DIRTY = false;
   $("#modal-root").innerHTML =
     '<div class="modal-bg" data-close="1">' +
       '<div class="modal" role="dialog" aria-modal="true" aria-label="' + esc(title) + '">' +
@@ -16174,9 +16177,33 @@ function modal(title, bodyHTML, footerHTML){
   return m;
 }
 
-/* Bound once, at parse time, for the life of the page. */
+/* Bound once, at parse time, for the life of the page.
+
+   The backdrop closes the dialog only when the press STARTED on the backdrop. A browser
+   sends the click to the nearest element holding both the press and the release, so
+   pressing inside a field - to select a word, to move the cursor - and letting go a few
+   pixels past the dialog's edge used to arrive here as a click on the backdrop, and the
+   dialog shut with everything typed in it. Reported 5 Oct 2026 as dialogs closing in
+   the middle of writing. The Close buttons are their own target and are unaffected. */
+let MODAL_PRESS = null;
+/* And once anything has been typed or chosen in the dialog, the backdrop does not close it
+   at all - only Close, Cancel or Escape, which are deliberate. Asked for by the owner on 5 Oct
+   2026 after Change expiry date shut while he was moving to the reason field, a case the
+   press-origin rule above could not be shown to cover. Only a person's own edits count
+   (isTrusted), so a dialog that fills itself in still closes on a backdrop click. */
+$("#modal-root").addEventListener("pointerdown", e => { MODAL_PRESS = e.target; });
+["input", "change"].forEach(type => $("#modal-root").addEventListener(type, e => {
+  if(e.isTrusted && e.target.matches && e.target.matches("input, select, textarea")) MODAL_DIRTY = true;
+}));
 $("#modal-root").addEventListener("click", e => {
-  if(e.target.dataset && e.target.dataset.close) closeModal();
+  const t = e.target;
+  const press = MODAL_PRESS; MODAL_PRESS = null;
+  if(!(t.dataset && t.dataset.close)) return;
+  if(t.classList.contains("modal-bg")){
+    if(press !== t) return;
+    if(MODAL_DIRTY){ toast("This dialog has unsaved input. Use Close or Cancel to leave it.", "warn"); return; }
+  }
+  closeModal();
 });
 document.addEventListener("keydown", e => {
   if(e.key !== "Escape" || !modalOpen()) return;
@@ -16220,6 +16247,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.55.1", date: "5 October 2026", groups: [
+    { h:"Dialogs no longer close while you are filling them in", items:[
+      "A dialog closed if a click ended on the dark area around it — for example when moving from one field to the next. That no longer happens.",
+      "Once you have typed or chosen anything in a dialog, clicking the dark area around it does not close it. Use <b>Close</b>, <b>Cancel</b> or <b>Esc</b> to leave it."
+    ] }
+  ] },
   { version: "2.55.0", date: "5 October 2026", groups: [
     { h:"The label on the unit is read, not only its serial", items:[
       "When a unit is scanned — receiving a delivery or a return, sending devices out, or in the procedure report — and the <b>expiry date</b> or <b>manufacturing date</b> on its label differs from the record, the app now shows both side by side and asks you to confirm what the label says.",
