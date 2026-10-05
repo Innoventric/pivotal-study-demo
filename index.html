@@ -11340,6 +11340,44 @@ function reworkLabelProblem(deviceSn, expectedExpiry, label){
   return null;
 }
 
+/* WHAT THE LABEL SAYS ABOUT A UNIT WE ALREADY HOLD (5 Oct 2026, the owner). A unit that went out
+   and came back - or was relabelled anywhere - was matched by its serial and the rest of the
+   label was thrown away, so a new expiry printed on it never reached the record.
+
+   labelData: { sn, expiry, mfgDate, format } from any payload; expiry and mfgDate are "" when
+   the payload does not carry them (a bare serial carries neither). Throws as readLabel does.
+
+   labelDiff: the fields where the label disagrees with the stored unit, as
+   [{ field: "expiration"|"mfgDate", label, stored }] - only fields the label actually
+   carries, and only when the label is THIS unit's (snKey equal; a reworked "-R" label still
+   names the same unit). [] when they agree or the label says nothing. One rule, read by the
+   server (deviceService, the authority) and by the page. */
+function labelData(code){
+  var raw = String(code == null ? "" : code).trim();
+  if(!raw) throw QrError("EMPTY", "Nothing was scanned.");
+  var g = parseGs1(raw);
+  if(g && g.serial){
+    return { sn: g.serial.toUpperCase(), expiry: g.expiry || "", mfgDate: g.productionDate || "", format: "GS1" };
+  }
+  var multi = /\n/.test(raw.replace(/\r/g, "\n")) || raw.split(/\s+/).length > 1;
+  if(multi){
+    var p = parseDeviceQr(raw);
+    return { sn: p.sn, expiry: p.expiryDate, mfgDate: p.mfgDate, format: "LABEL" };
+  }
+  return { sn: raw.toUpperCase(), expiry: "", mfgDate: "", format: "SN" };
+}
+function labelDiff(device, label){
+  if(!device || !label || !label.sn || snKey(label.sn) !== snKey(device.sn)) return [];
+  var out = [];
+  if(label.expiry && label.expiry !== String(device.expiration || "").slice(0, 10)){
+    out.push({ field: "expiration", label: label.expiry, stored: String(device.expiration || "").slice(0, 10) });
+  }
+  if(label.mfgDate && label.mfgDate !== String(device.mfgDate || "").slice(0, 10)){
+    out.push({ field: "mfgDate", label: label.mfgDate, stored: String(device.mfgDate || "").slice(0, 10) });
+  }
+  return out;
+}
+
 /** The DS size this Unica size requires. Mirrors UNICA_TO_DS in the app. */
 function requiredDsSize(unicaSize){
   return ({ S: "Short", M: "Short", L: "Long", XL: "Long" })[unicaSize] || null;
@@ -11355,6 +11393,8 @@ var api = {
   lotOf: lotOf,
   readLabel: readLabel,
   reworkLabelProblem: reworkLabelProblem,
+  labelData: labelData,
+  labelDiff: labelDiff,
   normaliseRef: normaliseRef,
   requiredDsSize: requiredDsSize,
   REF_MAP: REF_MAP,
@@ -13375,7 +13415,8 @@ const CAPABILITIES = {
   recordPastMove:  ["ADMIN"],  // document a move that already happened; see roleStore.js
   manageRework:    ["ADMIN"],  // send a unit or a lot for rework and bring it back; roleStore.js
   editExpiry:      ["ADMIN","QA"],  // change one unit's expiry date, with a reason; roleStore.js
-  releaseRework:   ["QA"]   // QA releases a unit back from rework into stock; never the admin who brought it back
+  releaseRework:   ["QA"],  // QA releases a unit back from rework into stock; never the admin who brought it back
+  approveLabelChange: ["ADMIN","QA"]  // apply a scanned label's dates to the unit; on the spot if they scanned it; roleStore.js
 };
 /* Every role the signed-in user holds, primary first. A user can carry a second role
    alongside their own - a site employee who also runs a warehouse - and capabilities are
@@ -14344,8 +14385,10 @@ function qaTodoCount(){
      them back, who cannot sign them. */
   const rw = can("releaseRework")
     ? reworkReleases().filter(r => r.status === "AWAITING_QA" && String(r.requestedBy || "").toLowerCase() !== me).length : 0;
-  if(!can("approveRegistration")) return rw;
-  return openBatches().filter(b => !iProducedBatch(b)).length + rw;
+  /* Labels that disagreed with the record (5 Oct 2026) wait for QA or an App Admin. */
+  const lbl = can("approveLabelChange") ? labelChanges().filter(r => r.status === "AWAITING").length : 0;
+  if(!can("approveRegistration")) return rw + lbl;
+  return openBatches().filter(b => !iProducedBatch(b)).length + rw + lbl;
 }
 
 async function loadRemoteStore(){
@@ -16177,6 +16220,13 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.55.0", date: "5 October 2026", groups: [
+    { h:"The label on the unit is read, not only its serial", items:[
+      "When a unit is scanned — receiving a delivery or a return, sending devices out, or in the procedure report — and the <b>expiry date</b> or <b>manufacturing date</b> on its label differs from the record, the app now shows both side by side and asks you to confirm what the label says.",
+      "Your confirmation goes to <b>QA or an App Admin</b> for approval; they see it in <b>QA Approval</b> and are notified. Until then the unit keeps its recorded dates, stays usable, and shows <b>Label change pending</b> in Stock Overview. An App Admin or QA who scans the label updates the unit at once.",
+      "When it is approved, the unit’s dates follow the label and its status follows the expiry date. A label whose expiry date has passed is not accepted by the scan."
+    ] }
+  ] },
   { version: "2.54.0", date: "4 October 2026", groups: [
     { h:"Change a unit’s expiry date", items:[
       "An <b>App Admin</b> or <b>QA</b> can now press <b>Change expiry</b> beside any unit in <b>Stock Overview</b>, choose the new date and give a reason. The change is written to the log with the old and the new date.",
@@ -18734,6 +18784,7 @@ async function boot(){
         // Role-scoped, so it is a separate call; a refusal must not blank the app.
         S.db.batches = await loadBatches();
         S.db.reworkReleases = await loadReworkReleases();
+        S.db.labelChanges = await loadLabelChanges();
       }
       catch(e){ toast("Could not load live data from the server: " + (e.message || "unknown error"), "bad"); }
       for(const local of held){
@@ -21250,6 +21301,265 @@ function findDeviceByScan(rawQr){
   return { device: device || null, parsed };
 }
 
+/* ---- WHAT THE LABEL SAYS (5 Oct 2026, the owner) ---------------------------------------------
+   A unit that went out and came back was scanned, found by its serial, and put back into
+   stock with its OLD dates: every scan field read the whole label and kept only the serial.
+   So a unit relabelled with a new expiry went on carrying the old one.
+
+   the owner's decisions, asked: on EVERY scan of a unit we hold, a label whose expiry or
+   manufacturing date differs from the record is shown side by side; the person scanning
+   confirms it; that files a LabelChanges request which QA or an App Admin approves (they are
+   alerted). An Admin or QA who scans it approves on the spot. Until then the unit keeps its
+   dates, stays usable and carries a "Label change pending" mark. A label whose expiry has
+   passed is still sent for approval, but the unit is not accepted by the scan that read it.
+   Not on the public courier page (no account) and not on the rework return (its own label
+   rule). deviceQr.labelDiff is the one comparison, read here and by the server.
+
+   labelChecked(context, onCode) wraps a scan field's handler: no difference, no label, an
+   unknown serial or a closed (used/rejected) unit all go straight to the handler, which
+   reports them as it always has. */
+function labelChanges(){ return (S.db && Array.isArray(S.db.labelChanges)) ? S.db.labelChanges : []; }
+function pendingLabelChange(deviceId){
+  return labelChanges().find(r => r.deviceId === deviceId && r.status === "AWAITING") || null;
+}
+async function loadLabelChanges(){
+  if(!S.backend) return labelChanges();
+  try{ return await api("GET", "/api/label-changes"); }
+  catch(e){ return []; }
+}
+async function refreshLabelChanges(authoritative){
+  const fresh = await loadLabelChanges();
+  S.db.labelChanges = Array.isArray(fresh) ? fresh : labelChanges();
+  if(authoritative && authoritative.changeId){
+    const i = S.db.labelChanges.findIndex(r => r.changeId === authoritative.changeId);
+    if(i >= 0) S.db.labelChanges[i] = authoritative; else S.db.labelChanges.unshift(authoritative);
+  }
+}
+function labelFieldName(f){ return f === "mfgDate" ? "Manufacturing date" : "Expiry date"; }
+function labelMismatch(code){
+  if(!window.DeviceQr || !window.DeviceQr.labelDiff || isExternalUser()) return null;
+  let label;
+  try{ label = window.DeviceQr.labelData(code); }catch(e){ return null; }
+  if(label.format === "SN") return null;
+  const d = S.db.devices.find(x => sameSn(x.sn, label.sn));
+  if(!d || d.status === "USED" || d.status === "REJECTED") return null;
+  const changes = window.DeviceQr.labelDiff(d, label);
+  if(!changes.length) return null;
+  const key = list => list.map(c => c.field + "=" + c.label).sort().join("|");
+  const open = pendingLabelChange(d.id);
+  return { device:d, label, changes, alreadyWaiting: !!(open && key(open.changes || []) === key(changes)),
+           expired: !!(label.expiry && label.expiry < todayISO()) };
+}
+function labelChecked(context, onCode){
+  return function(code, manual){
+    const self = this;
+    const run = () => onCode.call(self, code, manual);
+    const m = labelMismatch(code);
+    if(!m) return run();
+    /* NO NETWORK (the procedure report works offline): the request cannot reach anybody, and
+       blocking the scan in the middle of a procedure is worse than the old dates for an hour.
+       The unit stays usable either way, so the scan goes ahead and the person is told,
+       plainly, that the change was NOT sent. An expired label is still not accepted. */
+    if(S.backend && typeof navigator !== "undefined" && navigator.onLine === false){
+      if(m.expired) return toast(m.device.sn + ": the label says it expired on " + fmtDate(m.label.expiry) +
+        ", so it is not accepted. There is no network to record the label change - scan it again when it is back.", "bad");
+      toast(m.device.sn + ": the label differs from the record, but there is no network to send the change. " +
+        "Scan it again when the network is back.", "warn");
+      return run();
+    }
+    if(m.alreadyWaiting && !can("approveLabelChange")){
+      if(m.expired) return toast(m.device.sn + ": the label says it expired on " + fmtDate(m.label.expiry) +
+        ". A label change is already waiting for approval; the unit is not accepted here.", "bad");
+      toast(m.device.sn + ": the label change is already waiting for QA/Admin approval.", "warn");
+      return run();
+    }
+    askLabelChange(m, code, manual, context).then(ok => { if(ok) run(); });
+  };
+}
+function askLabelChange(m, code, manual, context){
+  const approver = can("approveLabelChange");
+  return new Promise(resolve => {
+    let settled = false;
+    const settle = v => { if(!settled){ settled = true; resolve(v); } };
+    modal("The label differs from the record",
+      '<p>The label on <b class="mono">' + esc(m.device.sn) + '</b> does not match what the system holds:</p>' +
+      '<div class="tbl-wrap"><table><thead><tr><th></th><th>In the system</th><th>On the label</th></tr></thead><tbody>' +
+        m.changes.map(c => '<tr><td>' + esc(labelFieldName(c.field)) + '</td><td>' + esc(c.stored ? fmtDate(c.stored) : "not set") +
+          '</td><td><b>' + esc(fmtDate(c.label)) + '</b></td></tr>').join("") +
+      '</tbody></table></div>' +
+      (approver
+        ? '<p>Confirm only if the label on the unit really says this. You hold the approval, so the unit is <b>updated now</b>, under your name.</p>'
+        : '<p>Confirm only if the label on the unit really says this. The change goes to <b>QA or an App Admin for approval</b>; until then the unit keeps its recorded dates.</p>') +
+      (m.expired ? '<div class="warn">The label\'s expiry date has passed. The change is still recorded, but this unit is <b>not accepted</b> here.</div>' : '') +
+      whyBox("lbl-why"),
+      '<div class="row"><button class="btn btn-primary" id="lbl-go">' + (approver ? 'Confirm and update' : 'Confirm — send for approval') + '</button>' +
+        '<button class="btn" data-close="1">Cancel</button></div>');
+    MODAL_CLEANUP = () => {
+      settle(false);
+      toast("Not accepted: the label and the record disagree. Check the label, then scan again.", "warn");
+    };
+    $("#lbl-go").onclick = async () => {
+      const go = $("#lbl-go"); go.disabled = true; clearWhy("lbl-why");
+      try{
+        const out = await submitLabelChange(m, code, manual, context);
+        MODAL_CLEANUP = null; closeModal(); renderNav();
+        if(out.auditFailed) toast("Recorded, but the log line could not be written. Record it by hand.", "bad");
+        else if(m.expired) toast(m.device.sn + " is expired according to its label, so it is not accepted here." +
+          (out.applied ? " The record now says so." : " The change waits for approval."), "bad");
+        else toast(out.applied ? m.device.sn + " updated from its label." :
+          "Sent to QA/Admin for approval. " + m.device.sn + " keeps its recorded dates until then.", "good");
+        settle(!m.expired && !(out.device && out.device.status === "EXPIRED"));
+      }catch(e){
+        if(e.code === "OFFLINE"){
+          MODAL_CLEANUP = null; closeModal();
+          toast(m.device.sn + ": the network dropped, so the label change was NOT sent. Scan it again when the network is back.", "warn");
+          return settle(!m.expired);
+        }
+        go.disabled = false; showWhy("lbl-why", e.message || "The server refused that.");
+      }
+    };
+  });
+}
+async function submitLabelChange(m, code, manual, context){
+  if(!Array.isArray(S.db.labelChanges)) S.db.labelChanges = [];
+  if(S.backend){
+    const out = await api("POST", "/api/devices/" + encodeURIComponent(m.device.id) + "/label-change",
+      { labelCode:String(code).slice(0, 600), labelManual:!!manual, context, locationId:m.device.locationId || "" });
+    if(out.device){
+      const i = S.db.devices.findIndex(x => x.id === m.device.id);
+      if(i >= 0) S.db.devices[i] = out.device;
+    }
+    if(out.audit) S.db.logs.unshift(out.audit);
+    if(out.change) await refreshLabelChanges(out.change);
+    commit();
+    return out;
+  }
+  /* Standalone: mirror deviceService.requestLabelChange / applyLabelChange. */
+  const now = nowISO();
+  labelChanges().filter(r => r.deviceId === m.device.id && r.status === "AWAITING")
+    .forEach(r => { r.status = "SUPERSEDED"; });
+  const r = { changeId:"LBL-" + now.replace(/[^0-9]/g, "").slice(0, 14) + "-" + Math.random().toString(16).slice(2, 8).toUpperCase(),
+    deviceId:m.device.id, sn:m.device.sn, ref:m.device.ref || "", productType:m.device.productType || "", size:m.device.size || "",
+    changes:m.changes, label:Object.assign({}, m.label, { manual:!!manual, at:now }), context, locationId:m.device.locationId || "",
+    requestedBy:(S.me && S.me.email) || "", requestedByName:(S.me && S.me.name) || "", requestedAt:now, status:"AWAITING" };
+  S.db.labelChanges.unshift(r);
+  const text = m.changes.map(c => labelFieldName(c.field).toLowerCase() + " " + (c.stored || "not set") + " → " + c.label).join(" · ");
+  if(can("approveLabelChange")){
+    applyLabelChangeLocally(r, "Approved on the spot by the person who scanned it.");
+    logAction("Label data applied to " + r.sn + " — approved on the spot", { locationId:r.locationId, highPriority:true,
+      stateChanges:text, comments:"Label scanned on " + context + "." });
+    commit();
+    return { change:r, applied:true, device:m.device };
+  }
+  logAction("Label differs from the record: " + r.sn + " — awaiting QA/Admin approval (" + r.changeId + ")",
+    { locationId:r.locationId, highPriority:true, stateChanges:text, comments:"Label scanned on " + context + "." });
+  notify("The label on " + r.sn + " differs from its record (" + text + "); waiting for approval (QA Approval).",
+    ["QA","ADMIN"], [], r.locationId);
+  commit();
+  return { change:r, applied:false, device:m.device };
+}
+function applyLabelChangeLocally(r, note){
+  const u = S.db.devices.find(x => x.id === r.deviceId);
+  if(!u || u.status === "USED" || u.status === "REJECTED") throw new Error("That unit's record is closed, so its dates cannot change.");
+  (r.changes || []).forEach(c => { if(c.field === "expiration") u.expiration = c.label; if(c.field === "mfgDate") u.mfgDate = c.label; });
+  const past = u.expiration && u.expiration < todayISO();
+  if(past && ["IN_WH","IN_SITE","DELIVERED","ON_WAY"].includes(u.status)) u.status = "EXPIRED";
+  else if(!past && u.status === "EXPIRED"){
+    u.status = u.destinationId ? "ON_WAY" : u.receivedVia === "HAND_CARRY" ? "DELIVERED"
+      : (["WAREHOUSE","HQ"].includes((loc(u.locationId) || {}).type) ? "IN_WH" : "IN_SITE");
+  }
+  r.status = "APPROVED";
+  r.decision = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"APPROVED", note:note || "" };
+}
+/* THE APPROVAL QUEUE, on QA Approval. Shown to everybody who opens the screen; acted on by
+   QA and App Admin (approveLabelChange, enforced by the server). */
+function labelQaSection(){
+  const open = labelChanges().filter(r => r.status === "AWAITING");
+  if(!open.length) return "";
+  const mayAct = can("approveLabelChange");
+  const row = r => {
+    const lab = r.label || {};
+    return '<tr><td class="mono">' + esc(r.sn) + '</td>' +
+      '<td>' + esc((r.productType === "UNICA" ? "Unica " : r.productType ? "DS " : "") + (r.size || "")) + '</td>' +
+      '<td>' + (r.changes || []).map(c => esc(labelFieldName(c.field)) + ': ' + esc(c.stored ? fmtDate(c.stored) : "not set") +
+        ' → <b>' + esc(fmtDate(c.label)) + '</b>').join("<br>") + '</td>' +
+      '<td>' + esc(r.context || "—") + (lab.manual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</td>' +
+      '<td>' + esc(r.requestedByName || r.requestedBy) + '<br><span class="hint">' + esc(fmtTs(r.requestedAt)) + '</span></td>' +
+      '<td>' + (mayAct
+        ? '<div class="row"><button class="btn btn-sm btn-primary" data-lblapprove="' + esc(r.changeId) + '">Approve</button>' +
+          '<button class="btn btn-sm btn-danger" data-lblreject="' + esc(r.changeId) + '">Reject</button></div>'
+        : '<span class="hint">Waiting for QA / App Admin</span>') + '</td></tr>';
+  };
+  return '<div class="card"><div class="card-hd"><h2>Label changes — waiting for approval</h2>' +
+      '<span class="pill p-orange">' + open.length + '</span></div><div class="card-bd">' +
+    '<p class="hint" style="margin-top:0">A scanned label disagreed with the unit\'s record and the person who scanned it confirmed what the label says. ' +
+      'Approving writes the label\'s dates onto the unit, under your name; the status follows the expiry date.</p>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>Serial</th><th>Product</th><th>Change</th><th>Scanned on</th>' +
+      '<th>Confirmed by</th><th></th></tr></thead><tbody>' + open.map(row).join("") + '</tbody></table></div>' +
+    '</div></div>';
+}
+function confirmLabelApprove(changeId){
+  const r = labelChanges().find(x => x.changeId === changeId); if(!r) return;
+  modal("Apply the label to " + r.sn,
+    '<p>The unit\'s record will read:</p><ul>' + (r.changes || []).map(c => '<li>' + esc(labelFieldName(c.field)) + ': ' +
+      esc(c.stored ? fmtDate(c.stored) : "not set") + ' → <b>' + esc(fmtDate(c.label)) + '</b></li>').join("") + '</ul>' +
+    '<p class="hint">Confirmed from the label by ' + esc(r.requestedByName || r.requestedBy) + ' · ' + esc(fmtTs(r.requestedAt)) +
+      '. If the new expiry date has passed, the unit becomes expired.</p>' + whyBox("lba-why"),
+    '<div class="row"><button class="btn btn-primary" id="lba-go">Approve</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#lba-go").onclick = async () => {
+    const go = $("#lba-go"); go.disabled = true;
+    try{
+      let out;
+      if(S.backend){
+        out = await api("POST", "/api/label-changes/" + encodeURIComponent(changeId) + "/approve", {});
+        const i = S.db.devices.findIndex(x => x.id === r.deviceId);
+        if(i >= 0 && out.device) S.db.devices[i] = out.device;
+        if(out.audit) S.db.logs.unshift(out.audit);
+        await refreshLabelChanges(out.change);
+      }else{
+        applyLabelChangeLocally(r, "");
+        logAction("Label data applied to " + r.sn + " — approved (" + r.changeId + ")", { locationId:r.locationId, highPriority:true,
+          stateChanges:(r.changes || []).map(c => labelFieldName(c.field).toLowerCase() + " " + (c.stored || "not set") + " → " + c.label).join(" · "),
+          comments:"Confirmed from the label by " + (r.requestedByName || r.requestedBy) + "." });
+        out = {};
+      }
+      commit(); closeModal(); renderNav(); render();
+      if(out.auditFailed) toast("Applied, but the log line could not be written. Record it by hand.", "bad");
+      else toast(out.expired ? r.sn + " updated — its expiry date has passed, so it is now expired." : r.sn + " updated from its label.", "good");
+    }catch(e){ go.disabled = false; showWhy("lba-why", e.message || "The server refused that."); }
+  };
+}
+function askLabelReject(changeId){
+  const r = labelChanges().find(x => x.changeId === changeId); if(!r) return;
+  modal("Do not apply the label to " + r.sn,
+    '<p>The unit keeps its recorded dates. ' + esc(r.requestedByName || r.requestedBy) + ' is told why.</p>' +
+    '<div class="field"><label class="req" for="lbr-why">Why is the label not applied?</label>' +
+      '<input type="text" id="lbr-why" maxlength="400" placeholder="e.g. wrong label on the box; the unit is being relabelled"></div>' +
+    whyBox("lbr-box"),
+    '<div class="row"><button class="btn btn-danger" id="lbr-go">Reject</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#lbr-go").onclick = async () => {
+    const reason = ($("#lbr-why").value || "").trim();
+    if(reason.length < 3) return showWhy("lbr-box", "Say why the label is not applied.");
+    const go = $("#lbr-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/label-changes/" + encodeURIComponent(changeId) + "/reject", { reason });
+        if(out.audit) S.db.logs.unshift(out.audit);
+        await refreshLabelChanges(out.change);
+      }else{
+        r.status = "REJECTED";
+        r.decision = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"REJECTED", note:reason };
+        logAction("Label change not applied to " + r.sn + " (" + r.changeId + ")", { locationId:r.locationId, highPriority:true,
+          stateChanges:"not applied — the record keeps its dates", comments:"Reason: " + reason });
+      }
+      commit(); closeModal(); renderNav(); render();
+      toast("Rejected. " + r.sn + " keeps its recorded dates.", "good");
+    }catch(e){ go.disabled = false; showWhy("lbr-box", e.message || "The server refused that."); }
+  };
+}
+
 function resetArrival(){
   const me = S.db.users.find(u => u.email === S.me.email) || {};
   AR = {
@@ -21371,7 +21681,7 @@ VIEWS.arrival = {
       inScope(d.destinationId || d.locationId));
     /* How many units are fully cleared - the header count for step 2. */
     const cleared = AR.units.filter(arUnitPassed).length;
-    SCANFIELDS["ar-scan"] = { label:"device label", onCode:(code, manual) => {
+    SCANFIELDS["ar-scan"] = { label:"device label", onCode:labelChecked("Receive a Delivery", (code, manual) => {
       let hit;
       /* Reads the real four-line label, and still accepts a serial typed by hand. It
          used to compare the raw scan against a serial number, so scanning an actual
@@ -21424,7 +21734,7 @@ VIEWS.arrival = {
          the person. */
       if(!AR.siteId) AR.siteId = target || "";
       saveDrafts(); render();
-    }};
+    })};
 
     /* Units carried in by the team are counted out separately. The receiver's next move is
        the same either way - the four checks - but "the team brought these" answers the
@@ -25393,7 +25703,7 @@ VIEWS.clinical = {
 
     /* Stage 2: each unit at the table is scanned onto its own verification card. */
     SCANFIELDS["pt-dev-scan"] = { label:"device label",
-      onCode:(code, manual) => ptAddDeviceUnit(code, manual) };
+      onCode:labelChecked("the procedure report", (code, manual) => ptAddDeviceUnit(code, manual)) };
 
     /* The two scanned device identifiers in stage 4. Both read the real label as well as
        a typed serial - they used to compare the raw scan against a serial number, so a
@@ -25411,7 +25721,7 @@ VIEWS.clinical = {
        The serial is kept alongside the REF because the REF names the MODEL and the serial
        names the UNIT, and inventory only moves per unit. failRef/replRef keep their old
        meaning so the report and its PDF are unchanged. */
-    SCANFIELDS["fail-scan"] = { label:"failed device label", onCode:(code, manual) => {
+    SCANFIELDS["fail-scan"] = { label:"failed device label", onCode:labelChecked("the procedure report (failed device)", (code, manual) => {
       let d;
       try{ d = resolveScannedDevice(code).device; }
       catch(e){ return toast(e.message || "That does not look like a device label.", "bad"); }
@@ -25424,8 +25734,8 @@ VIEWS.clinical = {
                  " — confirm below to take it out of stock."
               : "Recorded as typed. No unit matched, so nothing will leave stock.", d ? "good" : "bad");
       render();
-    }};
-    SCANFIELDS["repl-scan"] = { label:"replacement device label", onCode:(code, manual) => {
+    })};
+    SCANFIELDS["repl-scan"] = { label:"replacement device label", onCode:labelChecked("the procedure report (replacement)", (code, manual) => {
       let d;
       try{ d = resolveScannedDevice(code).device; }
       catch(e){ return toast(e.message || "That does not look like a device label.", "bad"); }
@@ -25449,7 +25759,7 @@ VIEWS.clinical = {
                    (sizeOk ? "" : " | SIZE MISMATCH against assigned " + p.unicaSize) });
       }
       commit(); scheduleCaseFileSave(p); render();
-    }};
+    })};
 
     const form = $("#cform");
     if(!form) return;
@@ -26973,7 +27283,7 @@ VIEWS.shipment = {
    whole shipment is confirmed together at the end. */
 SCANFIELDS["sh-scan"] = {
   label:"device to send",
-  onCode(code, wasManual){
+  onCode:labelChecked("Send Devices Out", function(code, wasManual){
     if(!SH) return;
     SH.lines = SH.lines || [];
     if(!SH.originId){ render(); return showWhy("sh-why", "Choose where the units are coming from (From) first."); }
@@ -27017,7 +27327,7 @@ SCANFIELDS["sh-scan"] = {
     clearWhy("sh-why");
     delete MANUAL_OPEN["sh-scan"];
     render();
-  }
+  })
 };
 
 /* When a unit may be added by choosing it from stock instead of scanning its label.
@@ -30309,7 +30619,9 @@ function unitDetailTable(units, opts){
           (d.version ? ' <span class="hint" title="product version">v ' + esc(d.version) + '</span>' : '') + '</td>' +
         '<td>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</td>' +
         '<td>' + where + '</td>' +
-        '<td>' + unitStatusPill(d) + '</td>' +
+        '<td>' + unitStatusPill(d) +
+          (pendingLabelChange(d.id) ? ' <span class="pill p-orange" title="A scanned label disagrees with this record - waiting for QA/Admin approval in QA Approval">Label change pending</span>' : '') +
+          '</td>' +
         '<td' + (exp && exp <= soon ? ' class="warn-cell" title="expires within 90 days"' : '') +
           '>' + esc(exp ? fmtDate(exp) : "—") + '</td>' +
         '<td>' + (d.allocatedTo ? '<span class="pill p-blue">' + esc(reservedForCode(d)) + '</span>'
@@ -30506,7 +30818,8 @@ function mvText(m){
                                        (m.note ? " (version " + m.note + ")" : "");
     case "PUT_BACK":            return "Put back into stock (was used)";
     case "EXPIRY_CHANGED":      return "Expiry date changed" + (m.note ? ": " + m.note : "");
-    case "EXPIRED":             return "Expired";
+    case "MFG_CHANGED":         return "Manufacturing date changed" + (m.note ? ": " + m.note : "");
+    case "EXPIRED":            return "Expired";
     default:                    return "Status changed" + (m.note ? ": " + m.note : "");
   }
 }
@@ -31188,7 +31501,7 @@ VIEWS.batches = {
   body(){
     const all = (S.db && Array.isArray(S.db.batches)) ? S.db.batches : [];
     const approver = can("approveRegistration");
-    const rw = reworkQaSection();
+    const rw = labelQaSection() + reworkQaSection();
     if(!all.length){
       return rw + '<div class="empty">No batches yet. A batch appears here once production ' +
         'has been confirmed on the New Device Registration screen.</div>';
@@ -31261,6 +31574,8 @@ VIEWS.batches = {
         : "");
   },
   wire(){
+    $$("[data-lblapprove]").forEach(btn => btn.onclick = () => confirmLabelApprove(btn.dataset.lblapprove));
+    $$("[data-lblreject]").forEach(btn => btn.onclick = () => askLabelReject(btn.dataset.lblreject));
     $$("[data-rwapprove]").forEach(btn => btn.onclick = () => confirmReworkRelease(btn.dataset.rwapprove));
     $$("[data-rwsendback]").forEach(btn => btn.onclick = () => askReworkSendBack(btn.dataset.rwsendback));
     $$("[data-bapprove]").forEach(btn => btn.onclick = () => confirmApprove(btn.dataset.bapprove));
