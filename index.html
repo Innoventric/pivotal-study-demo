@@ -13416,7 +13416,8 @@ const CAPABILITIES = {
   manageRework:    ["ADMIN"],  // send a unit or a lot for rework and bring it back; roleStore.js
   editExpiry:      ["ADMIN","QA"],  // change one unit's expiry date, with a reason; roleStore.js
   releaseRework:   ["QA"],  // QA releases a unit back from rework into stock; never the admin who brought it back
-  approveLabelChange: ["ADMIN","QA"]  // apply a scanned label's dates to the unit; on the spot if they scanned it; roleStore.js
+  approveLabelChange: ["ADMIN","QA"],  // apply a scanned label's dates to the unit; on the spot if they scanned it; roleStore.js
+  correctUnit:     ["ADMIN"]  // correct any field of a unit's record, with a reason; roleStore.js
 };
 /* Every role the signed-in user holds, primary first. A user can carry a second role
    alongside their own - a site employee who also runs a warehouse - and capabilities are
@@ -16247,6 +16248,17 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.56.0", date: "5 October 2026", groups: [
+    { h:"App Admin: correct a unit’s record", items:[
+      "A new <b>Correct</b> button beside every unit in Stock Overview, for App Admins only. It fixes what the record got wrong: serial number, version, where the unit is, status, expiry and manufacturing dates, and which patient it is reserved for.",
+      "The dialog warns that nothing is scanned or checked, lists every change before you save, and requires a reason. Each correction is written to the log, high priority, with every field before → after, and appears in the unit’s history as a correction.",
+      "“In stock” follows the location: In WH at a warehouse or HQ, In Site at a hospital. A unit is put in transit only by a shipment, not by a correction."
+    ] },
+    { h:"FIFO: an App Admin is warned, not stopped", items:[
+      "When an App Admin sends a unit that is not the earliest-expiry stock, the FIFO warning and the unit that should go first are still shown, but initials and a reason are optional. The override is still recorded against the account, high priority.",
+      "Nothing changes for any other role: a FIFO override still needs initials and a reason."
+    ] }
+  ] },
   { version: "2.55.1", date: "5 October 2026", groups: [
     { h:"Dialogs no longer close while you are filling them in", items:[
       "A dialog closed if a click ended on the dark area around it — for example when moving from one field to the next. That no longer happens.",
@@ -26772,6 +26784,9 @@ function shipFifoAvailable(productType, size){
     .sort(fifoCompare);
   return pool.filter(d => d.allocatedTo).concat(pool.filter(d => !d.allocatedTo));
 }
+/* What an App Admin's FIFO override records when no reason was typed. The same words as
+   deviceService's, so a dispatch by anybody else still carries a reason the server accepts. */
+const ADMIN_FIFO_NO_REASON = "App Admin override — no reason given";
 function shipFifoFlags(){
   const flags = {};
   const byGroup = {};
@@ -27203,6 +27218,21 @@ VIEWS.shipment = {
           'A partner-company account cannot record the override — an Innoventric App Admin, ' +
           'Clinical PM or Manager has to. Swap in the units named above, remove them, or ask ' +
           'one of them to send this shipment.</div>'
+      /* AN APP ADMIN IS WARNED, NOT STOPPED (5 Oct 2026, the owner: "לאדמין מותר הכל"). The
+         notice and the swap list are the same; initials and reason become optional, and a
+         blank reason is recorded as ADMIN_FIFO_NO_REASON so the override is still on the
+         record, high priority, against the account. */
+      : anyBypass && hasRole("ADMIN")
+        ? '<div class="warn">One or more scanned units are not the earliest-expiry stock (FIFO).' +
+          fifoWantedList +
+          'As App Admin you may send them anyway. The FIFO override is recorded against your ' +
+          'account with the date; initials and a reason are optional.</div>' +
+          '<div class="grid g2" style="margin-top:8px">' +
+            '<div class="field"><label for="sh-ini">Your initials</label>' +
+              '<input type="text" id="sh-ini" maxlength="4" value="' + esc(SH.initials) + '" ' +
+              'autocomplete="off" style="max-width:110px"></div>' +
+            '<div class="field"><label for="sh-rsn">Reason for overriding FIFO</label>' +
+              '<input type="text" id="sh-rsn" value="' + esc(SH.reason) + '"></div></div>'
       : anyBypass
         ? '<div class="warn">One or more scanned units are not the earliest-expiry stock (FIFO).' +
           fifoWantedList +
@@ -27872,9 +27902,14 @@ function doShip(){
     return showWhy("sh-why", "Some units are not the earliest-expiry stock. A partner-company " +
       "account cannot record a FIFO override — an Innoventric App Admin, Clinical PM or Manager " +
       "has to. Remove those units, or ask one of them to send this shipment.");
-  if(anyBypass && (!SH.initials.trim() || !SH.reason.trim()))
+  /* An App Admin is warned on Step 3 and not stopped here - see the note there. */
+  const adminOverride = anyBypass && hasRole("ADMIN");
+  if(anyBypass && !adminOverride && (!SH.initials.trim() || !SH.reason.trim()))
     return showWhy("sh-why", "Step 3 — a FIFO override needs both your initials and a reason.");
   clearWhy("sh-why");
+  const ovInitials = SH.initials.trim().toUpperCase();
+  const ovReason = SH.reason.trim() || (adminOverride ? ADMIN_FIFO_NO_REASON : "");
+  const ovInitialled = ovInitials ? " (initialled " + ovInitials + ")" : "";
 
   const from = SH.originId, to = SH.destId;
   const shipper = SH.shipper.trim();
@@ -27889,7 +27924,7 @@ function doShip(){
       ((p.sent && p.sent.sn) || p.line.sn || "a unit") + " instead of " +
       (p.wanted ? p.wanted.sn : "the earliest-expiry unit")).join(", ");
     return " · FIFO OVERRIDE by " + ((S.me && S.me.email) || "unknown") +
-      " (initialled " + SH.initials.trim().toUpperCase() + ") — " + SH.reason +
+      ovInitialled + " — " + ovReason +
       (swaps ? " · sent " + swaps : "");
   };
   /* Ship earliest-expiry first, so every FIFO-compliant unit is the server's current
@@ -27917,8 +27952,7 @@ function doShip(){
                           (units.length === 1 ? " unit" : " units") + ") — " : "") +
         (carrying ? "carried by " + shipper + ", no courier; the four arrival checks are " +
                     "still required before it counts as stock. " : "") +
-        (bypassOf(u) ? ("FIFO OVERRIDE by " + S.me.email + " (initialled " +
-          SH.initials.trim().toUpperCase() + ") — " + SH.reason)
+        (bypassOf(u) ? ("FIFO OVERRIDE by " + S.me.email + ovInitialled + " — " + ovReason)
         : identifiedHow(u.id) + " and confirmed"),
       highPriority: bypassOf(u)
     });
@@ -27928,8 +27962,8 @@ function doShip(){
       masterPackId: packId || null, unitsInPack: units.length,
       from:locName(from), to:locName(to), shippedBy:shipper, shippedAt:at,
       identifierSource: identifiedHow(u.id),
-      fifoOverride:bypassOf(u), overrideReason: bypassOf(u) ? SH.reason : null,
-      overrideInitials: bypassOf(u) ? SH.initials.trim().toUpperCase() : null, actor:S.me.email
+      fifoOverride:bypassOf(u), overrideReason: bypassOf(u) ? ovReason : null,
+      overrideInitials: bypassOf(u) ? ovInitials : null, actor:S.me.email
     });
   }
   function finishShip(){
@@ -27985,8 +28019,7 @@ function doShip(){
              from the session. It is here so the two paths carry the same shape, and so the
              standalone preview below is not the only one that has it. */
           override: anyBypass
-            ? { by: S.me.email, initials: SH.initials.trim().toUpperCase(),
-                reason: SH.reason, at }
+            ? { by: S.me.email, initials: ovInitials, reason: ovReason, at }
             : null,
           units: units.map(u => ({
             deviceId:u.id, sn:u.sn, ref:u.ref, productType:u.productType, size:u.size,
@@ -28066,8 +28099,7 @@ function doShip(){
     lineItems:SH.lineItems.slice(), invoice:Object.assign({}, SH.invoice),
     /* Same shape the server stamps, `at` included - see the note on the backend branch. */
     override: anyBypass
-      ? { by:(S.me && S.me.email) || "", initials:SH.initials.trim().toUpperCase(),
-          reason:SH.reason, at }
+      ? { by:(S.me && S.me.email) || "", initials:ovInitials, reason:ovReason, at }
       : null,
     units: units.map(u => ({ deviceId:u.id, sn:u.sn, ref:u.ref, productType:u.productType,
                              size:u.size, expiration:u.expiration,
@@ -28221,6 +28253,9 @@ async function dispatchShipment(shipmentId){
     }
 
     const before = dev.status;
+    /* The server lets an App Admin past FIFO with no override on the note (5 Oct 2026) and
+       says so in wasOverride; the log line must record it either way. */
+    let srvOv = false;
     try{
       if(S.backend){
         const out = carrying
@@ -28232,6 +28267,7 @@ async function dispatchShipment(shipmentId){
               destinationId: to, shipperName: shipper, masterPackId: sh.shipmentId,
               shippedAt: leftAt,
               override: !!ov, overrideReason: reason });
+        srvOv = !ov && !!out.wasOverride;
         const i = S.db.devices.findIndex(x => x.id === out.device.id);
         if(i >= 0) S.db.devices[i] = out.device; else S.db.devices.push(out.device);
       }else{
@@ -28261,15 +28297,18 @@ async function dispatchShipment(shipmentId){
              backdated dispatch indistinguishable from a live one. */
           (backdated ? " · DEPARTURE BACKDATED to " + fmtTs(leftAt) +
                        ", recorded " + fmtTs(nowISO()) : "") +
-          (ov ? " · FIFO OVERRIDE — " + reason : ""),
-        highPriority: !!ov || backdated });
+          (ov ? " · FIFO OVERRIDE — " + reason
+              : srvOv ? " · FIFO OVERRIDE by " + ((S.me && S.me.email) || "unknown") + " — " +
+                        ADMIN_FIFO_NO_REASON : ""),
+        highPriority: !!ov || srvOv || backdated });
       queueBackup(locName(from) + "/Inventory_Logs",
         "shipment_" + now.sn + "_" + Date.now() + ".json", {
         type:"SHIPMENT_RECORD", shipmentId: sh.shipmentId,
         device:{ id:now.id, ref:now.ref, sn:now.sn, product:devName(now), expiration:now.expiration },
         from:locName(from), to:locName(to), shippedBy:shipper, shippedAt:leftAt,
         identifierSource: u.identifiedHow || "scanned",
-        fifoOverride: !!ov, overrideReason: ov ? ov.reason : null,
+        fifoOverride: !!ov || srvOv,
+        overrideReason: ov ? ov.reason : srvOv ? ADMIN_FIFO_NO_REASON : null,
         actor:(S.me && S.me.email) || "" });
       outcome.push({ deviceId:dev.id, sn:dev.sn, shipped:true });
       done++;
@@ -30394,6 +30433,161 @@ document.addEventListener("click", e => {
   if(t) askChangeExpiry(t.dataset.expiry);
 });
 
+/* ADMIN CORRECTION (5 Oct 2026, the owner: an App Admin may edit everything, with a warning, a
+   reason and a log line). Units only for now; ADMIN alone. The server is the authority
+   (deviceService.correctUnit) and writes the audit line; the dialog lists every change
+   before the press. "Stock" follows the location: IN_WH at a warehouse or HQ, IN_SITE at a
+   site. In transit is not offered - that is what a shipment is for. */
+const CORRECT_STATUS_OPTS = [["STOCK","In stock (follows the location)"], ["EXPIRED","Expired"],
+  ["USED","Used"], ["REJECTED","Rejected"], ["OBSOLETE","Obsolete"], ["REWORK","In rework"]];
+function stockStatusAt(locId){
+  const l = loc(locId) || {};
+  return l.type && l.type !== "WAREHOUSE" && l.type !== "HQ" ? "IN_SITE" : "IN_WH";
+}
+function askCorrectUnit(deviceId){
+  const d = S.db.devices.find(x => x.id === deviceId);
+  if(!d) return;
+  const statusLabel = s => (DEV_STATUS[s] || {}).label || s;
+  const curStatus = DEV_STATUS[d.status] && DEV_STATUS[d.status].stock ? "STOCK" : d.status;
+  const statusOpts = (CORRECT_STATUS_OPTS.some(o => o[0] === curStatus) ? [] :
+      [[curStatus, statusLabel(d.status) + " (as now)"]]).concat(CORRECT_STATUS_OPTS)
+    .map(o => '<option value="' + o[0] + '"' + (o[0] === curStatus ? " selected" : "") + '>' + esc(o[1]) + '</option>').join("");
+  const locOpts = (S.db.locations || []).slice().sort((a, b) => String(a.name).localeCompare(String(b.name)))
+    .map(l => '<option value="' + esc(l.id) + '"' + (l.id === d.locationId ? " selected" : "") + '>' + esc(l.name) + '</option>').join("");
+  const patOpts = '<option value="">— not reserved —</option>' +
+    (S.db.patients || []).slice().sort((a, b) => String(a.patientCode).localeCompare(String(b.patientCode)))
+      .map(p => '<option value="' + esc(p.id) + '"' + (p.id === d.allocatedTo ? " selected" : "") + '>' +
+        esc(p.patientCode || p.id) + '</option>').join("");
+  modal("Correct this unit's record",
+    '<div class="warn" style="margin:0 0 10px"><b>You are changing the record by hand.</b> Nothing is ' +
+      'scanned and no check is run. Every change is written to the log, high priority, under your ' +
+      'name with the reason. Use it to fix what the record got wrong — not instead of a shipment, ' +
+      'a check-in or a procedure report.</div>' +
+    '<div class="grid g2">' +
+      '<div class="field"><label for="cu-sn">Serial number</label><input type="text" id="cu-sn" class="mono" value="' + esc(d.sn || "") + '">' +
+        '<div class="hint">Product and size follow the serial.</div></div>' +
+      '<div class="field"><label for="cu-ver">Version</label><input type="text" id="cu-ver" maxlength="100" value="' + esc(d.version || "") + '"></div>' +
+      '<div class="field"><label for="cu-loc">Where it is</label><select id="cu-loc">' + locOpts + '</select></div>' +
+      '<div class="field"><label for="cu-st">Status</label><select id="cu-st">' + statusOpts + '</select></div>' +
+      '<div class="field"><label for="cu-exp">Expiry date</label><input type="date" id="cu-exp" value="' + esc(d.expiration || "") + '"></div>' +
+      '<div class="field"><label for="cu-mfg">Manufacturing date</label><input type="date" id="cu-mfg" value="' + esc(d.mfgDate || "") + '"></div>' +
+      '<div class="field"><label for="cu-pat">Reserved for</label><select id="cu-pat">' + patOpts + '</select></div>' +
+    '</div>' +
+    '<div id="cu-diff"></div>' +
+    '<div class="field"><label class="req" for="cu-why">Why — what is wrong in the record?</label>' +
+      '<input type="text" id="cu-why" maxlength="400" placeholder="e.g. the units never left the site; the rework return filed them at HQ"></div>' +
+    whyBox("cu-why-box"),
+    '<div class="row"><button class="btn btn-primary" id="cu-go">Save correction</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+
+  /* What would change, as the server will see it: only fields whose value differs. */
+  const read = () => {
+    const c = {};
+    const sn = ($("#cu-sn").value || "").trim().toUpperCase();
+    if(sn !== String(d.sn || "").toUpperCase()) c.sn = sn;
+    const ver = ($("#cu-ver").value || "").trim();
+    if(ver !== (d.version || "")) c.version = ver;
+    const l = $("#cu-loc").value;
+    if(l && l !== d.locationId) c.locationId = l;
+    const st = $("#cu-st").value;
+    if(st !== curStatus) c.status = st;
+    else if(c.locationId && st === "STOCK" && stockStatusAt(c.locationId) !== d.status) c.status = "STOCK";
+    const exp = $("#cu-exp").value || "";
+    if(exp !== (d.expiration || "")) c.expiration = exp;
+    const mfg = $("#cu-mfg").value || "";
+    if(mfg !== (d.mfgDate || "")) c.mfgDate = mfg;
+    const pat = $("#cu-pat").value || "";
+    if(pat !== (d.allocatedTo || "")) c.allocatedTo = pat;
+    return c;
+  };
+  const patCode = id => id ? ((S.db.patients.find(p => p.id === id) || {}).patientCode || id) : "nobody";
+  const lines = c => {
+    const out = [];
+    if("sn" in c) out.push("Serial: " + (d.sn || "—") + " → " + c.sn);
+    if("locationId" in c) out.push("Where: " + locName(d.locationId) + " → " + locName(c.locationId));
+    if("status" in c){
+      const to = c.status === "STOCK" ? stockStatusAt(c.locationId || d.locationId) : c.status;
+      out.push("Status: " + statusLabel(d.status) + " → " + statusLabel(to));
+    }
+    if("expiration" in c) out.push("Expiry: " + (d.expiration || "—") + " → " + (c.expiration || "—"));
+    if("mfgDate" in c) out.push("Manufacturing date: " + (d.mfgDate || "—") + " → " + (c.mfgDate || "—"));
+    if("version" in c) out.push("Version: " + (d.version || "—") + " → " + (c.version || "—"));
+    if("allocatedTo" in c) out.push("Reserved for: " + patCode(d.allocatedTo) + " → " + patCode(c.allocatedTo));
+    return out;
+  };
+  const paint = () => {
+    const ls = lines(read());
+    const movingNow = DEV_STATUS[d.status] && !DEV_STATUS[d.status].stock && (d.status === "ON_WAY" || d.status === "DELIVERED");
+    $("#cu-diff").innerHTML = ls.length
+      ? '<div class="info" style="margin:8px 0"><b>Will change:</b><ul style="margin:4px 0 0;padding-left:18px">' +
+          ls.map(x => '<li>' + esc(x) + '</li>').join("") + '</ul>' +
+          (movingNow && ("status" in read()) ? '<div class="hint">It is in transit now; the journey is cleared.</div>' : '') +
+          (d.allocatedTo && "allocatedTo" in read() ? '<div class="hint">ADMIN and CPM at the patient’s site are told.</div>' : '') +
+        '</div>'
+      : '<div class="hint" style="margin:8px 0">Nothing changed yet.</div>';
+  };
+  ["cu-sn","cu-ver","cu-loc","cu-st","cu-exp","cu-mfg","cu-pat"].forEach(id => {
+    $("#" + id).addEventListener("input", paint); $("#" + id).addEventListener("change", paint);
+  });
+  paint();
+
+  const go = $("#cu-go");
+  go.onclick = async () => {
+    const changes = read();
+    const reason = ($("#cu-why").value || "").trim();
+    if(!Object.keys(changes).length) return showWhy("cu-why-box", "Nothing has changed.");
+    if(reason.length < 3) return showWhy("cu-why-box", "A reason is required — what is wrong in the record?");
+    if("sn" in changes){
+      try{ window.DeviceQr.parseSn(changes.sn); }
+      catch(e){ return showWhy("cu-why-box", e.message || "That is not a valid serial number."); }
+      const clash = S.db.devices.find(x => x.id !== d.id && sameSn(x.sn, changes.sn));
+      if(clash) return showWhy("cu-why-box", "Another unit already carries " + clash.sn + ".");
+    }
+    if(changes.expiration && (changes.mfgDate || d.mfgDate) && changes.expiration <= (changes.mfgDate || d.mfgDate))
+      return showWhy("cu-why-box", "The expiry date must be after the manufacturing date.");
+    clearWhy("cu-why-box"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/devices/" + encodeURIComponent(deviceId) + "/correct", { changes, reason });
+        const i = S.db.devices.findIndex(x => x.id === deviceId);
+        if(i >= 0 && out.device) S.db.devices[i] = out.device;
+        if(out.audit) S.db.logs.unshift(out.audit);
+        MOVES.delete(deviceId);
+        commit(); closeModal(); render();
+        if(out.auditFailed) toast("The record is corrected, but the log line could not be written. Record it by hand.", "bad");
+        else toast(out.changed ? "Record corrected and logged." : "Nothing needed changing.", "good");
+        return;
+      }
+      /* Standalone: mirror deviceService.correctUnit. */
+      const summary = lines(changes);
+      const was = d.status, before = d.sn;
+      if("sn" in changes){ const p = window.DeviceQr.parseSn(changes.sn); d.sn = p.sn; d.productType = p.productType; d.size = p.size; }
+      if("version" in changes) d.version = changes.version;
+      if("mfgDate" in changes) d.mfgDate = changes.mfgDate;
+      if("expiration" in changes) d.expiration = changes.expiration;
+      if("allocatedTo" in changes){ d.allocatedTo = changes.allocatedTo; d.allocatedAt = changes.allocatedTo ? nowISO() : null; }
+      if("locationId" in changes) d.locationId = changes.locationId;
+      if("status" in changes) d.status = changes.status === "STOCK" ? stockStatusAt(d.locationId) : changes.status;
+      else if(DEV_STATUS[d.status] && DEV_STATUS[d.status].stock) d.status = stockStatusAt(d.locationId);
+      if((was === "ON_WAY" || was === "DELIVERED") && d.status !== was){ d.destinationId = null; d.masterPackId = null; }
+      commit();
+      logAction("Admin correction of " + (before !== d.sn ? before + " → " : "") + d.sn, {
+        locationId: d.locationId, highPriority: true,
+        stateChanges: summary.join(" · "),
+        comments: "Reason: " + reason + " | CORRECTED BY HAND by an App Admin; no scan, no check run in the app." });
+      closeModal(); render();
+      toast("Record corrected and logged.", "good");
+    }catch(e){
+      go.disabled = false;
+      showWhy("cu-why-box", e.message || "The server refused that.");
+    }
+  };
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-correct]");
+  if(t) askCorrectUnit(t.dataset.correct);
+});
+
 /* ====================================================== STOCK DASHBOARD == */
 /* locId replaced a free-text "search site name" box. Typing a name to filter columns
    meant guessing at its exact spelling and punctuation - several site names contain an
@@ -30639,7 +30833,9 @@ function unitDetailTable(units, opts){
   const mayRework   = can("manageRework") && !isExternalUser();
   /* CHANGE EXPIRY (4 Oct 2026): App Admin and QA, any unit that is not spent. */
   const mayExpiry   = can("editExpiry") && !isExternalUser();
-  const acts = mayObsolete || mayRestore || mayRework || mayExpiry;
+  /* ADMIN CORRECTION (5 Oct 2026): any unit, any status - the record is what is wrong. */
+  const mayCorrect  = can("correctUnit") && !isExternalUser();
+  const acts = mayObsolete || mayRestore || mayRework || mayExpiry || mayCorrect;
   const ncol = acts ? 7 : 6;
   const row = d => {
       const here = deviceAtLocation(d);
@@ -30677,6 +30873,9 @@ function unitDetailTable(units, opts){
             : '') +
           (mayExpiry && d.status !== "USED" && d.status !== "REJECTED"
             ? ' <button class="btn btn-sm" data-expiry="' + esc(d.id) + '">Change expiry</button>'
+            : '') +
+          (mayCorrect
+            ? ' <button class="btn btn-sm" data-correct="' + esc(d.id) + '" title="Admin: correct this unit’s record, with a reason">Correct</button>'
             : '') + '</td>' : '') +
         '</tr>' + (o.after ? o.after(d, ncol) : '');
   };
@@ -30785,7 +30984,8 @@ async function loadMovements(id){
 /* Events after which the unit is somewhere else. The rest - reserved, released, used,
    obsolete - happen to it where it stands. */
 const MV_MOVES = new Set(["REGISTERED", "SHIPPED", "HAND_CARRIED", "DELIVERED", "RECEIVED",
-  "RECEIVED_OVERRIDE", "RETURNED", "WITHDRAWN", "SCANNED", "REJECTED_ON_ARRIVAL", "MOVED_RETRO"]);
+  "RECEIVED_OVERRIDE", "RETURNED", "WITHDRAWN", "SCANNED", "REJECTED_ON_ARRIVAL", "MOVED_RETRO",
+  "CORRECTED"]);
 function mvPlace(m){
   if(m.locationId) return { key:m.locationId, label:locName(m.locationId) };
   if(m.event === "HAND_CARRIED") return { key:"hc:" + m.fromId + ">" + m.toId, moving:true,
@@ -30850,6 +31050,9 @@ function mvText(m){
     case "REWORK_RETURNED":     return "Back from rework, into stock at " + locName(m.toId) +
                                        (m.note ? " (version " + m.note + ")" : "");
     case "PUT_BACK":            return "Put back into stock (was used)";
+    case "CORRECTED":           return "Record corrected by an App Admin" +
+                                       (m.toId ? " — filed at " + locName(m.toId) + " (was " + locName(m.fromId) + ")" : "") +
+                                       (m.note ? ": " + m.note.replace(/^Admin correction — /, "") : "");
     case "EXPIRY_CHANGED":      return "Expiry date changed" + (m.note ? ": " + m.note : "");
     case "MFG_CHANGED":         return "Manufacturing date changed" + (m.note ? ": " + m.note : "");
     case "EXPIRED":            return "Expired";
