@@ -16248,6 +16248,15 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.56.1", date: "6 October 2026", groups: [
+    { h:"One press, one shipment", items:[
+      "Pressing <b>Confirm &amp; send all</b> twice no longer prepares the same shipment twice. The button reads <b>Preparing…</b> and does nothing more until the first press has been answered.",
+      "A unit already packed into a shipment that has not been handed over cannot go into a second one. Scanning it, choosing it from stock or confirming a shipment that holds it now stops with a message naming that shipment’s invoice number and destination."
+    ] },
+    { h:"Shipments are titled by their invoice number", items:[
+      "An opened shipment is headed <b>Invoice DDMMYY-NN</b> — the number on its paperwork — with the internal MP number beside it in small print. The In Transit list shows the invoice number on every shipment."
+    ] }
+  ] },
   { version: "2.56.0", date: "5 October 2026", groups: [
     { h:"App Admin: correct a unit’s record", items:[
       "A new <b>Correct</b> button beside every unit in Stock Overview, for App Admins only. It fixes what the record got wrong: serial number, version, where the unit is, status, expiry and manufacturing dates, and which patient it is reserved for.",
@@ -27250,8 +27259,9 @@ VIEWS.shipment = {
     '</div><div class="card-ft">' +
       whyBox("sh-why") +
       '<div class="row">' +
-        '<button class="btn btn-primary btn-lg" id="sh-go">' +
-          (carrying ? "Confirm &amp; hand over all" : "Confirm &amp; send all") + '</button>' +
+        '<button class="btn btn-primary btn-lg" id="sh-go"' + (SHIP_BUSY ? " disabled" : "") + '>' +
+          (SHIP_BUSY ? "Preparing…" : carrying ? "Confirm &amp; hand over all" : "Confirm &amp; send all") +
+        '</button>' +
         '<button class="btn" id="sh-clear">Start over</button>' +
         /* A DRAFT of the paperwork, from what is filled in above - to be checked before
            anything is confirmed. See previewShipmentDocs. */
@@ -27378,6 +27388,8 @@ SCANFIELDS["sh-scan"] = {
       return showWhy("sh-why", "That unit is already scanned.");
     }
     const known = S.db.devices.find(d => sameSn(d.sn, parsed.sn));
+    const pack = known && packHolding(known.id);
+    if(pack){ render(); return showWhy("sh-why", heldForPackMsg(known.sn, pack)); }
     SH.lines.push({
       sn: parsed.sn, ref: parsed.ref,
       size: parsed.size, productType: parsed.productType,
@@ -27439,6 +27451,8 @@ function addPickedUnit(productType){
   if(SH.lines.some(l => l.deviceId === d.id || sameSn(l.sn, d.sn))){
     render(); return showWhy("sh-why", "That unit is already on this shipment.");
   }
+  const pack = packHolding(d.id);
+  if(pack){ render(); return showWhy("sh-why", heldForPackMsg(d.sn, pack)); }
   SH.lines.push({
     sn: d.sn, ref: d.ref, size: d.size, productType: d.productType,
     expiration: d.expiration, mfgDate: d.mfgDate,
@@ -27657,6 +27671,21 @@ function committedUnitIds(){
    moments the answer changes without the array being replaced. Cheap: the next caller
    rebuilds one Set from a list that is never long. */
 function forgetCommitted(){ COMMITTED_MEMO = { src:null, n:-1, set:new Set() }; }
+/* WHICH box a unit is held for, and the sentence that says so - added 6 Oct 2026. The scan,
+   the stock pick and the confirm all refuse such a unit, and "already packed" without
+   naming the shipment sends the operator hunting for it. Named by its invoice number
+   first, because that is the number printed on the paperwork in their hand. */
+function packHolding(deviceId){
+  if(!deviceId) return null;
+  return (S.db.shipments || []).find(sh => !shipmentDispatched(sh) &&
+    (sh.units || []).some(u => u && u.deviceId === deviceId)) || null;
+}
+function heldForPackMsg(sn, sh){
+  return (sn || "That unit") + " is already held for another shipment — " +
+    (sh.invoiceNo ? "invoice " + sh.invoiceNo + " (" + sh.shipmentId + ")" : sh.shipmentId) +
+    " to " + locName(sh.destinationId) + ", packed and not yet sent. One unit cannot go in " +
+    "two boxes: send or cancel that shipment on In Transit first.";
+}
 /* Mirrors isDispatched in shipmentService.js, including the part that matters most: a row
    with no preparedAt predates the two-phase split and DID leave when it was recorded. */
 function shipmentDispatched(sh){
@@ -27868,7 +27897,15 @@ function inTransitTable(){
       '<td>' + unitStatusPill(d) + '</td></tr>').join("") +
     '</tbody></table></div>';
 }
+/* ONE PRESS, ONE SHIPMENT - added 6 Oct 2026. A double click on Confirm & send all filed two
+   shipment notes for the same unit (both "packed, not sent", MP-20261005200258-M4AF and its
+   twin): the second press arrived while the first POST was still in the air, so neither
+   could see the other. Set before the first await and cleared only when the request has
+   answered; the button is drawn disabled while it is set, and the server refuses a unit
+   already held as well (ALREADY_PACKED), so a second tab cannot do it either. */
+let SHIP_BUSY = false;
 function doShip(){
+  if(SHIP_BUSY) return;
   if(!SH.originId) return showWhy("sh-why", "Step 1 — choose where the units are coming from.");
   if(!SH.destId)   return showWhy("sh-why", "Step 1 — choose where they are going.");
   const req = shipReq();
@@ -27892,6 +27929,10 @@ function doShip(){
       return showWhy("sh-why", "A scanned unit (" + l.sn + ") is not in stock at this location. " +
         "Remove it, or check it in on the Receive a Delivery screen first.");
     if(l.expired) return showWhy("sh-why", "A scanned unit (" + l.sn + ") is past its expiry date.");
+    /* Asked again at the confirm, not only at the scan: the form is kept across screens, so
+       a line scanned yesterday may since have been packed into somebody else's box. */
+    const pack = packHolding(dev.id);
+    if(pack) return showWhy("sh-why", heldForPackMsg(l.sn, pack) + " Remove it from this shipment.");
     if(!l.confirmed) return showWhy("sh-why", "Step 2b — confirm every scanned line.");
   }
   const flags = shipFifoFlags();
@@ -27990,8 +28031,11 @@ function doShip(){
     /* The server enforces FIFO/override/transitions and owns the ETag, so each unit
        ships through the API; the local state is updated from what it returns. Units
        ship sequentially - the FIFO pick shipping first makes the next unit the pick. */
+    SHIP_BUSY = true;
+    const go = $("#sh-go");
+    if(go){ go.disabled = true; go.textContent = "Preparing…"; }
     (async () => {
-      let done = 0;
+      let done = 0, createdInvoice = "";
       const outcome = [];
       /* THE SHIPMENT NOTE IS FILED FIRST, and the order is the whole point.
 
@@ -28027,6 +28071,7 @@ function doShip(){
             handEntered: !!(SH.lines.find(l => l.deviceId === u.id) || {}).handEntered }))
         });
         packId = created.shipmentId;
+        createdInvoice = created.invoiceNo || "";
         /* FILE IT LOCALLY TOO, or the shipment just prepared is invisible on the screen
            this navigates to. In Transit reads S.db.shipments, and a view's load() runs
            ONCE per page load (see LOADED_VIEWS) - so a person who had already opened In
@@ -28046,7 +28091,11 @@ function doShip(){
         S.db.shipments.unshift(created);
         LOADED_VIEWS.delete("transit");
         LOADED_VIEWS.delete("shiplog");
+        forgetCommitted();
+        SHIP_BUSY = false;
       }catch(e){
+        SHIP_BUSY = false;
+        render();      // redraws the button enabled; the reason is set after, as everywhere
         /* Nothing has shipped. Say what did not happen rather than what did. */
         return showWhy("sh-why", (e.message || "The shipment note could not be filed.") +
           " Nothing has been sent — the units are still in stock and everything you " +
@@ -28075,7 +28124,8 @@ function doShip(){
            is the only one that exists if the shipment is cancelled instead of sent. */
         highPriority: anyBypass });
       resetShip(); renderNav();
-      toast("Shipment " + packId + " prepared. Nothing has left yet — confirm the " +
+      toast("Shipment " + (createdInvoice ? "invoice " + createdInvoice : packId) +
+            " prepared. Nothing has left yet — confirm the " +
             "hand-over on In Transit.", "good");
       S.view = "transit"; SHIPSEL = packId; renderNav(); render();
     })();
@@ -28113,7 +28163,7 @@ function doShip(){
       units.map(u => u.sn + " (" + identifiedHow(u.id) + ")").join(", ") + overrideNote(),
     highPriority: anyBypass });
   commit(); resetShip();
-  toast("Shipment " + packId + " prepared. Nothing has left yet — confirm the hand-over " +
+  toast("Shipment invoice " + S.db.shipments[0].invoiceNo + " prepared. Nothing has left yet — confirm the hand-over " +
         "on In Transit.", "good");
   S.view = "transit"; SHIPSEL = packId; renderNav(); render();
 }
@@ -28200,7 +28250,16 @@ function askDepartureTime(sh){
   });
 }
 
+/* The button disables itself, but the same shipment has two of them - on its row and on its
+   open card - so the guard that holds is this one, per shipment, until the press finishes. */
+const DISPATCHING = new Set();
 async function dispatchShipment(shipmentId){
+  if(DISPATCHING.has(shipmentId)) return;
+  DISPATCHING.add(shipmentId);
+  try{ return await dispatchShipmentOnce(shipmentId); }
+  finally{ DISPATCHING.delete(shipmentId); }
+}
+async function dispatchShipmentOnce(shipmentId){
   const sh = (S.db.shipments || []).find(x => x.shipmentId === shipmentId);
   if(!sh) return toast("That shipment could not be found.", "bad");
   if(shipmentDispatched(sh)) return toast("That shipment has already been dispatched.", "warn");
@@ -28365,7 +28424,9 @@ async function cancelPreparedShipment(shipmentId){
   const sh = (S.db.shipments || []).find(x => x.shipmentId === shipmentId);
   if(!sh || shipmentDispatched(sh)) return;
   modal("Cancel this shipment note",
-    '<p>Shipment <b class="mono">' + esc(shipmentId) + '</b> was prepared but never handed ' +
+    '<p>Shipment <b class="mono">' + esc(sh.invoiceNo ? "invoice " + sh.invoiceNo : shipmentId) + '</b>' +
+      (sh.invoiceNo ? ' <span class="hint mono">(' + esc(shipmentId) + ')</span>' : '') +
+      ' was prepared but never handed ' +
     'over. Cancelling removes the note and <b>releases its ' + ((sh.units || []).length) +
     ' unit(s)</b> back to available stock.</p>' +
     '<div class="info">No unit has moved, so nothing about the stock itself changes — ' +
@@ -28841,7 +28902,9 @@ VIEWS.transit = {
       const heldDays = waiting && sh.preparedAt ? daysSince(sh.preparedAt) : null;
       const heldLong = heldDays != null && heldDays >= 2;
       h += '<tr' + (sh.shipmentId === SHIPSEL ? ' class="sel"' : '') + '>' +
-        '<td>' + esc(fmtDate(String(sh.sentAt || "").slice(0, 10))) +
+        '<td>' + (invoiceNo(sh) ? '<div class="mono" style="font-weight:600">' +
+                   esc(invoiceNo(sh)) + '</div>' : '') +
+          esc(fmtDate(String(sh.sentAt || "").slice(0, 10))) +
           (sh.senderName ? '<div class="hint">by ' + esc(sh.senderName) + '</div>' : '') +
           (waiting ? '<div><span class="pill ' + (heldLong ? "p-red" : "p-orange") + '">' +
             'packed, not sent' + (heldDays ? ' · ' + heldDays + 'd' : '') + '</span></div>' +
@@ -29050,8 +29113,13 @@ function wireSignaturePad(){
 function shipmentCard(sh){
   const units = sh.units || [];
   let h = '<div class="card" style="margin-top:14px"><div class="card-hd">' +
-    '<h2>' + esc(sh.reconstructed ? "Movement on " + fmtDate(String(sh.sentAt || "").slice(0,10))
-                                  : sh.shipmentId) + '</h2></div><div class="card-bd">';
+    /* The invoice number is the title (the owner, 6 Oct 2026): it is the number on the paperwork
+       and the one people say out loud. The MP id is the internal key and stays beside it,
+       small, for support and for rows older than the invoice column. */
+    '<h2>' + (sh.reconstructed ? esc("Movement on " + fmtDate(String(sh.sentAt || "").slice(0,10)))
+             : invoiceNo(sh) ? 'Invoice ' + esc(invoiceNo(sh)) +
+               ' <span class="hint mono" style="font-weight:400">' + esc(sh.shipmentId) + '</span>'
+             : esc(sh.shipmentId)) + '</h2></div><div class="card-bd">';
 
   /* A reconstructed movement says so in one line rather than showing empty AWB and
      courier boxes. Empty boxes read as "somebody forgot to fill this in", which invites
