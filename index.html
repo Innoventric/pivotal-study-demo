@@ -11467,7 +11467,9 @@ var SCREENING_STEPS = [
 ];
 
 var ANAT_STAGES = [
-  { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval" },
+  /* No angle on the CT report (6 Oct 2026, the owner): the four angle fields were not needed
+     there. An angle recorded on it before then stays in the record, unshown. */
+  { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval", noAngle:true },
   { k:"model3d",   n:2,  label:"3D Model Evaluation",                kind:"eval", pm:true, sim:true },
   /* Printing cannot begin on somebody's say-so alone: a physical model gets made from
      it. Two parts on one card since 24 Sep 2026 (the owner): 3.1 PRINT REQUEST - a CPM,
@@ -11549,10 +11551,13 @@ var ANGLE_FIELDS = [
    field blank and the next one would unlock, which defeats the only thing the
    sequence exists to guarantee. */
 function stageRequired(s){
+  /* NO COMPLETION DATE TO TYPE (6 Oct 2026, the owner). Stages 1-7 used to be closed by
+     entering a date and time; now the Done button stamps who and when. An ops stage
+     therefore asks nothing of its fields at all - Done is the whole act (stage 3 still
+     needs its 3.1 request, added in stageMissing). */
   if(s.kind === "eval")  return [["suitability","Anatomical suitability"],
-                                 ["size","Recommended implant size"],
-                                 ["completionDate","Completion date"]];
-  if(s.kind === "ops")   return [["actualDate","Actual completion date"]];
+                                 ["size","Recommended implant size"]];
+  if(s.kind === "ops")   return [];
   /* Eligibility is two approvals and an arm. The arm is what stage 9 acts on, so a
      stage that closed without it would leave the randomisation with nothing to read. */
   if(s.kind === "approval") return [["eligibleByInnoventric","Patient eligible by Innoventric"],
@@ -11653,7 +11658,11 @@ function stageTouched(p, s){
      something done TO the task, not progress on it. */
   var admin = { status:1, assignedTo:1, dueDate:1, completedBy:1, completionDate:1,
                 requestedBy:1, requestedAt:1, reopenedBy:1, reopenedAt:1, reopenReason:1,
-                notRequiredBy:1, notRequiredAt:1 };
+                notRequiredBy:1, notRequiredAt:1,
+                /* An automatic assignment is no more work than one by hand. Every stage
+                   gets one since 6 Oct 2026, and each would otherwise read In progress
+                   the moment it opened. */
+                autoAssignedAt:1, autoAssignChanged:1 };
   return Object.keys(a).some(function(k){
     return !admin[k] && String(a[k] || "").trim() !== "";
   });
@@ -16248,6 +16257,17 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.57.0", date: "7 October 2026", groups: [
+    { h:"Every patient has a folder from registration", items:[
+      "A patient’s folder in SharePoint — <b>site › Clinical_Procedures › patient code</b> — is now created as soon as the patient is registered, with the folders the app files into: <b>anatomical</b> (CT report, 3D model, pliable model, road map) and <b>source_images</b>. It used to appear only when the first file was filed.",
+      "Patients registered earlier have been given theirs. Moving a patient to another site creates a folder there; files already filed stay where they are."
+    ] },
+    { h:"Screening", items:[
+      "Stage 1, the CT measurements report, no longer asks for angles.",
+      "Every evaluation stage is assigned automatically. Stage 1 goes to the site’s Responsible CPM when the CT is marked received; each later stage goes to the patient’s CPM as it opens.",
+      "<b>Done</b> replaces the typed completion date on stages 1–7. Pressing it records who finished the stage and when, and the stage shows <b>Done by</b> that person and time."
+    ] }
+  ] },
   { version: "2.56.1", date: "6 October 2026", groups: [
     { h:"One press, one shipment", items:[
       "Pressing <b>Confirm &amp; send all</b> twice no longer prepares the same shipment twice. The button reads <b>Preparing…</b> and does nothing more until the first press has been answered.",
@@ -23326,6 +23346,7 @@ VIEWS.screening = {
       st.done = cb.checked;
       st.by = cb.checked ? S.me.name : "";
       st.at = cb.checked ? nowLocalStamp() : "";   // date + time of ticking, automatically
+      if(cb.checked && cb.dataset.scr === "ct") autoAssignFirst(p);
       const before = p.status;
       p.status = recomputeWorkflow(p);
       logAction("Screening material updated", { locationId:p.siteId,
@@ -23535,7 +23556,13 @@ VIEWS.screening = {
         const complete = () => {
           a.status = "Completed";
           a.completedBy = S.me.name;
-          if(!a.completionDate) a.completionDate = nowISO().slice(0,16);
+          /* Stages 1-7: Done IS the date (6 Oct 2026) - the wall-clock time of the press.
+             An ops stage keeps it in actualDate too, where its readers have always looked.
+             Stages 8-9 keep what was typed: 9's date is the procedure, not the press. */
+          if(stage.kind === "eval" || stage.kind === "ops"){
+            a.completionDate = nowLocalStamp();
+            if(stage.kind === "ops") a.actualDate = a.completionDate;
+          }else if(!a.completionDate) a.completionDate = nowISO().slice(0,16);
         };
         closeModal();
 
@@ -23641,6 +23668,8 @@ VIEWS.screening = {
         const wasBy = a.completedBy, wasAt = a.completionDate;
         a.status = "In progress";
         a.completedBy = ""; a.completionDate = "";
+        /* An ops stage's actual date is Done's stamp now, so it goes with the signature. */
+        if(stage.kind === "ops") a.actualDate = "";
         a.reopenedBy = S.me.name; a.reopenedAt = nowISO(); a.reopenReason = why;
         closeModal();
         afterStageChange(p, stage, "Stage REOPENED after confirmation", {
@@ -23809,8 +23838,14 @@ function openDisqualifyDialog(p, opts){
    AT THE MOMENT IT OPENS, NOT UP FRONT: an assignment opens a stage in this app
    (anatUnlocked), so naming somebody on all three at once would skip the sequence. And
    only on the opening - a stage already open before this release is left as it was,
-   the owner's decision. */
-const AUTO_ASSIGN_STAGES = ["approvals", "scheduling", "order"];
+   the owner's decision.
+
+   EVERY STAGE SINCE 6 Oct 2026 (the owner: no task without an owner). Stage 1 is given to
+   the site's Responsible CPM the moment the CT is marked received (autoAssignFirst) -
+   only the site's, the owner's answer when asked: a site with none leaves it empty with the
+   hint to set one. Each later stage goes to the patient's CPM when the one before it is
+   done, passing over any stage already set aside as Not required. */
+const AUTO_ASSIGN_STAGES = ANAT_STAGES.map(s => s.k);
 function isCpmUser(u){ return !!u && [u.role].concat(userExtraRoles(u)).includes("CPM"); }
 function patientCpm(p, beforeKey){
   const i = ANAT_STAGES.findIndex(s => s.k === beforeKey);
@@ -23837,10 +23872,19 @@ function autoAssignHint(p, s, a, assignedNow){
 }
 function autoAssignNext(p, done){
   if(!p || !p.anat || !done) return "";
-  const i = ANAT_STAGES.findIndex(s => s.k === done.k);
-  const next = ANAT_STAGES[i + 1];
-  if(!next || !AUTO_ASSIGN_STAGES.includes(next.k)) return "";
   if(!stageComplete(p, done)) return "";
+  const i = ANAT_STAGES.findIndex(s => s.k === done.k);
+  /* The first stage after it still open: a Not required one has nobody to give it to. */
+  const next = ANAT_STAGES.slice(i + 1).find(s => !stageComplete(p, s));
+  return autoAssignStage(p, next);
+}
+/* Stage 1 opens when the CT is in, so that is when it gets its owner. */
+function autoAssignFirst(p){
+  if(!p || !p.anat || !(p.screening && p.screening.ct && p.screening.ct.done)) return "";
+  return autoAssignStage(p, ANAT_STAGES[0]);
+}
+function autoAssignStage(p, next){
+  if(!next || !AUTO_ASSIGN_STAGES.includes(next.k)) return "";
   const a = p.anat[next.k];
   if(!a || String(a.assignedTo || "").trim() || a.autoAssignedAt || a.autoAssignChanged || (a.status || "Not started") !== "Not started") return "";
   if(!anatUnlocked(p, next.k)) return "";
@@ -24363,10 +24407,9 @@ function anatStageHtml(p, s, ctReady){
     inner += '<h3 style="margin:16px 0 8px">3.2 Model printed</h3>' +
       '<div class="grid g2">' +
         f("estDate","Estimated completion date","datetime-local",{ locked:!a.printApproved }) +
-        f("actualDate","Actual completion date","datetime-local",{ locked:!a.printApproved }) +
       '</div>' +
       '<div class="hint">' + (a.printApproved
-        ? 'Confirmed with <b>I’m done</b> below by ' +
+        ? 'Confirmed with <b>Done</b> below by ' +
           esc(a.assignedTo ? assigneeLabel(a.assignedTo) : "the person printing it") +
           ', or by a Clinical PM, Manager or App Admin.'
         : 'Opens once 3.1 is requested.') + '</div>';
@@ -24404,14 +24447,10 @@ function anatStageHtml(p, s, ctReady){
     if(s.scoring) inner += scoringBlock(p, s, dis);
     if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
     inner += anatFilesBlock(p, s);
-    inner += '<div class="grid g2">' + f("completionDate","Completion date","datetime-local") +
-      '<div class="field"><label>Completed by</label><input value="' + esc(a.completedBy || "") +
-      '" disabled></div></div>';
   }
   else if(s.kind === "ops"){
     inner += '</div><div class="grid g2">' +
-      f("estDate","Estimated completion date","datetime-local") +
-      f("actualDate","Actual completion date","datetime-local") + '</div>';
+      f("estDate","Estimated completion date","datetime-local") + '</div>';
     /* "No PM" only when stage 2 SAID no. A PM insertion set aside by hand, with a
        pacemaker recorded or not yet known, says that instead - it used to claim "no
        pacemaker recorded" on every not-required stage, which was false exactly in the
@@ -24586,9 +24625,14 @@ function anatStageHtml(p, s, ctReady){
       esc(a.reopenReason) + '</div>';
   }
   if(state === "Completed"){
-    inner += '<div class="okbox" style="margin-top:8px"><b>Confirmed by ' +
+    /* Stages 1-7 have no date field since 6 Oct 2026: this line IS the record of who
+       pressed Done and when. An ops stage completed before then has its date in
+       actualDate only. */
+    const doneKind = s.kind === "eval" || s.kind === "ops";
+    const at = a.completionDate || (s.kind === "ops" ? a.actualDate : "");
+    inner += '<div class="okbox" style="margin-top:8px"><b>' + (doneKind ? "Done by " : "Confirmed by ") +
       esc(a.completedBy || "") + '</b>' +
-      (a.completionDate ? ' · ' + esc(fmtDate(a.completionDate)) : "") + '</div>';
+      (at ? ' · ' + esc(fmtDate(at)) : "") + '</div>';
   }
   if(state === "Not required" && a.notRequiredBy){
     inner += '<div class="note" style="margin-top:8px">Marked not required by ' +
@@ -25304,17 +25348,22 @@ function stageActions(p, s, state){
     btns.push('<span class="hint">Confirmed by ordering the products — one step, with the ' +
       (s.k === "order" ? 'button above' : 'Set date and order products button') + '.</span>');
   }
-  if(mayDone && !byOrder && state === "Pending confirmation"){
-    btns.push('<button class="btn btn-primary" data-stgdone="' + s.k + '">I’m done</button>');
+  /* Ready for Done: open, reachable, and nothing it needs is missing. A stage with no
+     required fields (an ops stage, since 6 Oct 2026) is ready as soon as it opens - Done
+     is the whole act - so this cannot wait for "Pending confirmation", which only a stage
+     WITH required fields ever reaches. */
+  const ready = !anatDone(state) && !stageMissing(p, s).length && anatUnlocked(p, s.k);
+  if(mayDone && !byOrder && ready){
+    btns.push('<button class="btn btn-primary" data-stgdone="' + s.k + '">Done</button>');
     btns.push('<span class="hint">' + (s.needsApproval
       ? 'Confirms 3.2: the model is printed. Records you and the time.'
-      : 'Everything needed is filled in. Confirming records you and the time.') + '</span>');
+      : 'Records you and the time as having completed this stage.') + '</span>');
   }
-  if(may && !mayDone && state === "Pending confirmation"){
+  if(may && !mayDone && ready){
     btns.push('<span class="hint">Waiting for ' + esc(a.assignedTo ? assigneeLabel(a.assignedTo) : "the person printing it") +
       ' to confirm the model is printed.</span>');
   }
-  if(may && !byOrder && (state === "In progress" || state === "Not started") && stageRequired(s).length){
+  if(may && !byOrder && !ready && (state === "In progress" || state === "Not started") && stageMissing(p, s).length){
     btns.push('<span class="hint">' + (s.needsApproval && !a.printApproved
       ? 'Printing starts with a 3.1 print request.'
       : 'Fill in what this stage needs and a confirmation button appears here.') + '</span>');
