@@ -16047,7 +16047,9 @@ async function trySync(rec){
                              contentType: rec.contentType || "application/json",
                              contentEncoding: rec.encoding || undefined })
     });
-    if(r.ok){ rec.synced = true; rec.syncNote = "Uploaded to OneDrive"; }
+    /* Landed: the file is in the library, so its copy leaves this device. Kept, a few
+       images filled localStorage and every later save on the device stopped persisting. */
+    if(r.ok){ rec.synced = true; rec.syncNote = "Uploaded to OneDrive"; delete rec.content; }
     else {
       const e = await r.json().catch(() => ({}));
       rec.syncNote = "Queued — " + ((e.error && e.error.message) || ("HTTP " + r.status));
@@ -16257,6 +16259,14 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "2.57.1", date: "8 October 2026", groups: [
+    { h:"Files reach SharePoint, or you are told they did not", items:[
+      "A file added to an evaluation stage (CT report, 3D model, pliable model, road map) is uploaded first and recorded only once SharePoint has it. It used to read <b>Filed</b> straight away, even if the upload later failed. If the upload fails now, nothing is recorded and the message says why.",
+      "A PDF can be up to <b>4 MB</b>; the limit used to be about 3 MB.",
+      "Uploads still waiting on this device are kept when the page is reloaded. A reload used to drop them without a word.",
+      "Files that have been uploaded no longer take up space in the browser, which could fill and stop the device saving work."
+    ] }
+  ] },
   { version: "2.57.0", date: "7 October 2026", groups: [
     { h:"Every patient has a folder from registration", items:[
       "A patient’s folder in SharePoint — <b>site › Clinical_Procedures › patient code</b> — is now created as soon as the patient is registered, with the folders the app files into: <b>anatomical</b> (CT report, 3D model, pliable model, road map) and <b>source_images</b>. It used to appear only when the first file was filed.",
@@ -18854,6 +18864,10 @@ async function boot(){
         await api("POST", "/api/devices/apply-expiry").catch(() => {});
         const fresh = await loadRemoteStore();
         fresh.unsaved = (S.db && S.db.unsaved) || {};
+        /* Uploads that have not landed are this device's, not the server's - the server
+           always answers with an empty queue. Replacing the queue with that deleted every
+           waiting file on the next reload, without a word (Oct 2026). */
+        fresh.backupQueue = ((S.db && S.db.backupQueue) || []).filter(r => r && !r.synced);
         S.db = fresh;
         // Role-scoped, so it is a separate call; a refusal must not blank the app.
         S.db.batches = await loadBatches();
@@ -24073,9 +24087,10 @@ function confirmPdfClean(file, label){
     $("#pc-go").onclick = () => { MODAL_CLEANUP = null; closeModal(); settle(true); };
   });
 }
-/* The JSON body carries the file as base64, a third larger than the file, inside a limit
-   set at the server's upload cap - so a PDF is held to the same 0.74 the approvals use. */
-const ANAT_PDF_MAX = Math.floor(4 * 1024 * 1024 * 0.74);
+/* The server cap on the FILE. The JSON body carrying it as base64 is a third larger, and
+   since 8 Oct 2026 the server's body limit allows for that, so the 0.74 this used to apply
+   (about 3 MB, which a CT report can exceed) is gone. */
+const ANAT_PDF_MAX = 4 * 1024 * 1024;
 function addAnatFile(p, s, useCamera){
   if(!mayAddAnatFile(p, s)) return;
   const label = stageName(s);
@@ -24114,6 +24129,21 @@ function addAnatFile(p, s, useCamera){
       const rec = Object.assign({ id:uid("af"), stage:s.k, filename, folder, label,
         ts:nowISO(), by:(S.me && S.me.email) || "", byName:S.me.name, bytes,
         original: String(file.name || "").slice(0, 120) }, extra);
+      /* UPLOADED FIRST, recorded after (8 Oct 2026). It used to be recorded and called
+         "Filed" at once, with the file left in this browser's upload queue - inside
+         localStorage, where a file of a few MB does not fit, and which a reload emptied.
+         So the record could name a file SharePoint never received. Screening runs online;
+         a file that cannot go up now is not filed, and the person is told so. */
+      if(S.backend){
+        toast("Uploading " + file.name + "…");
+        try{
+          await api("POST", "/api/output/upload", { path:folder, filename, content:base64,
+            contentType, contentEncoding:"base64" });
+        }catch(e){
+          return toast("Not filed — the upload to SharePoint failed: " +
+            (e.message || "no connection") + ". Nothing was recorded; try again.", "bad");
+        }
+      }
       if(!Array.isArray(p.anatFiles)) p.anatFiles = [];
       p.anatFiles.push(rec);
       if(thumb) ANAT_THUMBS.set(rec.id, thumb);
@@ -24122,7 +24152,7 @@ function addAnatFile(p, s, useCamera){
       if(!S.backend && thumb) rec.thumb = thumb;
       commit();
       schedulePatientSave(p);
-      queueBackupBinary(folder, filename, base64, contentType);
+      if(!S.backend) queueBackupBinary(folder, filename, base64, contentType);
       logAction((isPdf ? "PDF" : "Image") + " filed for " + label + " (" + p.patientCode + ")", {
         locationId:p.siteId,
         stateChanges: isPdf ? "PDF checked clean by the uploader" :
