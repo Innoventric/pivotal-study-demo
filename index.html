@@ -16758,6 +16758,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.1.1", date: "20 October 2026", groups: [
+    { h:"Scanning", items:[
+      "Phones that could not read the label’s <b>DataMatrix</b> code - mostly Android - now read it. The phone’s own reader is used only where it can read that code, and a plain barcode beside it on the label is no longer picked up by mistake.",
+      "On a phone with several back cameras the scanner opens the <b>main</b> one, which can focus on a label. If the picture stays blurry, <b>Switch camera</b> tries the next one."
+    ] }
+  ] },
   { version: "3.1.0", date: "20 October 2026", groups: [
     { h:"Procedure summary", items:[
       "Submitting a procedure report opens the <b>Clinical Procedure Summary</b> (form CLD-U-104) for the subject. It is one shared task for everybody on the procedure team and the subject’s Clinical PM, due <b>72 hours</b> after the procedure (from the DS extraction time).",
@@ -18309,6 +18315,26 @@ function decodeAny(imgData){
 function nativeDetectorPossible(){
   return typeof window !== "undefined" && typeof window.BarcodeDetector === "function";
 }
+/* THE PHONE'S OWN READER, ONLY WHERE IT CAN READ OUR LABEL (v3.1.1).
+   Some Android phones could not scan the label at all. The built-in reader was built with
+   no format list and never asked what it supports, so on a phone whose reader has no
+   DataMatrix it found nothing, and every pass still waited up to 900ms on it before ZXing
+   - the reader that does read the label - got its turn. And it took the FIRST code of any
+   kind, so a 1-D barcode beside the DataMatrix could be delivered instead.
+   Now: used only when it says it reads data_matrix, asked for our two formats only, and a
+   result of any other format is ignored. Otherwise null, and ZXing reads every frame. */
+const SCAN_FORMATS = ["data_matrix", "qr_code"];
+async function makeNativeDetector(){
+  if(!nativeDetectorPossible() || typeof window.BarcodeDetector.getSupportedFormats !== "function") return null;
+  const have = await withTimeout(window.BarcodeDetector.getSupportedFormats(), 1500);
+  if(!Array.isArray(have) || !have.includes("data_matrix")) return null;
+  try{ return new window.BarcodeDetector({ formats: SCAN_FORMATS.filter(f => have.includes(f)) }); }
+  catch(_){ return null; }
+}
+function nativePick(found){
+  const hit = (found || []).find(b => b && SCAN_FORMATS.includes(b.format) && b.rawValue);
+  return hit ? hit.rawValue : null;
+}
 function scannerKind(){
   if(nativeDetectorPossible()) return "native";
   if(PivotalScanner.ready())   return "vendored";
@@ -18575,6 +18601,7 @@ function startScan(id, label){
       'stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="' + ICON.camera + '"/></svg></button>' +
     '<button class="btn" id="scan-type">Enter by hand instead</button>' +
     '<span class="spacer"></span>' +
+    '<button class="btn btn-sm" id="scan-cam" hidden>Switch camera</button>' +
     '<button class="btn btn-sm" id="scan-torch">Flash</button></div>');
 
   $("#scan-type").onclick = () => { MANUAL_OPEN[id] = true; closeModal(); render(); };
@@ -18597,11 +18624,8 @@ function startScan(id, label){
         /* 1) Native detector first — it reads QR, DataMatrix, Aztec and 1-D barcodes,
            so it copes with a device label that isn't a plain QR. */
         try{
-          if(nativeDetectorPossible()){
-            let d = null;
-            try{ d = new window.BarcodeDetector(); }catch(_){ d = null; }
-            if(d){ const found = await d.detect(img); if(found && found.length) code = found[0].rawValue; }
-          }
+          const d = await makeNativeDetector();
+          if(d) code = nativePick(await withTimeout(d.detect(img), 3000));
         }catch(e){ /* fall through to jsQR */ }
         /* 2) jsQR (QR only) at high resolution — full frame, then a centre crop. */
         const max = 2200;
@@ -18698,14 +18722,13 @@ function startScan(id, label){
   /* Construct the native detector defensively: ask specifically for QR (some Android
      builds expose the API but support only a subset of formats), and never let a
      failed construction abort scanning — jsQR still runs as the fallback below. */
-  /* Detect ALL formats the browser supports, not just QR: medical device labels often
-     carry a GS1 DataMatrix (square like a QR but different), which jsQR cannot read. */
-  let det = null;
-  if(nativeDetectorPossible()){
-    try{ det = new window.BarcodeDetector(); }
-    catch(_){ try{ det = new window.BarcodeDetector({ formats:["qr_code","data_matrix"] }); }
-              catch(__){ det = null; } }
-  }
+  /* Only where it reads DataMatrix - see makeNativeDetector. Built asynchronously; the
+     loop runs ZXing meanwhile, so nothing waits for it. */
+  let det = null, detMisses = 0, detState = nativeDetectorPossible() ? "checking" : "none";
+  makeNativeDetector().then(d => {
+    det = d;
+    if(detState === "checking") detState = d ? "on" : "no DataMatrix";
+  });
   const cv = document.createElement("canvas");
   const cx = cv.getContext("2d", { willReadFrequently:true });
   let stream = null, stopped = false;
@@ -18776,15 +18799,57 @@ function startScan(id, label){
     return null;
   }
 
-  navigator.mediaDevices.getUserMedia({
-    /* Ask for continuous autofocus from the start: a label is held close, and many
-       Android cameras otherwise open at a fixed/far focus so the QR is blurry and
-       nothing decodes. advanced constraints are hints — ignored where unsupported. */
-    video:{ facingMode:{ ideal:"environment" }, width:{ ideal:1920 }, height:{ ideal:1080 },
-            advanced:[{ focusMode:"continuous" }] }
-  }).then(async s => {
+  /* WHICH CAMERA (v3.1.1). facingMode "environment" lets the browser choose among the
+     back cameras, and on some Android phones it chooses a wide or ultra-wide lens that
+     cannot focus at label distance - the picture never sharpens and nothing reads.
+     Android numbers its cameras and camera 0 is the main back camera ("camera2 0, facing
+     back" in Chrome's labels), so once permission is granted and the labels can be read
+     the scanner moves to it. Every other back camera is one press of Switch camera away.
+     The torch, zoom and refocus controls follow whichever camera is live (attach). */
+  let track = null, backCams = [], switching = false;
+  const msg = $("#scan-msg");
+  /* Ask for continuous autofocus from the start: a label is held close, and many
+     Android cameras otherwise open at a fixed/far focus so the QR is blurry and
+     nothing decodes. advanced constraints are hints — ignored where unsupported. */
+  const VIDEO_BASE = { width:{ ideal:1920 }, height:{ ideal:1080 }, advanced:[{ focusMode:"continuous" }] };
+  function openCamera(deviceId){
+    return navigator.mediaDevices.getUserMedia({ video: deviceId
+      ? Object.assign({ deviceId:{ exact:deviceId } }, VIDEO_BASE)
+      : Object.assign({ facingMode:{ ideal:"environment" } }, VIDEO_BASE) });
+  }
+  const liveDeviceId = () => (track && track.getSettings && track.getSettings().deviceId) || "";
+  async function useCamera(deviceId){
+    if(switching || stopped) return;
+    switching = true;
+    /* The open camera is released FIRST: many phones cannot hold two cameras at once. */
+    if(stream) stream.getTracks().forEach(t => t.stop());
+    stream = null;
+    try{
+      let s = null;
+      try{ s = await openCamera(deviceId); }catch(_){ s = await openCamera(null); }
+      if(stopped){ s.getTracks().forEach(t => t.stop()); return; }
+      attach(s);
+    }catch(err){ cameraFailed(err); }
+    finally{ switching = false; }
+  }
+  async function findBackCams(){
+    const all = await withTimeout(navigator.mediaDevices.enumerateDevices(), 1500) || [];
+    backCams = all.filter(d => d.kind === "videoinput" && /back|rear|environment/i.test(d.label || ""));
+    const camBtn = $("#scan-cam");
+    if(camBtn) camBtn.hidden = backCams.length < 2;
+    const main = backCams.find(d => /^camera2 0\b/i.test(d.label || ""));
+    if(main && liveDeviceId() && main.deviceId !== liveDeviceId()) await useCamera(main.deviceId);
+  }
+  const camBtn = $("#scan-cam");
+  if(camBtn) camBtn.onclick = () => {
+    if(backCams.length < 2 || switching) return;
+    const i = backCams.findIndex(d => d.deviceId === liveDeviceId());
+    if(msg) msg.textContent = "Switching camera…";
+    useCamera(backCams[(i + 1) % backCams.length].deviceId);
+  };
+
+  openCamera(null).then(async s => {
     if(stopped){ s.getTracks().forEach(t => t.stop()); return; }
-    stream = s; video.srcObject = s;
 
     /* A stream can be granted and still show nothing: playback blocked by autoplay
        policy, another app holding the camera, a device that yields no frames. That case
@@ -18793,11 +18858,11 @@ function startScan(id, label){
        The watchdog is armed BEFORE play() is awaited, and play() is deliberately NOT
        awaited, because on a stream that never produces a frame the promise never settles
        - so anything sequenced after it would never run at all. That is precisely the
-       case this is here to catch, and awaiting first would disarm it. */
-    let playRejected = null;
+       case this is here to catch, and awaiting first would disarm it. attach() calls
+       play() and does not await it either. */
     const framesArrived = () => video.videoWidth > 0 && video.videoHeight > 0;
     setTimeout(() => {
-      if(stopped || framesArrived()) return;
+      if(stopped || switching || framesArrived()) return;
       scanOverlay(
         "<b>The camera opened but is not showing a picture.</b>" +
         (playRejected ? "<div class='sub'>The browser blocked video playback.</div>" : "") +
@@ -18805,9 +18870,8 @@ function startScan(id, label){
         "again. You can also take a photo of the label, or enter the identifier by hand.</div>",
         id);
     }, 4000);
-    video.play().catch(e => { playRejected = e; });
+    attach(s);
 
-    const msg = $("#scan-msg");
     if(msg) msg.textContent = "Hold the code inside the box.";
 
     /* ---- THE DECODE LOOP STARTS HERE, before anything optional ----
@@ -18837,9 +18901,12 @@ function startScan(id, label){
       try{
         /* Bounded: BarcodeDetector.detect can hang on some devices, and an unbounded
            await here would stop the loop permanently rather than skip one frame. */
+        /* A reader that hangs is dropped after three misses: ZXing reads the label, and
+           waiting on a reader that does not answer is what made those phones look dead. */
         if(det){
-          const found = await withTimeout(det.detect(video), 900);
-          if(found && found.length) code = found[0].rawValue;
+          const found = await withTimeout(det.detect(video), 400);
+          if(found === null){ if(++detMisses >= 3){ det = null; detState = "dropped (no answer)"; } }
+          else { detMisses = 0; code = nativePick(found); }
         }
         if(!code) code = decodeFrame();
       }catch(e){ /* an undecodable frame is the normal case, not an error */ }
@@ -18856,13 +18923,16 @@ function startScan(id, label){
            whatever the cause, and without them the next step is guesswork. Which
            decoders exist, what the camera is actually delivering, and how many passes
            have run - one screenshot of this answers all three. */
-        const kit = [det ? "built-in" : null,
-                     PivotalDataMatrix.ready() ? "DataMatrix" : null,
+        const kit = [PivotalDataMatrix.ready() ? "DataMatrix" : null,
                      PivotalScanner.ready() ? "QR" : null].filter(Boolean).join(" + ") || "none";
+        const camLabel = (track && track.label) || "";
         msg.innerHTML = '<b>Still nothing.</b> Tap the picture to refocus, try Flash, hold the ' +
-          'label ~15–20&nbsp;cm away and steady, or <a href="#" id="scan-give-up">enter it by hand</a>.' +
+          'label ~15–20&nbsp;cm away and steady' + (backCams.length > 1 ? ', try <b>Switch camera</b>' : '') +
+          ', or <a href="#" id="scan-give-up">enter it by hand</a>.' +
           '<div class="hint" style="margin-top:6px;font-size:11px">Readers: ' + esc(kit) +
+          ' · built-in: ' + esc(detState) +
           ' · camera ' + video.videoWidth + '×' + video.videoHeight +
+          (camLabel ? ' (' + esc(camLabel) + ')' : '') +
           ' · ' + passes + ' passes</div>';
         const giveUp = $("#scan-give-up");
         if(giveUp) giveUp.onclick = e => {
@@ -18874,53 +18944,28 @@ function startScan(id, label){
     function schedule(){ if(!stopped) setTimeout(tick, PACE_MS); }
     tick();
 
-    const track = s.getVideoTracks()[0];
+    /* Labels are readable only now that the camera is granted; this may move to the
+       main back camera (see WHICH CAMERA above). The decode loop is already running. */
+    findBackCams();
+  }).catch(cameraFailed);
+
+  /* Point the scanner at a camera that has just opened: the first one, or the one Switch
+     camera or findBackCams moved to. Focus, flash and zoom are re-read here because they
+     belong to the camera - a zoom range from the last lens is wrong for this one. */
+  function attach(s){
+    stream = s; video.srcObject = s;
+    video.play().catch(() => {});
+    track = s.getVideoTracks()[0] || null;
     const caps = (track && track.getCapabilities) ? track.getCapabilities() : {};
-
-    /* Best-effort continuous autofocus after the track is live (some browsers only
-       honour it here, not in getUserMedia).
-
-       NOT awaited on the path to the decode loop. applyConstraints is a promise that
-       some Android browsers never settle, and this used to sit between the camera
-       starting and tick() being called - so on those devices the picture appeared, the
-       loop never started, nothing was ever decoded and not even the "still nothing"
-       message could appear, because that lives inside the loop. Decoding is the
-       function; focus, flash and zoom are improvements to it and must never gate it. */
-    function refocus(){
-      try{ withTimeout(track.applyConstraints({ advanced:[{ focusMode:"continuous" }] }), 1500); }
-      catch(e){}
-    }
     if(!caps || !Array.isArray(caps.focusMode) || caps.focusMode.includes("continuous")) refocus();
-
-    /* Tap the picture to force a refocus — the reliable fix when a close label opens
-       blurry and the camera will not refocus on its own. */
-    const frame = $("#scan-frame");
-    if(frame) frame.onclick = () => { refocus(); if(msg) msg.textContent = "Focusing…"; };
-
-    /* Flashlight. Always offer the button: some browsers (e.g. Samsung Internet) do not
-       advertise `torch` in capabilities yet still honour the constraint. Try it on tap;
-       only if the attempt actually fails do we tell the user it is unsupported. */
     const torchBtn = $("#scan-torch");
-    if(torchBtn){
-      let on = false;
-      torchBtn.onclick = async () => {
-        try{
-          on = !on;
-          await track.applyConstraints({ advanced:[{ torch:on }] });
-          torchBtn.textContent = on ? "Flash off" : "Flash";
-        }catch(e){
-          on = false;
-          torchBtn.disabled = true; torchBtn.textContent = "No flash";
-          if(msg) msg.innerHTML = "This browser can't control the flashlight — " +
-            "turn on more light, or use your phone's own camera torch.";
-        }
-      };
-    }
+    if(torchBtn){ torchOn = false; torchBtn.disabled = false; torchBtn.textContent = "Flash"; }
 
     /* Zoom. The decisive control when a label won't focus up close: the operator holds
        it at a distance the camera CAN focus, then zooms so the QR still fills the box.
        Only shown when the camera exposes a zoom range. */
     const zoomWrap = $("#scan-zoom-wrap"), zoomInput = $("#scan-zoom");
+    if(zoomWrap) zoomWrap.style.display = "none";
     if(zoomInput && caps && caps.zoom && typeof caps.zoom.max === "number" && caps.zoom.max > (caps.zoom.min || 1)){
       zoomInput.min = caps.zoom.min || 1;
       zoomInput.max = caps.zoom.max;
@@ -18931,8 +18976,49 @@ function startScan(id, label){
         try{ await track.applyConstraints({ advanced:[{ zoom: parseFloat(zoomInput.value) }] }); }catch(e){}
       };
     }
+  }
 
-  }).catch(err => {
+  /* Best-effort continuous autofocus after the track is live (some browsers only
+     honour it here, not in getUserMedia).
+
+     NOT awaited on the path to the decode loop. applyConstraints is a promise that
+     some Android browsers never settle, and this used to sit between the camera
+     starting and tick() being called - so on those devices the picture appeared, the
+     loop never started, nothing was ever decoded and not even the "still nothing"
+     message could appear, because that lives inside the loop. Decoding is the
+     function; focus, flash and zoom are improvements to it and must never gate it. */
+  function refocus(){
+    try{ if(track) withTimeout(track.applyConstraints({ advanced:[{ focusMode:"continuous" }] }), 1500); }
+    catch(e){}
+  }
+
+  /* Tap the picture to force a refocus — the reliable fix when a close label opens
+     blurry and the camera will not refocus on its own. */
+  const frame = $("#scan-frame");
+  if(frame) frame.onclick = () => { refocus(); if(msg) msg.textContent = "Focusing…"; };
+
+  /* Flashlight. Always offer the button: some browsers (e.g. Samsung Internet) do not
+     advertise `torch` in capabilities yet still honour the constraint. Try it on tap;
+     only if the attempt actually fails do we tell the user it is unsupported. */
+  let torchOn = false;
+  const torchBtn = $("#scan-torch");
+  if(torchBtn){
+    torchBtn.onclick = async () => {
+      if(!track) return;
+      try{
+        torchOn = !torchOn;
+        await track.applyConstraints({ advanced:[{ torch:torchOn }] });
+        torchBtn.textContent = torchOn ? "Flash off" : "Flash";
+      }catch(e){
+        torchOn = false;
+        torchBtn.disabled = true; torchBtn.textContent = "No flash";
+        if(msg) msg.innerHTML = "This browser can't control the flashlight — " +
+          "turn on more light, or use your phone's own camera torch.";
+      }
+    };
+  }
+
+  function cameraFailed(err){
     /* Named reasons, because "the camera could not be opened" is not something an
        operator standing in a cath lab can act on, and the browser does tell us which. */
     const n = (err && err.name) || "";
@@ -18949,7 +19035,7 @@ function startScan(id, label){
       : "<b>The camera could not be opened.</b><div class='sub'>" + esc(n || "unknown error") +
         ". Take a photo of the label instead, or enter the identifier by hand.</div>";
     scanOverlay(detail, id);
-  });
+  }
 }
 
 /* Put a message ON the viewfinder and hide the aiming box, so the black rectangle is
