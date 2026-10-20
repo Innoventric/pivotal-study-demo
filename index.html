@@ -12552,8 +12552,83 @@ function siteMeasures(locations, patients, logs, today){
   };
 }
 
+/* ---- STUCK IN SCREENING (20 Oct 2026, the owner) ------------------------------------------
+   A subject who has not moved for STUCK_DAYS is listed in the daily mail - to the site's
+   Responsible CPM, every App Admin and Manager, and QA - with how long since registration,
+   how long since the last move, and the Responsible CPM. "In screening" runs until a
+   procedure is SCHEDULED: a subject who passed screening and has no procedure date is
+   stuck too (the owner). Not a stopped subject, not a treated one, and not a control-arm
+   subject whose scheduling is done (they never get a procedure). */
+var STUCK_DAYS = 3;
+
+/* What counts as a MOVE: the status, a screening tick, or a stage's status. Not an
+   assignment, a due date or an edited note - those are work ABOUT the subject, not the
+   subject moving. caseService compares this before and after every save and stamps
+   p.lastMovedAt when it differs. */
+function movementKey(p){
+  if(!p) return "";
+  var parts = [String(p.status || ""), (p.cancelled && p.cancelled.is) ? "X" : ""];
+  SCREENING_STEPS.forEach(function(s){
+    parts.push((p.screening && p.screening[s.k] && p.screening[s.k].done) ? "1" : "0");
+  });
+  ANAT_STAGES.forEach(function(s){
+    parts.push(String((p.anat && p.anat[s.k] && p.anat[s.k].status) || ""));
+  });
+  return parts.join("|");
+}
+
+/* When the subject last moved. The stamp when there is one; before it existed (records
+   older than 20 Oct 2026), the latest date the record itself carries for a move - a
+   registration, a screening tick, a stage confirmed, reopened or set not-required. */
+function lastMovedAt(p){
+  if(!p) return "";
+  if(p.lastMovedAt) return String(p.lastMovedAt);
+  var dates = [p.registeredAt];
+  SCREENING_STEPS.forEach(function(s){
+    var x = p.screening && p.screening[s.k];
+    if(x && x.done) dates.push(x.at);
+  });
+  ANAT_STAGES.forEach(function(s){
+    var a = (p.anat && p.anat[s.k]) || {};
+    dates.push(a.completionDate, a.reopenedAt, a.notRequiredAt, a.requestedAt, a.printApprovedAt);
+  });
+  dates = dates.map(function(d){ return String(d || ""); }).filter(function(d){ return /^\d{4}-\d{2}-\d{2}/.test(d); }).sort();
+  return dates.length ? dates[dates.length - 1] : "";
+}
+
+/* Is this subject one the stuck list is about at all - in screening, or past it with no
+   procedure scheduled? */
+function inScreeningPhase(p){
+  if(!p || (p.cancelled && p.cancelled.is) || p.status === "CANCELLED") return false;
+  if(isPostProcedure(p)) return false;
+  var sched = ANAT_STAGES.filter(function(s){ return s.k === "scheduling"; })[0];
+  if(sched && isControl(p) && stageComplete(p, sched)) return false;
+  var i = PT_FLOW.indexOf(p.status);
+  return p.status === "SUSPECTED" || i < 0 || i < PT_FLOW.indexOf("SCHEDULED");
+}
+
+/* Every stuck subject, longest-still first. `today` is "YYYY-MM-DD" in Israel time. */
+function stuckSubjects(patients, today, days){
+  var limit = days == null ? STUCK_DAYS : days;
+  var out = [];
+  (patients || []).forEach(function(p){
+    if(!inScreeningPhase(p)) return;
+    var moved = lastMovedAt(p);
+    var still = daysApart(String(moved).slice(0, 10), today);
+    if(still === null || still < limit) return;
+    var reg = p.registeredAt ? daysApart(String(p.registeredAt).slice(0, 10), today) : null;
+    out.push({ patient: p, lastMovedAt: moved, daysStill: still, daysSinceRegistration: reg });
+  });
+  return out.sort(function(a, b){ return b.daysStill - a.daysStill; });
+}
+
 var api = {
   PT_FLOW: PT_FLOW,
+  STUCK_DAYS: STUCK_DAYS,
+  movementKey: movementKey,
+  lastMovedAt: lastMovedAt,
+  inScreeningPhase: inScreeningPhase,
+  stuckSubjects: stuckSubjects,
   PROTOCOLS: PROTOCOLS,
   PROTOCOL_DEFAULT: PROTOCOL_DEFAULT,
   STUDY_PROTOCOL: STUDY_PROTOCOL,
@@ -13426,6 +13501,210 @@ if(typeof window !== "undefined") window.ProcedureDoc = api;
 })();
 
 </script>
+<script>
+/* ---------------------------------------------------------------------------
+   procSummaryForm.js - inlined by build-demo.js. The live app loads it from procSummaryForm.js.
+   --------------------------------------------------------------------------- */
+"use strict";
+/* =============================================================================
+   THE CLINICAL PROCEDURE SUMMARY - form CLD-U-104 Rev01 (20 Oct 2026, the owner)
+
+   Opened automatically when a procedure report is submitted and the subject becomes
+   TREATED. It is ONE shared task for everybody on the procedure team (the four team
+   fields of the report, which now hold app users) plus the subject's CPM, due 72 hours
+   after the procedure ended (the procedure date and its DS-out time). It stays open until
+   somebody closes it; whoever closes it is "Filled by". Closing files it as a PDF laid out
+   like the controlled document, in the subject's folder and in the central
+   Procedure_Summary folder. Word was asked for and then dropped (the owner: PDF only).
+
+   This file is the FORM - the questions, in the document's own numbering and words, what
+   the system fills in by itself, and what must be answered before it can be closed. The
+   screen, the PDF and the server's check all read it, so the questions cannot drift. Loaded
+   like procedureDoc.js: require() on the server, a same-origin <script> in the page (which
+   is why it is in STATIC_FILES and in sw.js's SHELL).
+   ============================================================================= */
+(function(){
+
+var DOC = { number: "CLD-U-104", revision: "01", title: "Unica™ Clinical Procedure Summary Template" };
+
+/* How long the team has, from the end of the procedure. */
+var DUE_HOURS = 72;
+/* When the reminder mail goes: this many hours after the procedure ended (the owner: yes to a
+   reminder; 48 was the proposal). */
+var REMIND_AFTER_HOURS = 48;
+
+var YN = ["Yes", "No"];
+var PERF = ["fully functioning", "one stuck leaflet", "two stuck leaflets", "nonfunctioning", "not confirmed"];
+var TEAM = ["primary operator", "secondary operator", "Echocardiologist", "Nurse", "Other"];
+
+/* Each question: k (stored key), n (the document's number), q (its words), type:
+     yn      - Yes | No
+     choice  - one of `options`
+     multi   - any of `options`, with an "Other" text when "Other" is ticked
+     text    - free text
+   `specify` names when a follow-up text is asked for ("Yes" or "No"), and `specifyLabel`
+   what the document calls it. `optional` questions may be left blank at closing. */
+var SECTIONS = [
+  { n: "1", title: "Training", items: [
+    { k: "simTraining", n: "1.1", q: "Was simulator training performed?", type: "yn" },
+    { k: "trainedTeam", n: "1.2", q: "Mark all team members who participated in the training:", type: "multi",
+      options: TEAM, otherKey: "trainedOther", optional: true }
+  ]},
+  { n: "2", title: "Preparation", items: [
+    { k: "shipDeficiency", n: "2.1", q: "Were there any device deficiencies related to shipment and/or storage?",
+      type: "yn", specify: "Yes" },
+    { k: "peripheralOk", n: "2.2", q: "Was all the peripheral equipment required for the procedure available?",
+      type: "yn", specify: "No" },
+    { k: "sterilityFoul", n: "2.3", q: "Were there any sterility fouls during the device preparation?",
+      type: "yn", specify: "Yes" },
+    { k: "crimpDeficiency", n: "2.4", q: "Were there any device deficiencies during crimping/flushing?",
+      type: "yn", specify: "Yes" },
+    { k: "prepRemarks", n: "2.5", q: "Other Remarks:", type: "text", optional: true }
+  ]},
+  { n: "3", title: "Procedure", items: [
+    { k: "roomOk", n: "3.1", q: "Was there enough room in the Cath lab for device preparation and all team members?", type: "yn" },
+    { k: "ergoOk", n: "3.2", q: "Was the Cath lab equipment ergonomically and functionally adequate for the procedure?",
+      type: "yn", specify: "No" },
+    { k: "procDeficiency", n: "3.3", q: "Were there any device deficiencies during the procedure steps (insertion, deployment, retrieval)?",
+      type: "yn", specify: "Yes" },
+    { k: "echoModality", n: "3.4", q: "Echo modality was used in the procedure:", type: "choice", options: ["TTE", "TEE"] },
+    { k: "svcConfirmed", n: "3.5", q: "Was SVC valve functionality confirmed by echo?", type: "yn" },
+    { k: "svcPerformance", n: "3.6", q: "Mark the SVC valve performance post implantation:", type: "choice", options: PERF },
+    { k: "svcReduction", n: "3.7", q: "Was SVC pressure reduction achieved?", type: "yn", specify: "No", specifyLabel: "results" },
+    { k: "ivcConfirmed", n: "3.8", q: "Was IVC valve functionality confirmed by echo?", type: "yn" },
+    { k: "ivcPerformance", n: "3.9", q: "Mark the IVC valve performance post implantation:", type: "choice", options: PERF },
+    { k: "ivcReduction", n: "3.10", q: "Was IVC pressure reduction achieved?", type: "yn", specify: "No", specifyLabel: "results" },
+    { k: "ivcLeak", n: "3.11", q: "Was a leak detected at the IVC skirt level?", type: "yn" },
+    { k: "svcLeak", n: "3.12", q: "Was a leak detected at the SVC level?", type: "yn" }
+  ]},
+  { n: "4", title: "General feedback received during/after the procedure (by whom, what)", items: [
+    { k: "feedback", n: "4", q: "General feedback received during/after the procedure (by whom, what):",
+      type: "yn", specify: "Yes", specifyLabel: "by whom, what" }
+  ]},
+  { n: "5", title: "Action items", items: [
+    { k: "actionItems", n: "5", q: "Action items:", type: "yn", specify: "Yes" }
+  ]},
+  { n: "6", title: "Comments", items: [
+    { k: "comments", n: "6", q: "Comments:", type: "text", optional: true }
+  ]}
+];
+
+function allItems(){
+  var out = [];
+  SECTIONS.forEach(function(s){ s.items.forEach(function(it){ out.push(it); }); });
+  return out;
+}
+function specifyKey(it){ return it.k + "Specify"; }
+function str(v){ return v == null ? "" : String(v).trim(); }
+
+/* What must still be answered before the summary can be closed - by number, so the screen
+   can say "3.6, 3.9" rather than a list of internal keys. */
+function missing(answers){
+  var a = answers || {}, out = [];
+  allItems().forEach(function(it){
+    if(it.optional) return;
+    if(it.type === "multi"){
+      if(!(a[it.k] || []).length) out.push(it.n);
+      return;
+    }
+    var v = str(a[it.k]);
+    if(!v){ out.push(it.n); return; }
+    if(it.type === "choice" && it.options.indexOf(v) < 0){ out.push(it.n); return; }
+    if(it.type === "yn" && YN.indexOf(v) < 0){ out.push(it.n); return; }
+    if(it.specify && v === it.specify && !str(a[specifyKey(it)])) out.push(it.n + " (" + (it.specifyLabel || "specify") + ")");
+  });
+  var sim = str(a.simTraining);
+  if(sim === "Yes" && !(a.trainedTeam || []).length) out.push("1.2");
+  if((a.trainedTeam || []).indexOf("Other") >= 0 && !str(a.trainedOther)) out.push("1.2 (other)");
+  return out;
+}
+
+/* Only the keys the form knows, cleaned. Anything else a browser sends is dropped. */
+function sanitize(answers){
+  var a = answers || {}, out = {};
+  allItems().forEach(function(it){
+    if(it.type === "multi"){
+      var list = Array.isArray(a[it.k]) ? a[it.k] : [];
+      out[it.k] = list.filter(function(x){ return it.options.indexOf(x) >= 0; });
+      if(it.otherKey) out[it.otherKey] = str(a[it.otherKey]).slice(0, 300);
+      return;
+    }
+    var v = str(a[it.k]).slice(0, it.type === "text" ? 4000 : 100);
+    if(it.type === "yn" && v && YN.indexOf(v) < 0) v = "";
+    if(it.type === "choice" && v && it.options.indexOf(v) < 0) v = "";
+    out[it.k] = v;
+    if(it.specify) out[specifyKey(it)] = str(a[specifyKey(it)]).slice(0, 2000);
+  });
+  return out;
+}
+
+/* WHAT THE SYSTEM ALREADY KNOWS (the owner: fill in everything it knows). Never a clinical
+   judgement it cannot make: whether a pressure reduction was "achieved" is the team's
+   answer, so only the measured values are put beside it. `trainingItems` is
+   procedureDoc's TRAINING_ITEMS, passed in rather than required. */
+function prefill(p, trainingItems){
+  var c = (p && p.caseFile) || {};
+  var a = {};
+  var sim = (trainingItems || []).indexOf("Procedure simulation");
+  if(sim >= 0 && Array.isArray(c.training) && c.training[sim]) a.simTraining = "Yes";
+  var pr = function(k){
+    var s = str(c[k + "Sys"]), d = str(c[k + "Dias"]), m = str(c[k + "Mean"]);
+    return (s || d || m) ? (s || "–") + "\\" + (d || "–") + "(" + (m || "–") + ")" : "";
+  };
+  var pre = pr("ivcPre"), post = pr("ivcPost");
+  if(pre || post) a.ivcReductionSpecify = "IVC PRE " + (pre || "—") + " mmHg, POST " + (post || "—") + " mmHg (from the procedure report)";
+  return a;
+}
+
+/* The header of the document. */
+function header(p, siteName){
+  var c = (p && p.caseFile) || {};
+  return {
+    patientId: str(p && p.patientCode),
+    site: str(siteName),
+    procedureDate: str(c.procDate || (p && p.procedureDate)).slice(0, 10),
+    implantSize: str(p && p.unicaSize)
+  };
+}
+
+/* When the procedure ended, as an instant. The browser that submits the report knows the
+   site's clock and sends it (procEndAt); failing that, the procedure date and the DS-out
+   time are read as UTC, which is out by the site's offset - a few hours on a 72-hour clock. */
+function procedureEnd(p, sentIso){
+  if(sentIso && !isNaN(Date.parse(sentIso))) return new Date(sentIso).toISOString();
+  var c = (p && p.caseFile) || {};
+  var d = str(c.procDate || (p && p.procedureDate)).slice(0, 10);
+  var t = /^(\d{1,2}):(\d{2})/.exec(str(c.dsOut));
+  if(/^\d{4}-\d{2}-\d{2}$/.test(d)){
+    var iso = d + "T" + (t ? ("0" + t[1]).slice(-2) + ":" + t[2] : "23:59") + ":00Z";
+    if(!isNaN(Date.parse(iso))) return new Date(iso).toISOString();
+  }
+  return "";
+}
+function dueFrom(endIso, nowIso){
+  var base = endIso || nowIso || new Date().toISOString();
+  return new Date(Date.parse(base) + DUE_HOURS * 3600 * 1000).toISOString();
+}
+
+/* Open, closed, overdue - and how late, in whole hours. */
+function state(sum, nowMs){
+  if(!sum) return { kind: "none" };
+  if(sum.status === "CLOSED") return { kind: "closed" };
+  var due = Date.parse(sum.dueAt || "");
+  var now = nowMs == null ? Date.now() : nowMs;
+  if(!isNaN(due) && now > due) return { kind: "overdue", hoursLate: Math.floor((now - due) / 3600000) };
+  return { kind: "open", hoursLeft: isNaN(due) ? null : Math.max(0, Math.ceil((due - now) / 3600000)) };
+}
+
+var api = { DOC: DOC, DUE_HOURS: DUE_HOURS, REMIND_AFTER_HOURS: REMIND_AFTER_HOURS, YN: YN, PERF: PERF, TEAM: TEAM,
+            SECTIONS: SECTIONS, allItems: allItems, specifyKey: specifyKey, missing: missing,
+            sanitize: sanitize, prefill: prefill, header: header, procedureEnd: procedureEnd,
+            dueFrom: dueFrom, state: state };
+if(typeof module !== "undefined" && module.exports) module.exports = api;
+if(typeof window !== "undefined") window.ProcSummaryForm = api;
+})();
+
+</script>
 
 <script>
 /* Generated demo build: never contact a backend, and keep storage separate so a
@@ -13478,7 +13757,8 @@ const CAPABILITIES = {
   /* Add or edit a location. CPM since 11 Sep 2026 - see the long note in roleStore.js,
      which is the authority. A CPM opens a hospital SITE and nothing else; the two keys
      below are what say so. */
-  manageLocations: ["ADMIN","CPM"],
+  manageLocations: ["ADMIN","CPM","MANAGER"],  // MANAGER since 20 Oct 2026, to set a site's CPM
+  setSiteCpm:      ["ADMIN","MANAGER"],  // choose a site's Responsible CPM (any user); roleStore.js
   manageSupplyLocations: ["ADMIN"],  // ...but a WAREHOUSE or an HQ is ADMIN alone
   deleteLocations: ["ADMIN"],        // removing one is ADMIN alone, like deletePatients
   manageUsers:     ["ADMIN"],
@@ -14365,9 +14645,13 @@ function commit(){ const ok = saveDB(S.db); pkgRefreshSoon(); return ok; }
 
 /* Thin JSON fetch for the backend. Throws an Error carrying .code/.status from the
    server's { error:{ code, message } } envelope, so callers can show a real reason. */
-async function api(method, path, body){
+async function api(method, path, body, o){
   const opt = { method, credentials:"same-origin", headers:{} };
   if(body !== undefined){ opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  /* keepalive: the request outlives the page (the tab is being closed). Browsers cap such a
+     body at 64 KB; a larger one is sent the ordinary way and may be cut off - which is
+     why beforeunload also asks the person to stay while anything is unsaved. */
+  if(o && o.keepalive && (!opt.body || opt.body.length < 60000)) opt.keepalive = true;
   /* No network is its own answer, code OFFLINE, and not a refusal: the procedure report
      queues on it (see THE REPORT WITH NO NETWORK) where it would otherwise retry, give up
      and tell the operator their work is on this device only. */
@@ -14531,7 +14815,10 @@ async function loadRemoteStore(){
    the very bug this list exists to stop. status also self-heals - the next edit
    recomputes it - and submit passes the new one in its own body, so nothing is lost. */
 const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
-                              "checkedOutBy", "checkedOutAt", "offlineHold"];
+                              "checkedOutBy", "checkedOutAt", "offlineHold",
+                              /* the procedure summary (20 Oct 2026): written only by its
+                                 own routes, so the server's copy is always the newer one */
+                              "procSummary"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -14599,22 +14886,93 @@ async function runPatientSave(){
   try{
     await savePatientRemote(p);
     if(!_pPending) markUnsaved(id, false);
+    if(S.patientSaveFailed && S.patientSaveFailed[id]){ delete S.patientSaveFailed[id]; paintModeBar(); }
   }
   catch(e){
     if(e.code === "OFFLINE") offQueuePatient(p);
-    else toast(e.code === "CONFLICT" ? "This subject changed elsewhere — reopen it."
-                 : "Save failed: " + (e.message || "unknown error") +
-                   " Your work is on this device only — do not reload.", "bad"); }
+    else{
+      /* NOT A TOAST ALONE (21 Oct 2026). KR's refusals were toasts, and the CPM went on
+         filling in a stage for minutes after the first one. The strip at the top stays
+         until a save of this subject gets through. */
+      S.patientSaveFailed = S.patientSaveFailed || {};
+      S.patientSaveFailed[id] = { code: p.patientCode || id,
+        why: e.code === "CONFLICT" ? "somebody else changed this subject — reload the page before going on"
+                                   : (e.message || "the server refused the save") };
+      paintModeBar();
+      toast(e.code === "CONFLICT" ? "NOT SAVED: this subject was changed elsewhere. Reload before going on."
+                 : "NOT SAVED: " + (e.message || "unknown error") +
+                   " Your work is on this device only — do not reload.", "bad");
+    }
+  }
   finally{ _pSaving = false; if(_pPending) runPatientSave(); }
 }
-async function savePatientRemote(p){ return mergePatient(await api("PUT", "/api/patients", p)); }
+/* SAVE THE MOMENT THE PERSON LEAVES (the owner, 21 Oct 2026): another screen, another tab or
+   window, or closing the page. Nothing waits for the 900ms debounce then. The field that
+   still has the cursor is blurred first, because the stage fields save on `change`, which
+   the browser fires only when a field is left - text typed into a field that is still
+   focused when the tab closes would otherwise never be saved at all. */
+let _leaving = false, _refocus = null;
+function restoreFocusAfterLeave(){
+  const r = _refocus; _refocus = null;
+  if(!r) return;
+  const a = document.activeElement;
+  if(a && a !== document.body) return;            // the person has already gone elsewhere
+  const el = document.getElementById(r.id);
+  if(!el || el.disabled) return;
+  try{
+    el.focus({ preventScroll: true });
+    if(typeof r.start === "number" && el.setSelectionRange) el.setSelectionRange(r.start, r.end);
+  }catch(e){}
+}
+function flushAllSaves(opts){
+  if(!S.backend) return;
+  const el = document.activeElement;
+  if(el && el !== document.body && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)){
+    /* Coming back to the tab puts the cursor back where it was, so saving on the way out
+       costs the person nothing. Kept by id: the change handler may redraw the field. */
+    _refocus = (opts && opts.closing && el.id)
+      ? { id: el.id, start: el.selectionStart, end: el.selectionEnd } : null;
+    try{ el.blur(); }catch(e){}
+  }
+  _leaving = !!(opts && opts.closing);
+  try{
+    if(_pPending){ clearTimeout(_pTimer); runPatientSave(); }
+    flushCaseFileSave();
+  }finally{ _leaving = false; }
+}
+function savesOutstanding(){
+  return !!(_pPending || _pSaving || _cfPending || _cfSaving);
+}
+/* ONE ROW, ONE WRITE AT A TIME FROM THIS BROWSER (21 Oct 2026, KR at MUSC). Releasing
+   the case file writes the patient row too, and gives it a new ETag. Released after a
+   9-second visit to the report while the next save was being built, KR's browser kept
+   the old ETag and every save after it was refused - a whole stage typed, logged and
+   mailed about, and never stored. The release reply now carries the row (its ETag is
+   merged like any save's), and the release and the saves go through this one queue, so
+   a save always leaves with the ETag the last write handed back. */
+let _pChain = Promise.resolve();
+function patientRowWrite(fn){
+  const run = _pChain.then(fn, fn);
+  _pChain = run.catch(() => {});
+  return run;
+}
+async function savePatientRemote(p){
+  const keepalive = _leaving;       // read now: the queued write runs after flushAllSaves returns
+  return patientRowWrite(async () => mergePatient(await api("PUT", "/api/patients", p, { keepalive })));
+}
 /* Claim the file, or keep the claim alive. `force` is the takeover and the server gates
    it on lockCaseFile; everything else about this call is the same write. */
 async function checkoutPatientRemote(id, opts){ return api("POST", "/api/patients/" + encodeURIComponent(id) + "/checkout", opts || {}); }
 /* Ask who holds it WITHOUT claiming it. Everything a viewer does goes through this one:
    asking must never be what takes the file off the person writing the report. */
 async function checkoutStatusRemote(id){ return api("GET", "/api/patients/" + encodeURIComponent(id) + "/checkout"); }
-async function releasePatientRemote(id){ return api("POST", "/api/patients/" + encodeURIComponent(id) + "/release", {}); }
+async function releasePatientRemote(id){
+  return patientRowWrite(async () => {
+    const r = await api("POST", "/api/patients/" + encodeURIComponent(id) + "/release", {});
+    if(r && r.patient) mergePatient(r.patient);     // the new ETag - see patientRowWrite
+    return r;
+  });
+}
 /* Set by the case-file screen to its own recalc(). A merge replaces the caseFile bag
    under an open form, and the computed readouts are drawn from the model - without this
    they keep showing the value from before the merge. Guarded on the form still being on
@@ -14622,7 +14980,8 @@ async function releasePatientRemote(id){ return api("POST", "/api/patients/" + e
    refreshed: a full render() would throw the operator back to the top of the page. */
 let _cfRecalc = null;
 async function saveCaseFileRemote(id, caseFile, customQuestions){
-  const merged = mergePatient(await api("PATCH", "/api/patients/" + encodeURIComponent(id) + "/casefile", { caseFile, customQuestions }));
+  const merged = mergePatient(await api("PATCH", "/api/patients/" + encodeURIComponent(id) + "/casefile",
+    { caseFile, customQuestions }, { keepalive: _leaving }));
   if(_cfRecalc && document.getElementById("cform")) _cfRecalc();
   return merged;
 }
@@ -16060,7 +16419,7 @@ function notify(text, forRoles, forUserIds, locationId){
    In-app immediately; the email goes through the server, which knows the addresses and
    is the only place allowed to send. Best-effort - a notification that fails must never
    cost the assignment itself. */
-function announceAssignment(p, stage, prevEmail, nextEmail){
+function announceAssignment(p, stage, prevEmail, nextEmail, opts){
   const a = p.anat[stage.k];
   const what = "stage " + stage.n + ". " + stage.label;
   const due = a.dueDate ? " by " + fmtDate(a.dueDate) : "";
@@ -16077,7 +16436,9 @@ function announceAssignment(p, stage, prevEmail, nextEmail){
     notify(what + " for subject " + p.patientCode + " is no longer assigned to you.",
            [], [prevEmail], p.siteId);
   }
-  if(S.backend){
+  /* No "New task" mail when the stage before this one was confirmed and that confirmation
+     is mailed (20 Oct 2026): the stage-done mail tells the new owner it is theirs. */
+  if(S.backend && !(opts && opts.noMail)){
     api("POST", "/api/tasks/notify", {
       patientId: p.id, patientCode: p.patientCode, siteId: p.siteId,
       stageKey: stage.k, stageLabel: stage.n + ". " + stage.label,
@@ -16233,13 +16594,26 @@ window.addEventListener("online", () => { _flushFails = 0; flushQueue(); });
 /* A field specialist typically leaves the tab open and returns to it. Treat that
    return as a chance to drain, but only if something is actually waiting. */
 document.addEventListener("visibilitychange", () => {
-  if(document.hidden) return;
+  /* Another tab, another window, the phone's home button: save now (the owner, 21 Oct 2026).
+     On a phone this is often the last moment the page is alive at all. */
+  if(document.hidden){ flushAllSaves({ closing: true }); return; }
+  restoreFocusAfterLeave();
   if(pendingUploads().length) flushQueue();
   /* And ask who is editing the open report. A backgrounded tab has its timers throttled
      to about one tick a minute, so coming back is the moment that answer is most likely
      to be stale - for the editor, whose claim needs refreshing, and for the viewer, who
      may have been waiting for the file to come free. */
   cfWake();
+});
+/* Closing the tab, reloading, typing another address. pagehide is the last event a page is
+   sure to get (on a phone, beforeunload often never comes); the saves leave with keepalive
+   so they outlive it. beforeunload then asks the person to stay if anything is still
+   unsaved or in the air - the browser's own "Leave site?" box, shown only in that case. */
+window.addEventListener("pagehide", () => flushAllSaves({ closing: true }));
+window.addEventListener("beforeunload", e => {
+  if(!S.backend) return;
+  flushAllSaves({ closing: true });
+  if(savesOutstanding()){ e.preventDefault(); e.returnValue = ""; }
 });
 
 /* Statuses that are set by the system, not by a person. */
@@ -16384,6 +16758,26 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.1.0", date: "20 October 2026", groups: [
+    { h:"Procedure summary", items:[
+      "Submitting a procedure report opens the <b>Clinical Procedure Summary</b> (form CLD-U-104) for the subject. It is one shared task for everybody on the procedure team and the subject’s Clinical PM, due <b>72 hours</b> after the procedure (from the DS extraction time).",
+      "It opens straight after Submit, and is under <b>Procedure Summary</b> in the menu, on Home and on the report. Anyone it was given to fills it in; it saves as you go. Whoever closes it is recorded as <b>Filled by</b>.",
+      "What the app already knows is filled in for you: the subject, site, date and implant size, simulator training from the report’s training ticks, and the IVC pressures beside 3.10.",
+      "Closing files a PDF laid out like the controlled document in the subject’s folder and in the <b>Procedure_Summary</b> folder. After that only an App Admin or a Manager can change it, with a reason.",
+      "A reminder email goes out <b>48 hours</b> after the procedure if it is still open, and an overdue one is listed at the top of the daily email.",
+      "The <b>Proctor, Tech 1st, Tech 2nd and Clinical</b> fields now offer <b>app users only</b> - they are who the summary is given to. The lists in Administration → Procedure team take users only."
+    ] },
+    { h:"Screening", items:[
+      "A user ticked <b>Screen Update</b> (Administration → Users) is emailed when a new subject is registered and enters screening.",
+      "Completing <b>CT report, 3D model evaluation, pliable model evaluation, Eligibility &amp; Approvals</b> or <b>procedure scheduling</b> emails every App Admin and Manager, the subject’s Clinical PM and the site’s Clinical PM: what was entered, the images filed with it, and who carries the subject on. The person who now holds the next step is told so in their copy - this replaces the separate “New task” email for that step.",
+      "The daily email lists <b>subjects stuck in screening</b>: no move for 3 days or more, from registration until a procedure is scheduled - with the days since registration, the days since the last move and the site’s Clinical PM. A Clinical PM sees their own sites; App Admins, Managers and QA see all.",
+      "Managers and QA now receive the daily email <b>every day</b>."
+    ] },
+    { h:"Sites", items:[
+      "<b>Every hospital site has a Responsible CPM.</b> A site cannot be saved without one. An App Admin or a Manager chooses it, and may choose any user. A Clinical PM who opens a site - or saves one that has none - becomes its Responsible CPM.",
+      "Managers can now open Administration → Locations to set it. The list marks sites with no CPM."
+    ] }
+  ] },
   { version: "3.0.0", date: "20 October 2026", groups: [
     { h:"Getting around", items:[
       "A <b>Back</b> button beside the screen title returns to the previous screen. The browser’s Back and a phone’s back gesture do the same.",
@@ -18979,6 +19373,12 @@ async function rescueUnsaved(saved){
   const stuck = [];
   for(const local of saved){
     try{
+      /* THE WHOLE SUBJECT FIRST (21 Oct 2026). This used to send the procedure report alone
+         and then call the subject rescued - so a screening stage that had never reached the
+         server (KR, MUSC, 19 Oct) lost its last copy at the next reload, with the marker
+         cleared and nothing said. Its own ETag goes with it: the server takes it over a
+         claim, and refuses it if somebody really changed the subject since. */
+      if(can("managePatients") || can("editAnatomical")) await savePatientRemote(local);
       await saveCaseFileRemote(local.id, local.caseFile || {}, local.customQuestions || []);
       /* PUT THE RESCUED COPY BACK, and this line is not tidying. S.db was already replaced
          by the shared database a moment ago - which, for this patient, is the copy from
@@ -19294,6 +19694,9 @@ const NAV = [
   { k:"patients", ic:"personAdd", label:"Subject Register", roles:["ADMIN","CPM"] },
   { k:"screening",ic:"funnel",  label:"Subject Screening",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
   { k:"clinical", ic:"case",    label:"Procedure Report",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  /* The summary each submitted report opens (CLD-U-104, 20 Oct 2026). Same roles as the
+     report; the badge counts the open ones given to YOU. */
+  { k:"procsummary", ic:"case", label:"Procedure Summary", roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"], sumBadge:true },
   /* Sits directly under the Procedure Report because it answers the question that screen
      raises and cannot: not "what is happening to THIS patient" but "where is everybody".
      Same role list as the report it belongs to. */
@@ -19331,7 +19734,7 @@ const NAV = [
      both of them: its tab strip is built from ADM_TABS, filtered by capability, so a CPM
      opening Administration gets the Locations tab and nothing else. The menu entry is a
      door, not a grant - see VIEWS.admin. */
-  { k:"admin",    ic:"gear",    label:"Administration",     roles:["ADMIN","CPM"] }
+  { k:"admin",    ic:"gear",    label:"Administration",     roles:["ADMIN","CPM","MANAGER"] }
 ];
 
 /* Mirrors EXTERNAL_ROLES in roleStore.js, which is the authority - roleStore.upsert
@@ -19358,8 +19761,20 @@ function navAllowed(item){
 
 function enterApp(){
   $("#login").hidden = true; $("#delivery").hidden = true; $("#app").hidden = false;
+  paintModeBar();
 
+  const allowed = NAV.filter(navAllowed);
+  if(!allowed.some(i => i.k === S.view)) S.view = allowed[0] ? allowed[0].k : "today";
+  closeSideMenu();
+  applySidePin();
+  renderNav();
+  enterAppRest();
+}
+/* The strip above every screen. Its own function since 21 Oct 2026, so a save refused
+   while working can raise it at once - it used to be drawn only when the app started. */
+function paintModeBar(){
   const bar = $("#mode-bar");
+  if(!bar) return;
   bar.hidden = false;
   /* WORK THIS BROWSER IS HOLDING THAT THE SERVER HAS REFUSED. It outranks the mode notice,
      because "which mode am I in" is background and "a procedure report exists on this
@@ -19368,6 +19783,10 @@ function enterApp(){
      piece of state to go stale. */
   const stuck = (S.rescueStuck || []).filter(x =>
     x && x.id && S.db && S.db.unsaved && S.db.unsaved[x.id]);
+  /* And a save refused while working (21 Oct 2026) - cleared by the next one that lands. */
+  for(const [id, f] of Object.entries(S.patientSaveFailed || {})){
+    if(f && !stuck.some(x => x.id === id)) stuck.push({ id, code: f.code, why: f.why });
+  }
   if(stuck.length){
     bar.className = "mode-bar stuck";
     bar.innerHTML = '<b>' + stuck.length + ' report(s) on this device have NOT reached the ' +
@@ -19397,12 +19816,8 @@ function enterApp(){
     try{ localStorage.removeItem(STORE_KEY); localStorage.removeItem(SESSION_KEY); }catch(err){}
     window.location.reload();
   };
-
-  const allowed = NAV.filter(navAllowed);
-  if(!allowed.some(i => i.k === S.view)) S.view = allowed[0] ? allowed[0].k : "today";
-  closeSideMenu();
-  applySidePin();
-  renderNav();
+}
+function enterAppRest(){
   renderUserMenu();
   render();
   paintOffline();
@@ -19424,7 +19839,8 @@ function renderNav(){
     if(!navAllowed(i)) continue;
     if(pending){ html += '<div class="nav-lbl">' + esc(pending) + '</div>'; pending = null; }
     const on = S.view === i.k;
-    const count = i.qaBadge ? qaTodoCount() : (i.badge ? unread : (i.todo ? todo : 0));
+    const count = i.qaBadge ? qaTodoCount() : i.sumBadge ? mySummaries().length
+                : (i.badge ? unread : (i.todo ? todo : 0));
     html += '<button class="nav-i' + (on ? " on" : "") + '" data-k="' + i.k + '"' +
       (on ? ' aria-current="page"' : "") + '>' +
       '<span class="n">' + icon(i.ic) + '</span>' +
@@ -19511,6 +19927,7 @@ function navSame(a, b){
 /* ctx: any of PID, SITEID, SHIPSEL, scr - applied BEFORE the move, so the remembered
    entry is the screen as it was and not as it is about to be. */
 function go(view, ctx){
+  flushAllSaves();                  // leaving a screen saves what it holds - see flushAllSaves
   const from = navSnap();
   if(ctx){
     if("PID" in ctx) PID = ctx.PID;
@@ -19527,6 +19944,7 @@ function go(view, ctx){
   closeSideMenu(); renderNav(); render();
 }
 function goBack(){
+  flushAllSaves();
   let s = NAV_BACK.pop();
   /* A screen this person can no longer reach (a role changed, a view was removed) is
      skipped rather than opened as "Nothing here". */
@@ -19702,6 +20120,17 @@ function todoItems(){
              (t.a.dueDate ? " (due " + fmtDate(t.a.dueDate) + ")" : "") +
              (t.unassigned ? " · unassigned" : "")).join(" — ") +
            (tasks.length > 3 ? "…" : "") });
+  }
+
+  /* 0b — procedure summaries given to this person and still open (20 Oct 2026). */
+  const sums = mySummaries();
+  if(sums.length){
+    const lateS = sums.filter(p => summaryState(p).kind === "overdue").length;
+    out.push({ ic:"case", tone: lateS ? "t-red" : "t-blue", view:"procsummary",
+      title: sums.length + " procedure summar" + (sums.length === 1 ? "y" : "ies") + " to complete" +
+        (lateS ? " — " + lateS + " overdue" : ""),
+      sub: sums.slice(0, 3).map(p => p.patientCode + " (due " + fmtTs(summaryOf(p).dueAt) + ")").join(" — ") +
+        (sums.length > 3 ? "…" : "") });
   }
 
   /* 1 — physically arrived, nobody has checked it in. Blocks it becoming stock. */
@@ -24074,14 +24503,19 @@ VIEWS.screening = {
     });
 
     /* ---- the four stage actions ---- */
-    const afterStageChange = (p2, stage, what, extra) => {
+    /* `opts.doneMail`: this change IS a stage being confirmed. For the five mailed stages
+       the next stage is assigned without its own "New task" mail, and the stage-done mail
+       is asked for after the save is queued (20 Oct 2026). */
+    const afterStageChange = (p2, stage, what, extra, opts) => {
+      const mailIt = !!(opts && opts.doneMail) && STAGE_DONE_MAIL.includes(stage.k);
       const rec = currentRecommendation(p2);
       if(rec.size){ p2.unicaSize = rec.size; p2.dsSize = dsForUnica(rec.size); }
-      autoAssignNext(p2, stage);
+      autoAssignNext(p2, stage, mailIt ? { noMail:true } : undefined);
       p2.status = recomputeWorkflow(p2);
       logAction(what, Object.assign({ locationId:p2.siteId,
         comments:"Subject " + p2.patientCode + " · stage " + stage.n + ". " + stage.label }, extra || {}));
       commit(); schedulePatientSave(p2); renderKeepingPlace(); flashSaved();
+      if(mailIt && stageComplete(p2, stage)) requestStageDoneMail(p2, stage);
     };
 
     $$("[data-stgdone]").forEach(b => b.onclick = () => {
@@ -24154,7 +24588,8 @@ VIEWS.screening = {
           afterStageChange(p, stage, "Stage confirmed — subject NOT SUITABLE, discussion required", {
             highPriority:true,
             stateChanges: stage.k + " → Completed; suitability review opened",
-            comments: "Subject " + p.patientCode + " · " + stageName(stage) + " — " + (a.unsuitableReason || "") });
+            comments: "Subject " + p.patientCode + " · " + stageName(stage) + " — " + (a.unsuitableReason || "") },
+            { doneMail:true });
           return;
         }
         /* A borderline conclusion IS this stage's size decision, so it becomes the
@@ -24162,7 +24597,7 @@ VIEWS.screening = {
         if(stage.scoring && sc.decision === "ELIGIBLE" && sc.chosenSize) a.size = sc.chosenSize;
 
         afterStageChange(p, stage, "Stage confirmed complete", {
-          stateChanges: stage.k + " → Completed by " + S.me.name });
+          stateChanges: stage.k + " → Completed by " + S.me.name }, { doneMail:true });
       };
     });
 
@@ -24453,20 +24888,20 @@ function autoAssignHint(p, s, a, assignedNow){
   }
   return t ? '<div class="hint">' + t + '</div>' : "";
 }
-function autoAssignNext(p, done){
+function autoAssignNext(p, done, opts){
   if(!p || !p.anat || !done) return "";
   if(!stageComplete(p, done)) return "";
   const i = ANAT_STAGES.findIndex(s => s.k === done.k);
   /* The first stage after it still open: a Not required one has nobody to give it to. */
   const next = ANAT_STAGES.slice(i + 1).find(s => !stageComplete(p, s));
-  return autoAssignStage(p, next);
+  return autoAssignStage(p, next, opts);
 }
 /* Stage 1 opens when the CT is in, so that is when it gets its owner. */
 function autoAssignFirst(p){
   if(!p || !p.anat || !(p.screening && p.screening.ct && p.screening.ct.done)) return "";
   return autoAssignStage(p, ANAT_STAGES[0]);
 }
-function autoAssignStage(p, next){
+function autoAssignStage(p, next, opts){
   if(!next || !AUTO_ASSIGN_STAGES.includes(next.k)) return "";
   const a = p.anat[next.k];
   if(!a || String(a.assignedTo || "").trim() || a.autoAssignedAt || a.autoAssignChanged || (a.status || "Not started") !== "Not started") return "";
@@ -24475,8 +24910,20 @@ function autoAssignStage(p, next){
   if(!email) return "";
   a.assignedTo = email;
   a.autoAssignedAt = nowISO();
-  announceAssignment(p, next, "", email);
+  announceAssignment(p, next, "", email, opts);
   return email;
+}
+
+/* A SCREENING STAGE CONFIRMED IS MAILED (20 Oct 2026, the owner): CT report, 3D model,
+   pliable model, Eligibility & Approvals and scheduling. Mirrors STAGE_DONE_MAIL in
+   screeningMail.js, which is the authority - the server refuses any other stage. The
+   server waits for this subject's save to land and reads everything from the stored
+   record, so this only names the stage. Best effort: it never costs the confirmation. */
+const STAGE_DONE_MAIL = ["ct", "model3d", "flexible", "approvals", "scheduling"];
+function requestStageDoneMail(p, stage){
+  if(!S.backend || !p || !stage || !STAGE_DONE_MAIL.includes(stage.k)) return;
+  api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/stage-done-mail", { stageKey: stage.k })
+    .catch(() => {});
 }
 
 /* Undo a disqualification. Whoever may disqualify may resume; the line in the log keeps
@@ -25161,7 +25608,7 @@ function anatStageHtml(p, s, ctReady){
            they can still be changed there, on the day. */
         '<div class="grid g4" style="margin:4px 0 10px">' + TEAM_LISTS.map(t => {
           const v = String(a["team_" + t.field] || "");
-          const names = teamNames(t.k);
+          const names = teamNames(t.k).filter(isTeamUser);   // app users only, 20 Oct 2026
           return '<div class="field"><label for="an-' + s.k + '-team_' + t.field + '">' + esc(t.label) + '</label>' +
             '<select id="an-' + s.k + '-team_' + t.field + '" data-anat="' + s.k + '|team_' + t.field + '"' + dis + '>' +
             '<option value="">— not yet —</option>' +
@@ -25709,8 +26156,10 @@ function openOrderDialog(p){
     const sched = p.anat.scheduling;
     sched.completionDate = v.date;
     p.procedureDate = v.date;
+    /* Whether THIS press is what confirms stage 9 - the stage-done mail goes once, then. */
+    let schedJustDone = false;
     if(sched.status !== "Completed" && !stageMissing(p, ANAT_STAGES.find(x => x.k === "scheduling")).length){
-      sched.status = "Completed"; sched.completedBy = S.me.name;
+      sched.status = "Completed"; sched.completedBy = S.me.name; schedJustDone = true;
     }
     /* Stage 10: the order. Quantities at the default are stored blank, so the default
        lives in one place (orderQty). */
@@ -25745,6 +26194,7 @@ function openOrderDialog(p){
     p.status = recomputeWorkflow(p);
     commit();
     schedulePatientSave(p);
+    if(schedJustDone) requestStageDoneMail(p, ANAT_STAGES.find(x => x.k === "scheduling"));
     toast(update ? "Order update sent." : "Products ordered. The warehouse has been asked to " +
       "confirm " + proposed.length + " proposed unit(s).", "good");
     renderKeepingPlace();
@@ -26379,7 +26829,8 @@ VIEWS.clinical = {
       /* Export is available whatever the file's state — including after the final lock,
          which is exactly when a shareable PDF of the whole procedure is wanted. */
       '<div class="row" style="margin-bottom:10px">' +
-        '<button class="btn" id="pt-pdf">Export procedure report (PDF)</button></div>' +
+        '<button class="btn" id="pt-pdf">Export procedure report (PDF)</button>' +
+        (p.procSummary ? '<button class="btn" id="pt-sum">Procedure summary</button>' : '') + '</div>' +
       (p.fileLocked ? '<div class="row"><span class="pill p-green">Permanently locked</span></div>' :
       /* VIEW MODE keeps the way out and loses the three buttons that write. Close is
          deliberately still here: somebody who came to look has to be able to leave by the
@@ -26629,14 +27080,6 @@ VIEWS.clinical = {
       if(!sel || !sel.dataset || !sel.dataset.teampick || cfReadOnly(p)) return;
       const box = form.querySelector('[data-cf="' + sel.dataset.teampick + '"]');
       if(!box) return;
-      if(sel.value === "__other__"){
-        box.style.display = "";
-        box.value = "";
-        box.dispatchEvent(new Event("input", { bubbles:true }));
-        box.focus();
-        return;
-      }
-      box.style.display = "none";
       box.value = sel.value;
       box.dispatchEvent(new Event("input", { bubbles:true }));
       box.dispatchEvent(new Event("change", { bubbles:true }));
@@ -26852,6 +27295,7 @@ VIEWS.clinical = {
     const sb = $("#pt-submit"); if(sb) sb.onclick = () => submitCase(p);
     const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
     const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
+    const ps = $("#pt-sum");    if(ps) ps.onclick = () => openSummary(p.id);
   }
 };
 
@@ -27038,7 +27482,9 @@ async function submitCase(p){
   if(S.backend){
     clearTimeout(_cfTimer);
     if(_cfPending === p.id) _cfPending = null;
-    const body = { status:newStatus, caseFile:p.caseFile || {}, customQuestions:p.customQuestions || [] };
+    const body = { status:newStatus, caseFile:p.caseFile || {}, customQuestions:p.customQuestions || [],
+                   /* when the procedure ended, on this device's clock - the summary's 72 hours */
+                   procEndAt: procEndLocal(p) };
     offline = queueFor(p);
     if(!offline){
       try{ await submitPatientRemote(p.id, body); }
@@ -27052,6 +27498,12 @@ async function submitCase(p){
       toast("Procedure report submitted. Still editable until locked.", "good"); render();
       await releaseAfterClose(p, "procedure report submitted");
       await takeBackUnused(p, back);
+      /* THE SUMMARY OPENS NOW (the owner: at the end of the report, the summary form opens).
+         The server opened it with the submit; whoever may fill it in is taken straight to it. */
+      if(summaryOf(p) && summaryOf(p).status === "OPEN" && mayWorkSummary(p)){
+        toast("The procedure summary is open — due within " + PSF.DUE_HOURS + " hours.", "good");
+        openSummary(p.id);
+      }
       return;
     }
     /* No network: submitted on this device, exactly as standalone does it below, and the
@@ -27068,6 +27520,9 @@ async function submitCase(p){
      same state from the same action, or the two behave differently for no visible reason. */
   if(newStatus === "CANCELLED") p.status = "CANCELLED";
   else if(c.procDate || p.procedureDate) p.status = "TREATED";
+  /* Standalone opens the summary itself; offline, the server opens it when the queued
+     submit lands. */
+  if(!S.backend) openSummaryLocal(p);
   logSubmit();
   commit();
   toast(offline ? "Procedure report submitted on this device. It reaches the server when the network returns."
@@ -28334,25 +28789,31 @@ function applyReportDefaults(p){
   return changed;
 }
 
+/* APP USERS ONLY since 20 Oct 2026 (the owner): whoever is in these four fields is given the
+   procedure summary when the report is submitted, so the list offers users and nothing
+   can be typed. A name stored before then that is not a user stays shown, marked, so an
+   older report reads as it did - and the hint says it gets no summary. */
 function teamField(p, key, label, teamRole){
   const v = String(cf(p)[key] == null ? "" : cf(p)[key]);
-  const names = teamNames(teamRole);
-  const other = v !== "" && !names.includes(v);
+  const names = teamNames(teamRole).filter(isTeamUser);
+  const legacy = v !== "" && !names.includes(v);
   const fid = "cf-" + key;
   return '<div class="field"><label for="' + fid + '-pick">' + esc(label) + '</label>' +
     '<select id="' + fid + '-pick" data-teampick="' + key + '"' + ro(p) + '>' +
       '<option value=""' + (v === "" ? " selected" : "") + '>— choose —</option>' +
       names.map(n => '<option' + (n === v ? " selected" : "") + '>' + esc(n) + '</option>').join("") +
-      '<option value="__other__"' + (other ? " selected" : "") + '>Other…</option>' +
+      (legacy ? '<option value="' + esc(v) + '" selected>' + esc(v) +
+        (isTeamUser(v) ? '' : ' (not an app user)') + '</option>' : '') +
     '</select>' +
-    '<input type="text" id="' + fid + '" data-cf="' + key + '" value="' + esc(v) + '"' + ro(p) +
-      ' placeholder="Name" aria-label="' + esc(label) + ' (not on the list)"' +
-      ' style="margin-top:6px' + (other ? "" : ";display:none") + '">' +
+    '<input type="hidden" id="' + fid + '" data-cf="' + key + '" value="' + esc(v) + '">' +
+    (legacy && !isTeamUser(v) ? '<div class="hint">Not an app user, so not given the procedure summary.</div>' : '') +
     '</div>';
 }
 async function addTeamMember(teamRole, name){
   name = String(name || "").trim();
-  if(!name) return showWhy("tm-why", "Choose a user, or type the name of someone without an account.");
+  if(!name) return showWhy("tm-why", "Choose a user.");
+  if(!isTeamUser(name)) return showWhy("tm-why", name + " is not a user of this app. The lists hold app users only, " +
+    "because they are given the procedure summary.");
   if(teamNames(teamRole).some(n => n.toLowerCase() === name.toLowerCase()))
     return showWhy("tm-why", name + " is already on that list.");
   let saved;
@@ -28375,8 +28836,15 @@ async function addTeamMember(teamRole, name){
   toast(name + " added" + (also ? " to Tech 1st and Tech 2nd." : "."), "good");
   render();
 }
-/* Who can be picked when adding a name: every person with an account, by name. Somebody
-   without one - a visiting proctor, a hospital clinician - is typed in instead. */
+/* Who can be picked when adding a name: every person with an account, by name. Since
+   20 Oct 2026 nobody else (the owner): the procedure team is given the procedure summary. */
+function teamUserByName(name){
+  const n = String(name || "").trim().toLowerCase();
+  if(!n) return null;
+  const hits = (S.db.users || []).filter(u => String(u.name || "").trim().toLowerCase() === n);
+  return hits.length === 1 ? hits[0] : null;
+}
+function isTeamUser(name){ return !!teamUserByName(name); }
 function teamPickableUsers(){
   const seen = new Set();
   return (S.db.users || []).map(u => String(u.name || u.email || "").trim())
@@ -33422,6 +33890,342 @@ const SF_KIND = {
   WITHDRAWN:      { label:"Withdrawn after Eligible", cls:"p-orange" },
   NO_REASON:      { label:"Cancelled — no reason recorded", cls:"p-grey" }
 };
+/* ============================================ THE PROCEDURE SUMMARY (CLD-U-104)
+   20 Oct 2026, the owner. Opened by Submit (on the server, in the same write that makes the
+   subject TREATED), one shared task for the procedure team and the subject's CPM, due 72
+   hours after the procedure. Anybody it was given to fills it in; whoever closes it is
+   "Filled by"; closing files the PDF in the subject's folder and in Procedure_Summary.
+   After closing, an App Admin or a Manager may change it with a reason. The questions are
+   procSummaryForm.js (window.ProcSummaryForm), which the server and the PDF read too.
+
+   p.procSummary is SERVER-OWNED (PATIENT_SERVER_OWNED): it is written only through its own
+   routes, and a whole-subject save never carries it back. */
+const PSF = window.ProcSummaryForm;
+let PSUM = { id:"", draft:null, dirty:false, timer:null, saving:false, editing:false, filter:"open" };
+
+function myEmail(){ return String((S.me && S.me.email) || "").toLowerCase(); }
+function summaryOf(p){ return (p && p.procSummary) || null; }
+function summaryIsMine(p){
+  const s = summaryOf(p);
+  return !!s && (s.assignees || []).map(e => String(e).toLowerCase()).includes(myEmail());
+}
+/* The server's rule (summaryAccess), mirrored to decide what to draw. */
+function mayWorkSummary(p){
+  const s = summaryOf(p);
+  if(!s) return false;
+  if(s.status === "CLOSED") return can("editSubmittedReport");
+  return summaryIsMine(p) || myRoles().some(r => ["ADMIN","MANAGER","CPM"].includes(r));
+}
+function summaryState(p){ return PSF.state(summaryOf(p), Date.now()); }
+/* Open summaries this person was given - the badge and the Home card. */
+function mySummaries(){
+  return (S.db.patients || []).filter(p => summaryOf(p) && summaryOf(p).status === "OPEN" && summaryIsMine(p));
+}
+function summaryPill(p){
+  const st = summaryState(p);
+  if(st.kind === "closed") return '<span class="pill p-green">Closed</span>';
+  if(st.kind === "overdue") return '<span class="pill p-red">' + (st.hoursLate < 1 ? "Overdue" : st.hoursLate + "h overdue") + '</span>';
+  if(st.kind === "open") return '<span class="pill p-orange">Open' + (st.hoursLeft != null ? " · " + st.hoursLeft + "h left" : "") + '</span>';
+  return "";
+}
+function summaryWho(emails){
+  return (emails || []).map(e => { const u = userByEmail(e); return u ? u.name : e; }).join(", ");
+}
+
+/* Standalone (demo) mirror of what the server does at Submit. */
+function openSummaryLocal(p){
+  if(p.procSummary || p.status !== "TREATED") return;
+  const c = cf(p), now = nowISO();
+  const emails = [];
+  ["proctor","tech1","tech2","clinical"].forEach(k => { const u = teamUserByName(c[k]); if(u) emails.push(String(u.email).toLowerCase()); });
+  const cpm = patientCpm(p, "order") || siteCpm(p.siteId);
+  if(cpm) emails.push(String(cpm).toLowerCase());
+  const end = PSF.procedureEnd(p, procEndLocal(p));
+  p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
+    openedBy:(S.me && S.me.email) || "", procEndAt:end, dueAt:PSF.dueFrom(end, now),
+    assignees:[...new Set(emails)], unmatched:[], answers:PSF.prefill(p, PD.TRAINING_ITEMS || []),
+    updatedAt:now, updatedBy:"", reminderSentAt:"", closedAt:"", closedBy:"", filledBy:"", filedAt:"",
+    editedAfterClose:[] };
+}
+/* The procedure's end as an instant, read on THIS device - the one at the site, whose
+   clock is the site's. Sent with Submit; the server falls back to reading it as UTC. */
+function procEndLocal(p){
+  const c = cf(p);
+  const d = String(c.procDate || p.procedureDate || "").slice(0, 10);
+  const t = /^(\d{1,2}):(\d{2})/.exec(String(c.dsOut || ""));
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(d) || !t) return "";
+  const local = new Date(d + "T" + ("0" + t[1]).slice(-2) + ":" + t[2] + ":00");
+  return isNaN(local) ? "" : local.toISOString();
+}
+
+/* ---- the form ---- */
+function psChoice(name, options, value, dis, multi){
+  return '<div class="chip-wrap" role="' + (multi ? "group" : "radiogroup") + '">' + options.map(o => {
+    const on = multi ? (value || []).includes(o) : value === o;
+    return '<label class="check' + (on ? " on" : "") + '" style="margin:0">' +
+      '<input type="' + (multi ? "checkbox" : "radio") + '" name="ps-' + name + '" data-ps="' + name + '"' +
+      ' data-psv="' + esc(o) + '"' + (multi ? ' data-psmulti="1"' : '') + (on ? " checked" : "") + (dis ? " disabled" : "") +
+      '><span>' + esc(o) + '</span></label>';
+  }).join("") + '</div>';
+}
+function psText(key, value, dis, rows, placeholder){
+  return '<textarea rows="' + (rows || 2) + '" data-ps="' + key + '" data-pstext="1"' + (dis ? " disabled" : "") +
+    (placeholder ? ' placeholder="' + esc(placeholder) + '"' : '') + '>' + esc(value || "") + '</textarea>';
+}
+function psQuestion(it, a, dis){
+  let h = '<div class="field ps-q" style="margin:10px 0"><label' + (it.optional ? '' : ' class="req"') + '>' +
+    esc(it.n + ". " + it.q) + '</label>';
+  if(it.type === "yn")     h += psChoice(it.k, PSF.YN, a[it.k], dis);
+  if(it.type === "choice") h += psChoice(it.k, it.options, a[it.k], dis);
+  if(it.type === "multi"){
+    h += psChoice(it.k, it.options, a[it.k] || [], dis, true);
+    if((a[it.k] || []).includes("Other")) h += psText(it.otherKey, a[it.otherKey], dis, 1, "Other — who");
+  }
+  if(it.type === "text") h += psText(it.k, a[it.k], dis, it.n === "6" ? 5 : 3);
+  if(it.specify && (a[it.k] === it.specify || String(a[PSF.specifyKey(it)] || "").trim())){
+    const lbl = it.specifyLabel === "results" ? "Results" : it.specifyLabel ? it.specifyLabel : "If “" + it.specify + "”, specify";
+    h += '<div style="margin-top:6px">' + psText(PSF.specifyKey(it), a[PSF.specifyKey(it)], dis,
+      (it.k === "feedback" || it.k === "actionItems") ? 4 : 2, lbl) + '</div>';
+  }
+  return h + '</div>';
+}
+function summaryFormHtml(p){
+  const s = summaryOf(p);
+  const a = PSUM.draft || s.answers || {};
+  const closed = s.status === "CLOSED";
+  const dis = !mayWorkSummary(p) || (closed && !PSUM.editing) || cfLockedSummary(p);
+  const h = PSF.header(p, locName(p.siteId));
+  const gaps = PSF.missing(a);
+  const head = '<div class="tbl-wrap"><table><thead><tr><th>Patient ID</th><th>Site</th><th>Procedure date</th>' +
+    '<th>Implant size</th><th>Filled by</th></tr></thead><tbody><tr>' +
+    '<td><b>' + esc(h.patientId) + '</b></td><td>' + esc(h.site) + '</td><td>' + esc(fmtDate(h.procedureDate)) + '</td>' +
+    '<td>' + esc(h.implantSize || "—") + '</td><td>' + esc(s.filledBy || (closed ? "—" : "whoever closes it")) + '</td>' +
+    '</tr></tbody></table></div>';
+  const st = summaryState(p);
+  const status = '<div class="' + (st.kind === "overdue" ? "warn" : "info") + '" style="margin:10px 0">' +
+    summaryPill(p) + ' ' + (closed
+      ? 'Closed by <b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
+        (s.filedAt ? ' · filed in the subject’s folder and in Procedure_Summary' : ' · <b>not filed yet</b>')
+      : 'Due by <b>' + esc(fmtTs(s.dueAt)) + '</b> — ' + PSF.DUE_HOURS + ' hours after the procedure. ' +
+        'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>. Anyone on it can fill it in; ' +
+        'whoever closes it is recorded as Filled by.') +
+    ((s.unmatched || []).length ? '<div class="hint">Not app users, so not given it: ' + esc(s.unmatched.join(", ")) + '</div>' : '') +
+    ((s.editedAfterClose || []).length ? '<div class="hint">Changed after closing: ' +
+      esc(s.editedAfterClose.map(e => e.by + " " + fmtTs(e.at) + " — " + e.reason).join("; ")) + '</div>' : '') +
+    '</div>';
+  const body = PSF.SECTIONS.map(sec =>
+    '<div class="card" style="margin-top:12px"><div class="card-hd"><h2>' + esc(sec.n + ". " + sec.title) + '</h2></div>' +
+    '<div class="card-bd">' + sec.items.map(it => psQuestion(it, a, dis)).join("") + '</div></div>').join("");
+  const btns = '<div class="row" style="margin-top:14px;gap:8px;flex-wrap:wrap">' +
+    '<button class="btn" id="ps-back">Back to the list</button>' +
+    (S.backend ? '<button class="btn" id="ps-pdf">Open PDF</button>' : '') +
+    (!closed && mayWorkSummary(p)
+      ? '<span class="hint" id="ps-saved">' + (PSUM.saving ? "Saving…" : PSUM.dirty ? "Not saved yet" : "Saved") + '</span>' +
+        '<button class="btn btn-primary" id="ps-close"' + (gaps.length ? ' title="Still to answer: ' + esc(gaps.join(", ")) + '"' : '') +
+        '>Close and file</button>'
+      : '') +
+    (closed && can("editSubmittedReport") && !PSUM.editing ? '<button class="btn" id="ps-edit">Change (App Admin / Manager)</button>' : '') +
+    (closed && PSUM.editing ? '<button class="btn btn-primary" id="ps-save-closed">Save change…</button>' +
+      '<button class="btn" id="ps-cancel-edit">Cancel</button>' : '') +
+    (closed && !s.filedAt && S.backend ? '<button class="btn" id="ps-refile">File again</button>' : '') +
+    '</div>' + whyBox("ps-why") +
+    (!closed ? '<div class="hint" id="ps-gaps" style="margin-top:6px">' + summaryGapsText(gaps) + '</div>' : '');
+  return head + status + body + btns;
+}
+function cfLockedSummary(p){ return false; }   // a locked report does not lock its summary
+function summaryGapsText(gaps){
+  return gaps.length ? "Still to answer before closing: " + esc(gaps.join(", ")) : "Everything is answered — it can be closed.";
+}
+
+function summaryListHtml(){
+  const all = (S.db.patients || []).filter(p => summaryOf(p) && inPatientScope(p.siteId));
+  const rows = all.filter(p => PSUM.filter === "all" ? true
+    : PSUM.filter === "closed" ? summaryOf(p).status === "CLOSED"
+    : PSUM.filter === "mine" ? summaryOf(p).status === "OPEN" && summaryIsMine(p)
+    : summaryOf(p).status === "OPEN")
+    .sort((x, y) => String(summaryOf(x).dueAt).localeCompare(String(summaryOf(y).dueAt)));
+  const n = k => all.filter(p => k === "mine" ? summaryOf(p).status === "OPEN" && summaryIsMine(p)
+    : k === "closed" ? summaryOf(p).status === "CLOSED" : k === "open" ? summaryOf(p).status === "OPEN" : true).length;
+  return '<div class="info">One summary per treated subject (form ' + esc(PSF.DOC.number) + ' Rev' + esc(PSF.DOC.revision) +
+    '), opened when the procedure report is submitted, for the procedure team and the subject’s Clinical PM. ' +
+    'Due ' + PSF.DUE_HOURS + ' hours after the procedure.</div>' +
+    '<div class="filters">' + selField("ps-filter", "Show", PSUM.filter,
+      [["open","Open (" + n("open") + ")"],["mine","Given to me (" + n("mine") + ")"],
+       ["closed","Closed (" + n("closed") + ")"],["all","All (" + n("all") + ")"]]) + '</div>' +
+    (rows.length
+      ? '<div class="tbl-wrap"><table><thead><tr><th>Subject</th><th>Procedure</th><th>Status</th><th>Due</th>' +
+        '<th>Given to</th><th>Filled by</th><th></th></tr></thead><tbody>' + rows.map(p => {
+          const s = summaryOf(p);
+          return '<tr><td><b>' + esc(p.patientCode) + '</b><div class="hint">' + esc(locName(p.siteId)) + '</div></td>' +
+            '<td>' + esc(fmtDate(cf(p).procDate || p.procedureDate)) + '</td>' +
+            '<td>' + summaryPill(p) + '</td><td>' + esc(fmtTs(s.dueAt)) + '</td>' +
+            '<td>' + esc(summaryWho(s.assignees) || "—") + '</td><td>' + esc(s.filledBy || "—") + '</td>' +
+            '<td><button class="btn btn-sm' + (s.status === "OPEN" && summaryIsMine(p) ? " btn-primary" : "") +
+              '" data-ps-open="' + esc(p.id) + '">' + (s.status === "OPEN" && mayWorkSummary(p) ? "Fill in" : "View") + '</button></td></tr>';
+        }).join("") + '</tbody></table></div>'
+      : '<div class="empty">Nothing here.</div>');
+}
+
+VIEWS.procsummary = {
+  title:"Procedure Summary",
+  sub(){ const p = PSUM.id && patient(PSUM.id);
+    return p ? "Clinical procedure summary — " + p.patientCode : "The clinical procedure summary (" + PSF.DOC.number + ") of every treated subject."; },
+  body(){
+    const p = PSUM.id && patient(PSUM.id);
+    if(p && summaryOf(p)) return summaryFormHtml(p);
+    PSUM.id = "";
+    return summaryListHtml();
+  },
+  wire(){
+    const f = $("#ps-filter"); if(f) f.onchange = () => { PSUM.filter = f.value; render(); };
+    $$("[data-ps-open]").forEach(b => b.onclick = () => openSummary(b.dataset.psOpen));
+    const p = PSUM.id && patient(PSUM.id);
+    if(!p || !summaryOf(p)) return;
+    const back = $("#ps-back"); if(back) back.onclick = async () => { await flushSummary(p); PSUM.id = ""; PSUM.draft = null; PSUM.editing = false; render(); };
+    const pdf = $("#ps-pdf"); if(pdf) pdf.onclick = async () => {
+      await flushSummary(p);
+      const w = window.open("/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/pdf", "_blank", "noopener");
+      if(!w) toast("Your browser blocked the new tab. Allow pop-ups and try again.", "warn");
+    };
+    $$("[data-ps]").forEach(el => el.addEventListener(el.dataset.pstext ? "input" : "change", () => onSummaryEdit(p, el)));
+    const close = $("#ps-close"); if(close) close.onclick = () => closeSummary(p);
+    const edit = $("#ps-edit"); if(edit) edit.onclick = () => { PSUM.editing = true; PSUM.draft = JSON.parse(JSON.stringify(summaryOf(p).answers || {})); render(); };
+    const cancel = $("#ps-cancel-edit"); if(cancel) cancel.onclick = () => { PSUM.editing = false; PSUM.draft = null; render(); };
+    const saveClosed = $("#ps-save-closed"); if(saveClosed) saveClosed.onclick = () => saveClosedSummary(p);
+    const refile = $("#ps-refile"); if(refile) refile.onclick = async () => {
+      refile.disabled = true;
+      try{ const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/file", {});
+        toast(r.filed && r.filed.patient && r.filed.central ? "Filed." : "Not filed: " + ((r.filed && r.filed.errors || []).join("; ")), r.filed && r.filed.patient && r.filed.central ? "good" : "bad"); }
+      catch(e){ toast(e.message || "Could not file it.", "bad"); }
+      refile.disabled = false;
+    };
+  }
+};
+
+function openSummary(id){
+  PSUM.id = id; PSUM.draft = null; PSUM.dirty = false; PSUM.editing = false;
+  const p = patient(id);
+  if(p && summaryOf(p)) PSUM.draft = JSON.parse(JSON.stringify(summaryOf(p).answers || {}));
+  go("procsummary");
+}
+
+/* Every change goes into the draft; an open summary is saved a moment later, the way the
+   report autosaves. A choice that reveals or hides a follow-up redraws the form. */
+function onSummaryEdit(p, el){
+  const s = summaryOf(p); if(!s || !mayWorkSummary(p)) return;
+  if(s.status === "CLOSED" && !PSUM.editing) return;
+  const a = PSUM.draft || (PSUM.draft = JSON.parse(JSON.stringify(s.answers || {})));
+  const k = el.dataset.ps;
+  let redraw = false;
+  if(el.dataset.psmulti){
+    const list = Array.isArray(a[k]) ? a[k].slice() : [];
+    const v = el.dataset.psv;
+    a[k] = el.checked ? (list.includes(v) ? list : list.concat([v])) : list.filter(x => x !== v);
+    redraw = v === "Other";
+  }else if(el.dataset.psv !== undefined){
+    a[k] = el.dataset.psv; redraw = true;
+  }else{
+    a[k] = el.value;
+  }
+  const chip = el.closest && el.closest(".check");
+  if(chip && el.type === "checkbox") chip.classList.toggle("on", el.checked);
+  /* Said again as it changes - typing an answer does not redraw the form. */
+  const gapsEl = $("#ps-gaps"); if(gapsEl) gapsEl.innerHTML = summaryGapsText(PSF.missing(a));
+  if(s.status === "OPEN"){
+    PSUM.dirty = true;
+    clearTimeout(PSUM.timer);
+    PSUM.timer = setTimeout(() => saveSummaryDraft(p), 1200);
+    const lbl = $("#ps-saved"); if(lbl) lbl.textContent = "Not saved yet";
+  }
+  if(redraw) renderKeepingPlace();
+}
+async function saveSummaryDraft(p){
+  const s = summaryOf(p); if(!s || s.status !== "OPEN" || !PSUM.dirty) return true;
+  const answers = JSON.parse(JSON.stringify(PSUM.draft || {}));
+  PSUM.dirty = false;
+  if(!S.backend){
+    s.answers = PSF.sanitize(answers); s.updatedAt = nowISO(); s.updatedBy = myEmail(); commit();
+    const lbl0 = $("#ps-saved"); if(lbl0) lbl0.textContent = "Saved"; return true;
+  }
+  PSUM.saving = true;
+  const lbl = $("#ps-saved"); if(lbl) lbl.textContent = "Saving…";
+  try{
+    const r = await api("PUT", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary", { answers });
+    if(r && r.patient) mergePatient(r.patient);
+    const l2 = $("#ps-saved"); if(l2) l2.textContent = PSUM.dirty ? "Not saved yet" : "Saved";
+    return true;
+  }catch(e){
+    PSUM.dirty = true;
+    const l2 = $("#ps-saved"); if(l2) l2.textContent = "Not saved";
+    showWhy("ps-why", e.message || "Could not save the summary.");
+    return false;
+  }finally{ PSUM.saving = false; }
+}
+async function flushSummary(p){
+  clearTimeout(PSUM.timer);
+  if(PSUM.dirty) return saveSummaryDraft(p);
+  return true;
+}
+async function closeSummary(p){
+  const s = summaryOf(p);
+  const a = PSUM.draft || s.answers || {};
+  const gaps = PSF.missing(a);
+  if(gaps.length) return showWhy("ps-why", "Still to answer before closing: " + gaps.join(", ") + ".");
+  modal("Close the procedure summary",
+    '<p>You are closing the procedure summary for <b>' + esc(p.patientCode) + '</b>. You are recorded as ' +
+    '<b>Filled by</b>, and the PDF is filed in the subject’s folder and in Procedure_Summary.</p>' +
+    '<p>After this only an App Admin or a Manager can change it, with a reason.</p>',
+    '<div class="row"><button class="btn btn-primary" id="ps-go">Close and file</button>' +
+    '<button class="btn" data-close="1">Back</button></div>');
+  $("#ps-go").onclick = async () => {
+    const btn = $("#ps-go"); btn.disabled = true;
+    clearTimeout(PSUM.timer);
+    if(!S.backend){
+      Object.assign(s, { answers:PSF.sanitize(a), status:"CLOSED", closedAt:nowISO(), closedBy:myEmail(),
+        filledBy:S.me.name, updatedAt:nowISO() });
+      logAction("Procedure summary closed for " + p.patientCode, { locationId:p.siteId, stateChanges:"Procedure summary CLOSED" });
+      commit(); closeModal(); PSUM.draft = null; PSUM.dirty = false; toast("Closed.", "good"); renderNav(); render(); return;
+    }
+    try{
+      const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/close", { answers:a });
+      if(r && r.patient) mergePatient(r.patient);
+      closeModal(); PSUM.draft = null; PSUM.dirty = false;
+      const ok = r.filed && r.filed.patient && r.filed.central;
+      toast(ok ? "Closed and filed." : "Closed, but NOT filed: " + ((r.filed && r.filed.errors) || []).join("; ") +
+        ". Use File again.", ok ? "good" : "bad");
+      renderNav(); render();
+    }catch(e){ btn.disabled = false; closeModal(); showWhy("ps-why", e.message || "Could not close it."); }
+  };
+}
+async function saveClosedSummary(p){
+  const a = PSUM.draft || {};
+  const gaps = PSF.missing(a);
+  if(gaps.length) return showWhy("ps-why", "A closed summary must stay complete: " + gaps.join(", ") + ".");
+  modal("Change a closed summary",
+    '<div class="field"><label class="req" for="ps-reason">Why is it being changed?</label>' +
+    '<textarea id="ps-reason" rows="3"></textarea></div><p class="hint">The reason goes into the summary and the log, ' +
+    'and the PDF is filed again.</p>',
+    '<div class="row"><button class="btn btn-primary" id="ps-reason-go">Save change</button>' +
+    '<button class="btn" data-close="1">Back</button></div>' + whyBox("ps-reason-why"));
+  $("#ps-reason-go").onclick = async () => {
+    const reason = $("#ps-reason").value.trim();
+    if(!reason) return showWhy("ps-reason-why", "A reason is required.");
+    if(!S.backend){
+      const s = summaryOf(p);
+      s.answers = PSF.sanitize(a);
+      s.editedAfterClose = (s.editedAfterClose || []).concat([{ by:S.me.name, email:myEmail(), at:nowISO(), reason }]);
+      logAction("Procedure summary changed after closing for " + p.patientCode, { locationId:p.siteId, highPriority:true, comments:"Reason: " + reason });
+      commit(); closeModal(); PSUM.editing = false; PSUM.draft = null; render(); return;
+    }
+    try{
+      const r = await api("PUT", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary", { answers:a, reason });
+      if(r && r.patient) mergePatient(r.patient);
+      closeModal(); PSUM.editing = false; PSUM.draft = null;
+      toast("Changed and filed again.", "good"); render();
+    }catch(e){ showWhy("ps-reason-why", e.message || "Could not save the change."); }
+  };
+}
+
 VIEWS.screenfail = {
   title:"Screen Failure",
   sub:"Every subject stopped before Eligible, and why — with those withdrawn later shown apart.",
@@ -35051,6 +35855,7 @@ VIEWS.admin = {
        team lists empty behind it. */
     if(admTabOpen("team")) await ensureTeam();
     if(admTabOpen("approvals")) await loadApprovals(true);
+    if(admTabOpen("users")) await loadAdminUserRecords();
   },
   body(){
     /* ADMTAB is module-level and defaults to "users", so without this a CPM opening
@@ -35138,7 +35943,10 @@ VIEWS.admin = {
                       : '<span class="pill p-orange">not filed</span>') + '</td>' +
           '<td>' + esc(l.address) + '</td>' +
           '<td>' + esc(l.contact) + '<div class="hint">' + esc(l.phone) + '</div></td>' +
-          '<td>' + esc(l.cpmUserId ? (user(l.cpmUserId) || {}).name || "—" : "—") + '</td>' +
+          /* A site with no Responsible CPM is named, loudly - since 20 Oct 2026 it cannot
+             be saved like that, and the legacy ones are filled the first time they are. */
+          '<td>' + (l.cpmUserId ? esc((user(l.cpmUserId) || {}).name || l.cpmUserId)
+                    : (l.type === "SITE" ? '<span class="pill p-orange">no CPM</span>' : "—")) + '</td>' +
           '<td class="num">' + n + '</td>' +
           /* The table stays WHOLE for a CPM - scopedLocIds() does not scope a CPM, so
              they see every location today and go on seeing every location. Only the two
@@ -35254,9 +36062,10 @@ VIEWS.admin = {
     }
 
     if(ADMTAB === "team" && admTabOpen("team")){
-      h += '<div class="info">The names the <b>Proctor</b>, <b>Tech 1st</b>, <b>Tech 2nd</b> and ' +
-        '<b>Clinical</b> fields of the procedure report are chosen from, for every site. Somebody ' +
-        'not on a list can still be typed in with <b>Other…</b>. Removing a name takes it off the ' +
+      h += '<div class="info">The people the <b>Proctor</b>, <b>Tech 1st</b>, <b>Tech 2nd</b> and ' +
+        '<b>Clinical</b> fields of the procedure report are chosen from, for every site. ' +
+        '<b>App users only</b> (since 20 Oct 2026): whoever is on the report is given the ' +
+        '<b>procedure summary</b> when it is submitted. Removing a name takes it off the ' +
         'list; reports that already name them are not changed. <b>Anyone added to Tech 1st is ' +
         'added to Tech 2nd as well.</b> Click a cell in the table to add or remove that qualification.</div>' +
         '<div class="grid g3" style="margin-bottom:6px">' +
@@ -35266,9 +36075,7 @@ VIEWS.admin = {
           '<div class="field"><label class="req" for="tm-user">Person</label>' +
             '<select id="tm-user"><option value="">— choose a user —</option>' +
               teamPickableUsers().map(n => '<option>' + esc(n) + '</option>').join("") +
-              '<option value="__other__">Someone without an account…</option></select>' +
-            '<input type="text" id="tm-name" maxlength="120" placeholder="Full name" ' +
-              'aria-label="Name of someone without an account" style="margin-top:6px;display:none"></div>' +
+              '</select></div>' +
           '<div class="field" style="align-self:end"><button class="btn btn-primary" id="tm-add">Add name</button></div>' +
         '</div>' + whyBox("tm-why") +
         /* ONE TABLE (v3.0.0, the owner item 25): a row per person, a column per list, so who is
@@ -35281,7 +36088,11 @@ VIEWS.admin = {
           if(!people.length) return '<div class="empty">Nobody on the lists yet. Add a person above.</div>';
           return '<div class="tbl-wrap"><table class="team-grid"><thead><tr><th>Person</th>' +
             TEAM_LISTS.map(x => '<th style="text-align:center">' + esc(x.label) + '</th>').join("") +
-            '</tr></thead><tbody>' + people.map(n => '<tr><td>' + esc(n) + '</td>' +
+            '</tr></thead><tbody>' + people.map(n => '<tr><td>' + esc(n) +
+              /* A name typed before the lists became users-only: still on the list, never given
+                 a summary. Said, so it can be replaced by the person's account. */
+              (isTeamUser(n) ? '' : ' <span class="pill p-orange" title="Not an app user - cannot be given the procedure summary">no account</span>') +
+              '</td>' +
               TEAM_LISTS.map(x => {
                 const m = live.find(y => y.name === n && y.teamRole === x.k);
                 return '<td style="text-align:center"><button type="button" class="tm-cell' + (m ? " on" : "") +
@@ -35334,13 +36145,7 @@ VIEWS.admin = {
 
     const tma = $("#tm-add");
     const tmu = $("#tm-user");
-    if(tmu) tmu.onchange = () => {
-      const other = tmu.value === "__other__";
-      $("#tm-name").style.display = other ? "" : "none";
-      if(other) $("#tm-name").focus();
-    };
-    if(tma) tma.onclick = () => addTeamMember($("#tm-role").value,
-      tmu && tmu.value !== "__other__" ? tmu.value : $("#tm-name").value);
+    if(tma) tma.onclick = () => addTeamMember($("#tm-role").value, tmu ? tmu.value : "");
     $$("[data-tm-toggle]").forEach(b => b.onclick = () => { b.disabled = true;
       return b.dataset.tmMember ? retireTeamMember(b.dataset.tmMember)
                                 : addTeamMember(b.dataset.tmToggle, b.dataset.tmPerson); });
@@ -35438,6 +36243,26 @@ function approvalMailAlert(n, approvers, batchId){
     '<div class="row"><button class="btn btn-primary" data-close="1">I understand</button></div>');
 }
 
+/* THE WHOLE USER RECORD FOR THE USERS TAB (20 Oct 2026). /api/store sends every signed-in
+   person a thin list of users - id, name, role, location, title, phone - which is all the
+   rest of the app needs. The edit form needs the rest: the account type, the extra role and
+   its location, the territory and Screen Update. Without them the form opened blank on those
+   fields and SAVED them blank, so an ordinary edit of a user cleared their extra role,
+   territory and Screen Update. Read from /api/admin/users (App Admin only) and merged onto
+   the thin records, so nothing else changes. */
+async function loadAdminUserRecords(){
+  if(!S.backend || !hasRole("ADMIN")) return;
+  try{
+    const r = await fetch("/api/admin/users", { credentials:"same-origin" });
+    if(!r.ok) return;
+    const full = (await r.json()).users || [];
+    for(const f of full){
+      const u = (S.db.users || []).find(x => String(x.email || x.id).toLowerCase() === String(f.email).toLowerCase());
+      if(u) Object.assign(u, { accessType:f.accessType, extraRoles:f.extraRoles || [], geography:f.geography || [],
+                               extraLocationId:f.extraLocationId || null, screenUpdate:f.screenUpdate === true });
+    }
+  }catch(e){ /* the form still opens; it simply cannot show what it was not sent */ }
+}
 function userForm(u){
   const isNew = !u;
   u = u || { id:uid("usr"), name:"", email:"", role:"EMPLOYEE", accessType:"INTERNAL",
@@ -35556,6 +36381,11 @@ function userForm(u){
          mind; the count and the names do, before the dialog is saved rather than after. */
       '<div class="hint" id="u-geo-sum" style="margin-top:6px"></div>' +
     '</fieldset>' +
+    /* "Screen Update" (20 Oct 2026, the owner): who is mailed the moment a new subject is
+       registered and enters screening. Per person, ticked here, and nothing else decides it. */
+    '<div style="margin:0 0 12px"><label class="check' + (u.screenUpdate ? " on" : "") +
+      '" style="margin:0"><input type="checkbox" id="u-su"' + (u.screenUpdate ? " checked" : "") +
+      '><span><b>Screen Update</b> — email me when a new subject is registered and enters screening</span></label></div>' +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
       '<div class="field"><label for="u-p">Phone</label><input type="tel" id="u-p" value="' + esc(u.phone||"") + '"></div></div>' +
@@ -35635,6 +36465,7 @@ function userForm(u){
     geoSummary();
   });
   ["#u-r", "#u-xr", "#u-l"].forEach(sel => { const e = $(sel); if(e) e.addEventListener("change", geoSummary); });
+  if($("#u-su")) $("#u-su").onchange = e => { const chip = e.target.closest(".check"); if(chip) chip.classList.toggle("on", e.target.checked); };
   geoSummary();
 
   $("#u-save").onclick = async () => {
@@ -35675,7 +36506,8 @@ function userForm(u){
     Object.assign(u, { name, email, role, accessType, extraRoles, geography,
       locationId:$("#u-l").value || null,
       extraLocationId: xr ? ($("#u-xl").value || null) : null,
-      title:$("#u-t").value.trim(), phone:$("#u-p").value.trim() });
+      title:$("#u-t").value.trim(), phone:$("#u-p").value.trim(),
+      screenUpdate: !!($("#u-su") || {}).checked });
 
     if(S.backend){
       try{
@@ -35685,7 +36517,8 @@ function userForm(u){
                                 extraRoles:u.extraRoles,
                                 geography:u.geography,
                                 name:u.name, title:u.title, phone:u.phone,
-                                locationId:u.locationId, extraLocationId:u.extraLocationId }) });
+                                locationId:u.locationId, extraLocationId:u.extraLocationId,
+                                screenUpdate:u.screenUpdate === true }) });
         if(!r.ok){
           const e = await r.json().catch(() => ({}));
           return showWhy("u-why", (e.error && e.error.message) || "The server refused it.");
@@ -35804,12 +36637,24 @@ function locForm(l){
       '<div class="field"><label for="l-ph1">Physician 1</label><input type="text" id="l-ph1" maxlength="200" value="' + esc(l.physician1 || "") + '"></div>' +
       '<div class="field"><label for="l-ph2">Physician 2</label><input type="text" id="l-ph2" maxlength="200" value="' + esc(l.physician2 || "") + '"></div>' +
       '<div class="field"><label for="l-echo">Echo operator</label><input type="text" id="l-echo" maxlength="200" value="' + esc(l.echoist || "") + '"></div></div>' +
-    '<div class="field"><label for="l-cpm">Responsible CPM</label><select id="l-cpm">' +
-      '<option value="">— none —</option>' +
-      S.db.users.filter(u => u.role === "CPM" || u.role === "ADMIN").map(u =>
-        '<option value="' + u.id + '"' + (u.id === l.cpmUserId ? " selected" : "") + '>' +
-        esc(u.name) + '</option>').join("") + '</select>' +
-      '<div class="hint">Receives the alert when a delivery is reported at this site.</div></div>',
+    /* THERE IS NO SITE WITHOUT A RESPONSIBLE CPM (20 Oct 2026, the owner). Any user may be it;
+       an App Admin or a Manager chooses (setSiteCpm). Anybody else sees it read-only - and
+       if the site has none yet, saving makes THEM its CPM, which the server does too. */
+    '<div class="field" id="l-cpm-row"' + (l.type === "SITE" ? '' : ' hidden') + '>' +
+      '<label class="req" for="l-cpm">Responsible CPM</label><select id="l-cpm"' +
+      (can("setSiteCpm") ? '' : ' disabled') + '>' +
+      '<option value="">— choose —</option>' +
+      S.db.users.slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))).map(u =>
+        '<option value="' + esc(u.id) + '"' + (u.id === l.cpmUserId ? " selected" : "") + '>' +
+        esc(u.name) + (u.role ? ' · ' + esc((ROLES[u.role] || {}).label || u.role) : '') +
+        '</option>').join("") + '</select>' +
+      '<div class="hint">' + (can("setSiteCpm")
+        ? 'Required for a hospital site. Any user may be it. Receives this site\'s alerts, ' +
+          'its screening tasks and its stuck subjects in the daily mail.'
+        : (l.cpmUserId
+            ? 'Set by a Manager or an App Admin.'
+            : 'This site has none yet - saving makes <b>you</b> its Responsible CPM. ' +
+              'A Manager or an App Admin can change it.')) + '</div></div>',
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn btn-primary" id="l-save">' + (isNew ? "Add" : "Save") + '</button>' +
     '</div>' + whyBox("l-why"));
@@ -35818,12 +36663,18 @@ function locForm(l){
      save-and-reopen. Whoever is adding a site is answering this question now. */
   const typeSel = $("#l-t"), openRow = $("#l-open-row");
   if(typeSel && openRow) typeSel.onchange = () => { openRow.hidden = typeSel.value !== "SITE";
-    if($("#l-phys-row")) $("#l-phys-row").hidden = typeSel.value !== "SITE"; };
+    if($("#l-phys-row")) $("#l-phys-row").hidden = typeSel.value !== "SITE";
+    if($("#l-cpm-row")) $("#l-cpm-row").hidden = typeSel.value !== "SITE"; };
   if(typeSel && openRow) openRow.hidden = typeSel.value !== "SITE";
 
   $("#l-save").onclick = async () => {
     const name = $("#l-n").value.trim();
     if(!name) return showWhy("l-why", "A name is required.");
+    /* No site without a Responsible CPM. Whoever may not choose keeps the site's own, or
+       becomes it - the server applies the same rule and is the authority. */
+    let cpmPick = can("setSiteCpm") ? ($("#l-cpm").value || null) : (l.cpmUserId || (S.me && S.me.id) || null);
+    if($("#l-t").value === "SITE" && !cpmPick)
+      return showWhy("l-why", "Choose the Responsible CPM - a hospital site cannot be saved without one.");
     Object.assign(l, { name, type:$("#l-t").value, address:$("#l-a").value.trim(),
       country:$("#l-country").value.trim(),
       region:$("#l-region").value.trim(),
@@ -35831,7 +36682,7 @@ function locForm(l){
          reading .value off a missing element throws, and it would throw inside a save. */
       openedAt:($("#l-opened") ? $("#l-opened").value : (l.openedAt || "")),
       contact:$("#l-c").value.trim(), phone:$("#l-p").value.trim(),
-      email:$("#l-e").value.trim(), cpmUserId:$("#l-cpm").value || null,
+      email:$("#l-e").value.trim(), cpmUserId:cpmPick,
       physician1:($("#l-ph1").value || "").trim(), physician2:($("#l-ph2").value || "").trim(),
       echoist:($("#l-echo").value || "").trim() });
 
