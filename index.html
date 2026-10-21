@@ -16758,6 +16758,15 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.2.1", date: "21 October 2026", groups: [
+    { h:"Shipping documents", items:[
+      "Every invoice and delivery note now carries the <b>QR code</b> and the instruction for the receiver: scan it with a phone camera to open the delivery page with the shipment filled in. It was meant to be there since 3.0.0 and was not being printed."
+    ] },
+    { h:"Subjects in follow up", items:[
+      "A subject whose report is <b>locked</b> no longer shows <b>Open report</b>. The eye still shows the filed report.",
+      "Beside the eye, a <b>procedure summary</b> button opens the subject’s summary (or offers the upload when there is none), and a <b>folder</b> button opens the subject’s folder in SharePoint."
+    ] }
+  ] },
   { version: "3.2.0", date: "21 October 2026", groups: [
     { h:"Procedure summary", items:[
       "The summary can be <b>uploaded as a file</b> - a PDF, a Word document or a saved email - instead of being filled in. Anybody can upload it; the first file closes the summary, with the uploader as <b>Filled by</b>. It is filed in the subject’s folder and in <b>Procedure_Summary</b>.",
@@ -34663,8 +34672,10 @@ VIEWS.followup = {
           '<td>' + sinceCell(when) + '</td>' +
           '<td>' + fuTeamCell(p, [["proctor","Proctor"],["tech1","Tech 1"],["tech2","Tech 2"],["clinical","Clinical"]]) + '</td>' +
           '<td>' + fuTeamCell(p, [["physician1","Physician"],["physician2","Physician"],["echoOperator","Echo"]]) + '</td>' +
-          '<td>' + report + reportEyeBtn(p) + '</td>' +
-          '<td><button class="btn btn-sm" data-fu-open="' + p.id + '">Open report</button></td></tr>';
+          '<td>' + report + reportEyeBtn(p) + fuSummaryBtn(p) + folderLinkBtn(p) + '</td>' +
+          /* 21 Oct 2026, the owner: a locked report cannot be changed, so it has no Open report -
+             the eye still shows the filed PDF. */
+          '<td>' + (p.fileLocked ? "" : '<button class="btn btn-sm" data-fu-open="' + p.id + '">Open report</button>') + '</td></tr>';
       }).join("") +
       '</tbody></table></div>' +
       '<div class="hint" style="margin-top:8px">Serial numbers are the units confirmed as ' +
@@ -34675,6 +34686,8 @@ VIEWS.followup = {
   },
   wire(){
     wireReportEyes();
+    $$("[data-fu-sum]").forEach(b => b.onclick = () => openSummary(b.dataset.fuSum));
+    $$("[data-fu-sum-up]").forEach(b => b.onclick = () => uploadSummaryFile(b.dataset.fuSumUp));
     $$("[data-fu-open]").forEach(b => b.onclick = () => {
       const p = patient(b.dataset.fuOpen);
       claimCaseFile(p.id);
@@ -34682,6 +34695,22 @@ VIEWS.followup = {
     });
   }
 };
+
+/* The procedure summary from Follow up, one press (21 Oct 2026, the owner), beside the eye and
+   the folder. Opens it where there is one; offers the upload where there is none, the same
+   choice the procedure report's own button makes. Only for those whose menu has the
+   Procedure Summary screen - a warehouse admin sees Follow up but not summaries. */
+function fuSummaryBtn(p){
+  const item = NAV.find(n => n.k === "procsummary");
+  if(!p || !item || !navAllowed(item)) return "";
+  if(summaryOf(p)) return '<button class="btn btn-sm btn-eye" data-fu-sum="' + p.id + '" ' +
+    'title="Open the procedure summary" aria-label="Open the procedure summary for ' + esc(p.patientCode) + '">' +
+    icon("case") + '</button>';
+  if(summaryUploadable(p)) return '<button class="btn btn-sm btn-eye" data-fu-sum-up="' + p.id + '" ' +
+    'title="No procedure summary yet - upload one" aria-label="Upload the procedure summary for ' + esc(p.patientCode) + '">' +
+    icon("case") + '</button>';
+  return "";
+}
 
 /* ======================================================= SHIPMENTS LOG ===
    Every shipment ever recorded, read as PAPERWORK rather than as movement.
