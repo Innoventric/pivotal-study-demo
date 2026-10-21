@@ -16758,6 +16758,16 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.2.0", date: "21 October 2026", groups: [
+    { h:"Procedure summary", items:[
+      "The summary can be <b>uploaded as a file</b> - a PDF, a Word document or a saved email - instead of being filled in. Anybody can upload it; the first file closes the summary, with the uploader as <b>Filled by</b>. It is filed in the subject’s folder and in <b>Procedure_Summary</b>.",
+      "Subjects implanted before summaries existed are listed under <b>Procedure Summary → Implanted, no summary</b>, and on their procedure report, with <b>Upload procedure summary</b>. Nothing is due for them and no reminder is sent."
+    ] },
+    { h:"Screening emails", items:[
+      "Two new ticks in Administration → Users: <b>Stage Update</b> adds the person to the email sent when a screening stage is completed, and <b>Stuck Update</b> sends them the daily email with the subjects stuck in screening at every site.",
+      "App Admins, Managers and QA receive both whether or not they are ticked. QA now also receives the stage-completed email."
+    ] }
+  ] },
   { version: "3.1.1", date: "20 October 2026", groups: [
     { h:"Scanning", items:[
       "Phones that could not read the label’s <b>DataMatrix</b> code - mostly Android - now read it. The phone’s own reader is used only where it can read that code, and a plain barcode beside it on the label is no longer picked up by mistake.",
@@ -26916,7 +26926,8 @@ VIEWS.clinical = {
          which is exactly when a shareable PDF of the whole procedure is wanted. */
       '<div class="row" style="margin-bottom:10px">' +
         '<button class="btn" id="pt-pdf">Export procedure report (PDF)</button>' +
-        (p.procSummary ? '<button class="btn" id="pt-sum">Procedure summary</button>' : '') + '</div>' +
+        (p.procSummary ? '<button class="btn" id="pt-sum">Procedure summary</button>'
+          : summaryUploadable(p) ? '<button class="btn" id="pt-sum-up">Upload procedure summary</button>' : '') + '</div>' +
       (p.fileLocked ? '<div class="row"><span class="pill p-green">Permanently locked</span></div>' :
       /* VIEW MODE keeps the way out and loses the three buttons that write. Close is
          deliberately still here: somebody who came to look has to be able to leave by the
@@ -27382,6 +27393,7 @@ VIEWS.clinical = {
     const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
     const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
     const ps = $("#pt-sum");    if(ps) ps.onclick = () => openSummary(p.id);
+    const psu = $("#pt-sum-up"); if(psu) psu.onclick = () => uploadSummaryFile(p.id);
   }
 };
 
@@ -34090,7 +34102,8 @@ function summaryFormHtml(p){
   const st = summaryState(p);
   const status = '<div class="' + (st.kind === "overdue" ? "warn" : "info") + '" style="margin:10px 0">' +
     summaryPill(p) + ' ' + (closed
-      ? 'Closed by <b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
+      ? (s.closedVia === "UPLOAD" ? 'Uploaded as a file by ' : 'Closed by ') +
+        '<b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
         (s.filedAt ? ' · filed in the subject’s folder and in Procedure_Summary' : ' · <b>not filed yet</b>')
       : 'Due by <b>' + esc(fmtTs(s.dueAt)) + '</b> — ' + PSF.DUE_HOURS + ' hours after the procedure. ' +
         'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>. Anyone on it can fill it in; ' +
@@ -34099,6 +34112,11 @@ function summaryFormHtml(p){
     ((s.editedAfterClose || []).length ? '<div class="hint">Changed after closing: ' +
       esc(s.editedAfterClose.map(e => e.by + " " + fmtTs(e.at) + " — " + e.reason).join("; ")) + '</div>' : '') +
     '</div>';
+  /* Closed by a file: the file IS the summary, and there is no form to show or change. */
+  if(s.closedVia === "UPLOAD"){
+    return head + status + summaryFilesHtml(p) +
+      '<div class="row" style="margin-top:14px"><button class="btn" id="ps-back">Back to the list</button></div>';
+  }
   const body = PSF.SECTIONS.map(sec =>
     '<div class="card" style="margin-top:12px"><div class="card-hd"><h2>' + esc(sec.n + ". " + sec.title) + '</h2></div>' +
     '<div class="card-bd">' + sec.items.map(it => psQuestion(it, a, dis)).join("") + '</div></div>').join("");
@@ -34116,7 +34134,7 @@ function summaryFormHtml(p){
     (closed && !s.filedAt && S.backend ? '<button class="btn" id="ps-refile">File again</button>' : '') +
     '</div>' + whyBox("ps-why") +
     (!closed ? '<div class="hint" id="ps-gaps" style="margin-top:6px">' + summaryGapsText(gaps) + '</div>' : '');
-  return head + status + body + btns;
+  return head + status + body + btns + summaryFilesHtml(p);
 }
 function cfLockedSummary(p){ return false; }   // a locked report does not lock its summary
 function summaryGapsText(gaps){
@@ -34137,8 +34155,9 @@ function summaryListHtml(){
     'Due ' + PSF.DUE_HOURS + ' hours after the procedure.</div>' +
     '<div class="filters">' + selField("ps-filter", "Show", PSUM.filter,
       [["open","Open (" + n("open") + ")"],["mine","Given to me (" + n("mine") + ")"],
-       ["closed","Closed (" + n("closed") + ")"],["all","All (" + n("all") + ")"]]) + '</div>' +
-    (rows.length
+       ["closed","Closed (" + n("closed") + ")"],["all","All (" + n("all") + ")"]]
+        .concat(isExternalUser() ? [] : [["nosum","Implanted, no summary (" + implantedWithoutSummary().length + ")"]])) + '</div>' +
+    (PSUM.filter === "nosum" ? noSummaryListHtml() : rows.length
       ? '<div class="tbl-wrap"><table><thead><tr><th>Subject</th><th>Procedure</th><th>Status</th><th>Due</th>' +
         '<th>Given to</th><th>Filled by</th><th></th></tr></thead><tbody>' + rows.map(p => {
           const s = summaryOf(p);
@@ -34150,6 +34169,21 @@ function summaryListHtml(){
               '" data-ps-open="' + esc(p.id) + '">' + (s.status === "OPEN" && mayWorkSummary(p) ? "Fill in" : "View") + '</button></td></tr>';
         }).join("") + '</tbody></table></div>'
       : '<div class="empty">Nothing here.</div>');
+}
+/* Implanted before summaries existed (or never given one): upload is the only way in, and
+   it opens no task (the owner, 21 Oct 2026). */
+function noSummaryListHtml(){
+  const rows = implantedWithoutSummary()
+    .sort((x, y) => String(cf(y).procDate || y.procedureDate || "").localeCompare(String(cf(x).procDate || x.procedureDate || "")));
+  return '<div class="hint" style="margin:8px 0">Implanted subjects with no procedure summary. Upload it as a PDF, ' +
+    'a Word document or a saved email; nothing is due and no reminder is sent.</div>' +
+    (rows.length
+      ? '<div class="tbl-wrap"><table><thead><tr><th>Subject</th><th>Procedure</th><th></th></tr></thead><tbody>' +
+        rows.map(p => '<tr><td><b>' + esc(p.patientCode) + '</b><div class="hint">' + esc(locName(p.siteId)) + '</div></td>' +
+          '<td>' + esc(fmtDate(cf(p).procDate || p.procedureDate)) + '</td>' +
+          '<td><button class="btn btn-sm" data-ps-upload="' + esc(p.id) + '">Upload summary file</button></td></tr>').join("") +
+        '</tbody></table></div>'
+      : '<div class="empty">Every implanted subject has a summary.</div>');
 }
 
 VIEWS.procsummary = {
@@ -34165,6 +34199,7 @@ VIEWS.procsummary = {
   wire(){
     const f = $("#ps-filter"); if(f) f.onchange = () => { PSUM.filter = f.value; render(); };
     $$("[data-ps-open]").forEach(b => b.onclick = () => openSummary(b.dataset.psOpen));
+    $$("[data-ps-upload]").forEach(b => b.onclick = () => uploadSummaryFile(b.dataset.psUpload));
     const p = PSUM.id && patient(PSUM.id);
     if(!p || !summaryOf(p)) return;
     const back = $("#ps-back"); if(back) back.onclick = async () => { await flushSummary(p); PSUM.id = ""; PSUM.draft = null; PSUM.editing = false; render(); };
@@ -34252,6 +34287,114 @@ async function flushSummary(p){
   if(PSUM.dirty) return saveSummaryDraft(p);
   return true;
 }
+/* THE SUMMARY AS A FILE (21 Oct 2026, the owner): a PDF, a Word document or a saved email, by
+   anybody inside Innoventric. The first file closes an open summary (the uploader is Filled
+   by); a subject implanted before summaries existed gets one, already closed, with no task.
+   The server's rule is summaryUploadable - this mirrors it to decide what to draw. */
+const SUMMARY_UPLOAD_EXT = ["pdf", "doc", "docx", "eml", "msg"];
+function summaryUploadable(p){
+  if(!p || isExternalUser()) return false;
+  return !!summaryOf(p) || (p.status === "TREATED" && studyArmOf(p) !== "CONTROL");
+}
+function summaryUploads(p){ return (summaryOf(p) && summaryOf(p).uploads) || []; }
+/* Implanted, and nothing filed: the list the summary screen offers an upload for. */
+function implantedWithoutSummary(){
+  return (S.db.patients || []).filter(p => !summaryOf(p) && summaryUploadable(p) && inPatientScope(p.siteId));
+}
+function summaryFilesHtml(p){
+  const ups = summaryUploads(p);
+  return '<div class="card" style="margin-top:12px"><div class="card-hd"><h2>Uploaded summary files</h2></div><div class="card-bd">' +
+    (ups.length
+      ? '<div class="tbl-wrap"><table><thead><tr><th>File</th><th>Uploaded by</th><th>When</th><th></th></tr></thead><tbody>' +
+        ups.map(f => '<tr><td><b>' + esc(f.original || f.filename) + '</b>' +
+          (f.central === false ? '<div class="hint">Not copied to Procedure_Summary</div>' : '') + '</td>' +
+          '<td>' + esc(f.byName || f.by) + '</td><td>' + esc(fmtTs(f.at)) + '</td>' +
+          '<td>' + (S.backend ? '<a class="btn btn-sm" target="_blank" rel="noopener" href="/api/patients/' +
+            encodeURIComponent(p.id) + '/files/' + encodeURIComponent(f.id) + '">' +
+            (f.ext === "pdf" ? "Open" : "Download") + '</a>' : '') + '</td></tr>').join("") +
+        '</tbody></table></div>'
+      : '<div class="hint">No file uploaded.</div>') +
+    (summaryUploadable(p) ? '<div class="row" style="margin-top:10px"><button class="btn" data-ps-upload="' + esc(p.id) + '">' +
+      (summaryOf(p) && summaryOf(p).status === "OPEN" ? "Upload the summary as a file instead" : "Upload a summary file") +
+      '</button></div><div class="hint">PDF, Word (.doc, .docx) or a saved email (.eml, .msg), up to 4 MB.' +
+      (summaryOf(p) && summaryOf(p).status === "OPEN" ? ' Uploading closes this summary, with you as Filled by.' : '') + '</div>' : '') +
+    '</div></div>';
+}
+function confirmSummaryFile(file, p, closes){
+  return new Promise(resolve => {
+    let settled = false;
+    const settle = v => { if(!settled){ settled = true; resolve(v); } };
+    modal("Upload the procedure summary",
+      '<p><b>' + esc(file.name) + '</b> · ' + Math.round(file.size / 1024) + ' KB · for <b>' + esc(p.patientCode) + '</b></p>' +
+      (closes ? '<div class="info">This closes the procedure summary for ' + esc(p.patientCode) +
+        ', and you are recorded as <b>Filled by</b>.</div>' : '') +
+      '<div class="warn">It is filed in the subject’s folder and in Procedure_Summary. Check it shows no subject ' +
+        'name, ID number, date of birth or other identifier — only the study code.</div>' +
+      '<label class="check"><input type="checkbox" id="psu-ok"><span>I have checked this file: ' +
+        'it carries no subject identifier.</span></label>',
+      '<div class="row"><button class="btn btn-primary" id="psu-go" disabled>Upload</button>' +
+        '<button class="btn" data-close="1">Cancel</button></div>');
+    MODAL_CLEANUP = () => settle(false);
+    $("#psu-ok").onchange = e => {
+      $("#psu-go").disabled = !e.target.checked;
+      e.target.closest(".check").classList.toggle("on", e.target.checked);
+    };
+    $("#psu-go").onclick = () => { MODAL_CLEANUP = null; closeModal(); settle(true); };
+  });
+}
+function uploadSummaryFile(id){
+  const p = patient(id);
+  if(!summaryUploadable(p)) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = SUMMARY_UPLOAD_EXT.map(e => "." + e).join(",");
+  inp.style.display = "none";
+  document.body.appendChild(inp);
+  inp.onchange = async () => {
+    const file = inp.files && inp.files[0];
+    inp.remove();
+    if(!file) return;
+    const ext = (String(file.name).match(/\.([a-z0-9]+)$/i) || [])[1];
+    if(!ext || !SUMMARY_UPLOAD_EXT.includes(ext.toLowerCase())){
+      return toast("Choose a PDF, a Word document (.doc, .docx) or a saved email (.eml, .msg).", "bad");
+    }
+    if(file.size > ANAT_PDF_MAX) return toast("That file is " + Math.round(file.size / 1024) +
+      " KB. The limit is about " + Math.round(ANAT_PDF_MAX / 1024) + " KB.", "bad");
+    const s = summaryOf(p);
+    const closes = !s || s.status === "OPEN";
+    if(!(await confirmSummaryFile(file, p, closes))) return toast("Nothing was uploaded.", "warn");
+    /* An open summary's unsaved typing goes first, so nothing typed is lost under the close. */
+    if(s && s.status === "OPEN" && PSUM.id === p.id){ clearTimeout(PSUM.timer); await saveSummaryDraft(p); }
+    if(!S.backend){
+      const now = nowISO();
+      const rec = { id:uid("psu"), filename:file.name, original:file.name, ext:ext.toLowerCase(), bytes:file.size,
+        by:myEmail(), byName:S.me.name, at:now, central:true };
+      if(!p.procSummary) p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
+        openedBy:myEmail(), procEndAt:"", dueAt:"", assignees:[], unmatched:[], answers:{}, legacy:true, editedAfterClose:[] };
+      const q = p.procSummary;
+      q.uploads = (q.uploads || []).concat([rec]);
+      if(q.status !== "CLOSED") Object.assign(q, { status:"CLOSED", closedVia:"UPLOAD", closedAt:now, closedBy:myEmail(),
+        filledBy:S.me.name, filedAt:now });
+      logAction("Procedure summary file uploaded for " + p.patientCode, { locationId:p.siteId, comments:file.name });
+      commit(); toast("Uploaded.", "good"); renderNav(); render(); return;
+    }
+    toast("Uploading " + file.name + "…");
+    try{
+      const content = await readFileBase64(file);
+      const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/upload",
+        { filename:file.name, content, checkedClean:true });
+      if(r && r.patient) mergePatient(r.patient);
+      PSUM.draft = null; PSUM.dirty = false;
+      toast((r.closed ? "Uploaded — the summary is closed." : "Uploaded.") +
+        (r.central ? "" : " It could not be copied to Procedure_Summary; it is in the subject’s folder."), r.central ? "good" : "warn");
+      renderNav(); render();
+    }catch(e){
+      toast("Not uploaded: " + (e.message || "no connection") + ". Nothing was recorded; try again.", "bad");
+    }
+  };
+  inp.click();
+}
+
 async function closeSummary(p){
   const s = summaryOf(p);
   const a = PSUM.draft || s.answers || {};
@@ -36345,7 +36488,8 @@ async function loadAdminUserRecords(){
     for(const f of full){
       const u = (S.db.users || []).find(x => String(x.email || x.id).toLowerCase() === String(f.email).toLowerCase());
       if(u) Object.assign(u, { accessType:f.accessType, extraRoles:f.extraRoles || [], geography:f.geography || [],
-                               extraLocationId:f.extraLocationId || null, screenUpdate:f.screenUpdate === true });
+                               extraLocationId:f.extraLocationId || null, screenUpdate:f.screenUpdate === true,
+                               stageUpdate:f.stageUpdate === true, stuckUpdate:f.stuckUpdate === true });
     }
   }catch(e){ /* the form still opens; it simply cannot show what it was not sent */ }
 }
@@ -36472,6 +36616,15 @@ function userForm(u){
     '<div style="margin:0 0 12px"><label class="check' + (u.screenUpdate ? " on" : "") +
       '" style="margin:0"><input type="checkbox" id="u-su"' + (u.screenUpdate ? " checked" : "") +
       '><span><b>Screen Update</b> — email me when a new subject is registered and enters screening</span></label></div>' +
+    /* "Stage Update" and "Stuck Update" (21 Oct 2026, the owner). Both ADD this person: App Admins,
+       Managers and QA always get the stage mail and the stuck list, whatever is ticked here. */
+    '<div style="margin:0 0 12px"><label class="check' + (u.stageUpdate ? " on" : "") +
+      '" style="margin:0"><input type="checkbox" id="u-sgu"' + (u.stageUpdate ? " checked" : "") +
+      '><span><b>Stage Update</b> — email me when a screening stage is completed (CT, 3D model, pliable model, eligibility, scheduling)</span></label></div>' +
+    '<div style="margin:0 0 12px"><label class="check' + (u.stuckUpdate ? " on" : "") +
+      '" style="margin:0"><input type="checkbox" id="u-stu"' + (u.stuckUpdate ? " checked" : "") +
+      '><span><b>Stuck Update</b> — send me the daily email with the subjects stuck in screening, at every site</span></label></div>' +
+    '<div class="hint" style="margin:-6px 0 12px">App Admins, Managers and QA receive both whether or not these are ticked.</div>' +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
       '<div class="field"><label for="u-p">Phone</label><input type="tel" id="u-p" value="' + esc(u.phone||"") + '"></div></div>' +
@@ -36593,7 +36746,9 @@ function userForm(u){
       locationId:$("#u-l").value || null,
       extraLocationId: xr ? ($("#u-xl").value || null) : null,
       title:$("#u-t").value.trim(), phone:$("#u-p").value.trim(),
-      screenUpdate: !!($("#u-su") || {}).checked });
+      screenUpdate: !!($("#u-su") || {}).checked,
+      stageUpdate: !!($("#u-sgu") || {}).checked,
+      stuckUpdate: !!($("#u-stu") || {}).checked });
 
     if(S.backend){
       try{
@@ -36604,7 +36759,9 @@ function userForm(u){
                                 geography:u.geography,
                                 name:u.name, title:u.title, phone:u.phone,
                                 locationId:u.locationId, extraLocationId:u.extraLocationId,
-                                screenUpdate:u.screenUpdate === true }) });
+                                screenUpdate:u.screenUpdate === true,
+                                stageUpdate:u.stageUpdate === true,
+                                stuckUpdate:u.stuckUpdate === true }) });
         if(!r.ok){
           const e = await r.json().catch(() => ({}));
           return showWhy("u-why", (e.error && e.error.message) || "The server refused it.");
