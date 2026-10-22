@@ -12294,15 +12294,34 @@ function dashboardCounts(patients){
    and a study reporting 0 days to eligibility because nothing has been measured is the
    worst thing this screen could say.
 
-   ctx = { patients, logs, today }
-     patients - the population the reader may see, already scoped
-     logs     - audit entries, for the registration-date fallback. Optional.
-     today    - "YYYY-MM-DD" or an ISO stamp. The month the implant chart runs to. */
+   ctx = { patients, logs, today, locations }
+     patients  - the population the reader may see, already scoped
+     logs      - audit entries, for the registration-date fallback. Optional.
+     today     - "YYYY-MM-DD" or an ISO stamp. The month the implant chart runs to.
+     locations - the sites, so the rule below can be applied. Optional; without it the
+                 stored protocol is read as it stands.
+
+   A SUBJECT AT A SITE THAT WAS NOT IN THE STUDY IS A COMPASSIONATE CASE, whatever the
+   record says (22 Oct 2026, the owner: one implant was counted as a study implant while no site
+   had an opening date). siteMeasures() already read it that way; these figures read the
+   stored protocol alone, so a subject switched to Study after registration was counted in.
+   It is a reading, not a rewrite - the record is left alone - and it is named in the notes.
+   A subject whose site is not in `locations` is read by its stored protocol: nothing is
+   known about that site, and guessing would move real study subjects out. */
 function report(ctx){
   var opts     = ctx || {};
-  var patients = opts.patients || [];
   var logs     = opts.logs || [];
   var today    = String(opts.today || "");
+  var locations = opts.locations || [];
+  var reread = 0;
+  var patients = (opts.patients || []).map(function(p){
+    if(!locations.length || !isStudyProtocol(p) || !p.siteId) return p;
+    var l = null;
+    for(var i = 0; i < locations.length; i++) if(locations[i] && locations[i].id === p.siteId){ l = locations[i]; break; }
+    if(!l || !siteNotInStudyYet(l, p, logs, today)) return p;
+    reread++;
+    return Object.assign({}, p, { protocol: "COMPASSIONATE" });
+  });
 
   var counts = dashboardCounts(patients);
   var rate = implantRate(patients, today);
@@ -12372,6 +12391,11 @@ function report(ctx){
             (ci ? ", including " + ci + " already implanted" : "") +
             ". They keep their full record; they are not part of the study." });
   }
+  if(reread) notes.push({
+    lead: reread + " subject" + (reread === 1 ? "" : "s") + " recorded as Study",
+    text: (reread === 1 ? "is" : "are") + " counted as compassionate: the site was not in the " +
+          "study when " + (reread === 1 ? "the subject was" : "they were") + " registered (no " +
+          "opening date, or registered before it). The record still says Study." });
   if(rate.undated) notes.push({ lead: "",
     text: rate.undated + " study implant" + (rate.undated === 1 ? " has" : "s have") +
           " no procedure date, so " + (rate.undated === 1 ? "it is" : "they are") +
@@ -12391,7 +12415,7 @@ function report(ctx){
           "which is the convention. It will move as they resolve." });
 
   return { counts: counts, rate: rate, tte: tte, enr: enr, sf: sf,
-           work: work, study: study, notes: notes };
+           work: work, study: study, notes: notes, rereadCompassionate: reread };
 }
 
 /* ============================ 5. THE SITES =================================
@@ -12451,6 +12475,19 @@ function siteNotInStudyYet(location, patient, logs, today){
   var reg = String(registrationDate(patient, logs) || "").slice(0, 10);
   if(!reg) return false;                         // unknown, so not asserted either way
   return reg < opened;
+}
+
+/* MAY THIS SUBJECT BE PUT ON THE STUDY PROTOCOL? (22 Oct 2026, the owner: one implant was counted
+   as a study implant while no site had an opening date.) The registration form already
+   settled the protocol from the site, but the Screening screen's Protocol select and the
+   server did not ask, so a subject could be switched to Study afterwards at a site that is
+   not in the study. One answer, read by the page (both selects) and the server (the save):
+   the site has opened by today, and the subject was not registered before it opened. */
+function studyAllowedAt(location, patient, logs, today){
+  var opened = String((location || {}).openedAt || "").slice(0, 10);
+  var day = String(today || "").slice(0, 10);
+  if(!opened || !day || opened > day) return false;
+  return !siteNotInStudyYet(location, patient, logs, day);
 }
 
 function siteMeasures(locations, patients, logs, today){
@@ -12656,6 +12693,8 @@ var api = {
   daysApart: daysApart,
   monthsInclusive: monthsInclusive,
   siteMeasures: siteMeasures,
+  siteNotInStudyYet: siteNotInStudyYet,
+  studyAllowedAt: studyAllowedAt,
   timeToEligible: timeToEligible,
   enrolmentProgress: enrolmentProgress,
   screenFailure: screenFailure,
@@ -16758,6 +16797,15 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.2.2", date: "22 October 2026", groups: [
+    { h:"Study figures", items:[
+      "A subject at a site that was <b>not in the study</b> when they were registered - the site has no opening date, or opened later - is now counted as a <b>compassionate case</b> in the study’s figures, even when the record says Study. One implant had been counted as a study implant this way. The figures say how many were counted like this.",
+      "The <b>Protocol</b> on the Screening screen can no longer be switched to <b>Study</b> for such a subject, the same rule the registration form already applied."
+    ] },
+    { h:"Procedure summary", items:[
+      "A subject implanted before summaries existed can now have the summary <b>filled in online</b>, not only uploaded: <b>Fill in online</b> under <b>Procedure Summary → Implanted, no summary</b>, and from <b>Add procedure summary</b> on the report and the summary button in Follow up. It is not a task - nothing is due, no reminder - and anyone at Innoventric can fill it in. Closing it files the PDF the same way."
+    ] }
+  ] },
   { version: "3.2.1", date: "21 October 2026", groups: [
     { h:"Shipping documents", items:[
       "Every invoice and delivery note now carries the <b>QR code</b> and the instruction for the receiver: scan it with a phone camera to open the delivery page with the shipment filled in. It was meant to be there since 3.0.0 and was not being printed."
@@ -17964,6 +18012,12 @@ function siteInStudy(siteId){
   const l = loc(siteId);
   const opened = String((l || {}).openedAt || "").slice(0, 10);
   return !!opened && opened <= nowISO().slice(0, 10);
+}
+/* MAY THIS SUBJECT BE ON THE STUDY PROTOCOL AT THIS SITE? siteInStudy() plus "not registered
+   before the site opened" - studyMeasures.studyAllowedAt, the one the server and the study
+   figures read. Asked by both Protocol selects (22 Oct 2026). */
+function studyAllowedFor(p, siteId){
+  return SM.studyAllowedAt(loc(siteId), p || {}, S.db.logs || [], nowISO());
 }
 const locName  = id => (loc(id) || {}).name || "—";
 const user     = id => S.db.users.find(u => u.id === id) || null;
@@ -24259,9 +24313,15 @@ VIEWS.screening = {
       '<div class="field"><label for="scr-proto">Protocol</label>' +
         '<select id="scr-proto"' + (can("managePatients") ? "" : " disabled") + '>' +
           PROTOCOLS.map(x => '<option value="' + x.k + '"' +
-            (x.k === protocolOf(p) ? " selected" : "") + '>' + esc(x.label) + '</option>').join("") +
+            (x.k === protocolOf(p) ? " selected" : "") +
+            (x.k === "STUDY" && !studyAllowedFor(p, p.siteId) ? " disabled" : "") +
+            '>' + esc(x.label) + '</option>').join("") +
         '</select>' +
-        (isCompassionate(p)
+        (!studyAllowedFor(p, p.siteId)
+          ? '<div class="hint"><b>The site was not in the study</b> when this subject was ' +
+            'registered, so the subject is a compassionate case and is counted out of the ' +
+            'study\'s figures' + (isCompassionate(p) ? '' : ' (the record still says Study)') + '.</div>'
+          : isCompassionate(p)
           ? '<div class="hint">Outside the study\'s eligible and implanted counts.</div>'
           : '<div class="hint">Part of the study. Switchable at any stage.</div>') +
       '</div>' +
@@ -24411,6 +24471,11 @@ VIEWS.screening = {
     const proto = $("#scr-proto");
     if(proto) proto.onchange = () => {
       if(!can("managePatients")) return;
+      if(proto.value === "STUDY" && !studyAllowedFor(p, p.siteId)){
+        proto.value = protocolOf(p);
+        return toast("The site was not in the study when " + p.patientCode + " was registered, " +
+          "so this subject cannot be put on the Study protocol.", "bad");
+      }
       const wasCompassionate = isCompassionate(p);
       const nameOf = k => (PROTOCOLS.find(x => x.k === k) || {}).label || k;
       const from = protocolOf(p);
@@ -26936,7 +27001,7 @@ VIEWS.clinical = {
       '<div class="row" style="margin-bottom:10px">' +
         '<button class="btn" id="pt-pdf">Export procedure report (PDF)</button>' +
         (p.procSummary ? '<button class="btn" id="pt-sum">Procedure summary</button>'
-          : summaryUploadable(p) ? '<button class="btn" id="pt-sum-up">Upload procedure summary</button>' : '') + '</div>' +
+          : summaryUploadable(p) ? '<button class="btn" id="pt-sum-up">Add procedure summary</button>' : '') + '</div>' +
       (p.fileLocked ? '<div class="row"><span class="pill p-green">Permanently locked</span></div>' :
       /* VIEW MODE keeps the way out and loses the three buttons that write. Close is
          deliberately still here: somebody who came to look has to be able to leave by the
@@ -27402,7 +27467,7 @@ VIEWS.clinical = {
     const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
     const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
     const ps = $("#pt-sum");    if(ps) ps.onclick = () => openSummary(p.id);
-    const psu = $("#pt-sum-up"); if(psu) psu.onclick = () => uploadSummaryFile(p.id);
+    const psu = $("#pt-sum-up"); if(psu) psu.onclick = () => chooseSummaryWay(p.id);
   }
 };
 
@@ -33765,7 +33830,8 @@ function scopedPatients(){ return allPatients().filter(p => inPatientScope(p.sit
    inside each of them would walk the whole register three times and could - between
    two of those walks - answer from different data. */
 function studyReport(){
-  return SM.report({ patients: scopedPatients(), logs: S.db.logs || [], today: nowISO() });
+  return SM.report({ patients: scopedPatients(), logs: S.db.logs || [], today: nowISO(),
+                     locations: S.db.locations || [] });
 }
 
 /* The sites, scoped the same way the patients are: visibleLocations() is already what
@@ -34021,7 +34087,8 @@ function mayWorkSummary(p){
   const s = summaryOf(p);
   if(!s) return false;
   if(s.status === "CLOSED") return can("editSubmittedReport");
-  return summaryIsMine(p) || myRoles().some(r => ["ADMIN","MANAGER","CPM"].includes(r));
+  return summaryIsMine(p) || myRoles().some(r => ["ADMIN","MANAGER","CPM"].includes(r)) ||
+    (!!s.legacy && !isExternalUser());
 }
 function summaryState(p){ return PSF.state(summaryOf(p), Date.now()); }
 /* Open summaries this person was given - the badge and the Home card. */
@@ -34114,6 +34181,8 @@ function summaryFormHtml(p){
       ? (s.closedVia === "UPLOAD" ? 'Uploaded as a file by ' : 'Closed by ') +
         '<b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
         (s.filedAt ? ' · filed in the subject’s folder and in Procedure_Summary' : ' · <b>not filed yet</b>')
+      : s.legacy ? 'Filled in online for a subject implanted before summaries existed. Nothing is due and it is ' +
+        'nobody’s task; anyone at Innoventric can fill it in, and whoever closes it is recorded as Filled by.'
       : 'Due by <b>' + esc(fmtTs(s.dueAt)) + '</b> — ' + PSF.DUE_HOURS + ' hours after the procedure. ' +
         'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>. Anyone on it can fill it in; ' +
         'whoever closes it is recorded as Filled by.') +
@@ -34184,13 +34253,15 @@ function summaryListHtml(){
 function noSummaryListHtml(){
   const rows = implantedWithoutSummary()
     .sort((x, y) => String(cf(y).procDate || y.procedureDate || "").localeCompare(String(cf(x).procDate || x.procedureDate || "")));
-  return '<div class="hint" style="margin:8px 0">Implanted subjects with no procedure summary. Upload it as a PDF, ' +
-    'a Word document or a saved email; nothing is due and no reminder is sent.</div>' +
+  return '<div class="hint" style="margin:8px 0">Implanted subjects with no procedure summary. Fill in the form online, ' +
+    'or upload it as a PDF, a Word document or a saved email; nothing is due and no reminder is sent.</div>' +
     (rows.length
       ? '<div class="tbl-wrap"><table><thead><tr><th>Subject</th><th>Procedure</th><th></th></tr></thead><tbody>' +
         rows.map(p => '<tr><td><b>' + esc(p.patientCode) + '</b><div class="hint">' + esc(locName(p.siteId)) + '</div></td>' +
           '<td>' + esc(fmtDate(cf(p).procDate || p.procedureDate)) + '</td>' +
-          '<td><button class="btn btn-sm" data-ps-upload="' + esc(p.id) + '">Upload summary file</button></td></tr>').join("") +
+          '<td><div class="row" style="gap:6px;flex-wrap:wrap">' +
+            '<button class="btn btn-sm btn-primary" data-ps-start="' + esc(p.id) + '">Fill in online</button>' +
+            '<button class="btn btn-sm" data-ps-upload="' + esc(p.id) + '">Upload summary file</button></div></td></tr>').join("") +
         '</tbody></table></div>'
       : '<div class="empty">Every implanted subject has a summary.</div>');
 }
@@ -34209,6 +34280,7 @@ VIEWS.procsummary = {
     const f = $("#ps-filter"); if(f) f.onchange = () => { PSUM.filter = f.value; render(); };
     $$("[data-ps-open]").forEach(b => b.onclick = () => openSummary(b.dataset.psOpen));
     $$("[data-ps-upload]").forEach(b => b.onclick = () => uploadSummaryFile(b.dataset.psUpload));
+    $$("[data-ps-start]").forEach(b => b.onclick = () => startSummaryOnline(b.dataset.psStart, b));
     const p = PSUM.id && patient(PSUM.id);
     if(!p || !summaryOf(p)) return;
     const back = $("#ps-back"); if(back) back.onclick = async () => { await flushSummary(p); PSUM.id = ""; PSUM.draft = null; PSUM.editing = false; render(); };
@@ -34231,6 +34303,47 @@ VIEWS.procsummary = {
     };
   }
 };
+
+/* An implanted subject with no summary - one from before summaries existed (22 Oct 2026,
+   the owner): the form online, beside the upload. Not a task - given to nobody, nothing due. */
+async function startSummaryOnline(id, btn){
+  const p = patient(id);
+  if(!p) return;
+  if(summaryOf(p)) return openSummary(id);
+  if(!summaryUploadable(p)) return;
+  if(!S.backend){
+    const now = nowISO();
+    p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
+      openedBy:myEmail(), procEndAt:"", dueAt:"", assignees:[], unmatched:[], answers:PSF.prefill(p, PD.TRAINING_ITEMS || []),
+      updatedAt:now, updatedBy:"", reminderSentAt:"", closedAt:"", closedBy:"", filledBy:"", filedAt:"",
+      editedAfterClose:[], legacy:true };
+    logAction("Procedure summary started online for " + p.patientCode, { locationId:p.siteId });
+    commit(); renderNav(); return openSummary(id);
+  }
+  if(btn) btn.disabled = true;
+  try{
+    const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/start", {});
+    if(r && r.patient) mergePatient(r.patient);
+    openSummary(id);
+  }catch(e){
+    toast("Could not start the summary: " + (e.message || "no connection") + ".", "bad");
+    if(btn) btn.disabled = false;
+  }
+}
+/* No summary yet: the report's button and the Follow up icon offer both ways in. */
+function chooseSummaryWay(id){
+  const p = patient(id);
+  if(!p) return;
+  if(summaryOf(p)) return openSummary(id);
+  modal("Procedure summary — " + p.patientCode,
+    '<p>' + esc(p.patientCode) + ' has no procedure summary. Fill in form ' + esc(PSF.DOC.number) +
+      ' here in the app, or upload it as a file. Nothing is due either way.</p>',
+    '<div class="row"><button class="btn btn-primary" id="psw-online">Fill in online</button>' +
+      '<button class="btn" id="psw-upload">Upload a file</button>' +
+      '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#psw-online").onclick = () => { closeModal(); startSummaryOnline(id); };
+  $("#psw-upload").onclick = () => { closeModal(); uploadSummaryFile(id); };
+}
 
 function openSummary(id){
   PSUM.id = id; PSUM.draft = null; PSUM.dirty = false; PSUM.editing = false;
@@ -34687,7 +34800,7 @@ VIEWS.followup = {
   wire(){
     wireReportEyes();
     $$("[data-fu-sum]").forEach(b => b.onclick = () => openSummary(b.dataset.fuSum));
-    $$("[data-fu-sum-up]").forEach(b => b.onclick = () => uploadSummaryFile(b.dataset.fuSumUp));
+    $$("[data-fu-sum-up]").forEach(b => b.onclick = () => chooseSummaryWay(b.dataset.fuSumUp));
     $$("[data-fu-open]").forEach(b => b.onclick = () => {
       const p = patient(b.dataset.fuOpen);
       claimCaseFile(p.id);
@@ -34707,7 +34820,7 @@ function fuSummaryBtn(p){
     'title="Open the procedure summary" aria-label="Open the procedure summary for ' + esc(p.patientCode) + '">' +
     icon("case") + '</button>';
   if(summaryUploadable(p)) return '<button class="btn btn-sm btn-eye" data-fu-sum-up="' + p.id + '" ' +
-    'title="No procedure summary yet - upload one" aria-label="Upload the procedure summary for ' + esc(p.patientCode) + '">' +
+    'title="No procedure summary yet - fill it in or upload it" aria-label="Add the procedure summary for ' + esc(p.patientCode) + '">' +
     icon("case") + '</button>';
   return "";
 }
@@ -35800,11 +35913,14 @@ function patientFormRender(p, isNew){
   const paintProtocol = () => {
     const sel = $("#p-proto"), why = $("#p-proto-why"), site = $("#p-site");
     if(!sel || !site) return;
-    const inStudy = siteInStudy(site.value);
+    const inStudy = studyAllowedFor(p, site.value);
     sel.disabled = !inStudy;
     if(!inStudy){
       sel.value = "COMPASSIONATE";
-      if(why) why.innerHTML = '<b>This site is not in the study</b>, so this subject is a ' +
+      if(why) why.innerHTML = siteInStudy(site.value)
+        ? '<b>This subject was registered before the site joined the study</b>, so the ' +
+          'subject is a compassionate case.'
+        : '<b>This site is not in the study</b>, so this subject is a ' +
         'compassionate case. A site joins the study on its opening date — fill that in on ' +
         'the site record and the choice opens up here.';
     }else if(why){
@@ -35866,7 +35982,7 @@ function patientFormRender(p, isNew){
     p.status = $("#p-st").value;
     /* Read from the site, not from the control: a disabled select is easy to re-enable
        from a console, and this is the rule rather than a convenience. */
-    p.protocol = siteInStudy($("#p-site").value) ? $("#p-proto").value : "COMPASSIONATE";
+    p.protocol = studyAllowedFor(p, $("#p-site").value) ? $("#p-proto").value : "COMPASSIONATE";
     /* THE REGISTRATION MOMENT, stamped once and never again. Nothing recorded it before
        20 Aug 2026, which is why the days-to-Eligible average can only be computed for the
        patients that have one - see registrationDate(). Set on the record itself rather
