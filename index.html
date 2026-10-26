@@ -11982,9 +11982,9 @@ function applyStageOverride(p, o){
   return { record: record, reassigned: reassigned };
 }
 
-/* A stage may only be worked on once every earlier stage is finished - unless it has
-   been assigned to somebody, an App Admin has recorded an override, or work has already
-   been done in it.
+/* A stage may only be worked on once every earlier stage is finished - unless an override
+   opened it, an override set it aside as a task still to finish, or work has already been
+   done in it.
 
    MOVED here from pivotal-app.html on 28 Sep 2026, with the daily summary's list of
    open tasks nobody has been assigned to: "open" in that list has to mean what it means
@@ -11992,10 +11992,11 @@ function applyStageOverride(p, o){
    The page binds it back under the same name. This is the one piece of GATING in this
    file; the rest of the task state machine is still the page's.
 
-   Assignment opening a stage is deliberate: giving somebody a task and then refusing to
-   let them start it would make the assignment a lie. It does mean the sequence is now
-   advisory rather than absolute, which is why the one genuinely unsafe jump is still
-   refused outright below. */
+   ASSIGNMENT NO LONGER OPENS A STAGE (26 Oct 2026, the owner: "Assigning someone should not
+   open a stage. Only finishing the stages before it, or an override, opens it."). It used
+   to, so naming somebody on a later stage by hand skipped the sequence with no override
+   and no record of why. Every automatic assignment happens as a stage opens
+   (autoAssignStage in the page, applyStageOverride here), so none of them needs it. */
 function anatUnlocked(p, key){
   var i = -1;
   for(var n = 0; n < ANAT_STAGES.length; n++) if(ANAT_STAGES[n].k === key){ i = n; break; }
@@ -12026,13 +12027,14 @@ function anatUnlocked(p, key){
     var held = (p.anat || {})[key] || {};
     if(!(key === "scheduling" && stageTouched(p, s)) && !(key === "order" && held.requestedBy)) return false;
   }
-  var a = (p.anat || {})[key] || {};
-  if(String(a.assignedTo || "").trim()) return true;
-  /* Once a stage holds work it stays reachable, even if the assignee is later cleared -
-     data already entered must never become unreachable. */
+  /* Once a stage holds work it stays reachable - data already entered must never become
+     unreachable. */
   if(stageTouched(p, s)) return true;
   if(p.anatOverride) return true;
   if(openedByStageOverride(p, i)) return true;
+  /* A stage an override set aside is an open task for the CPM, so it can be worked even
+     while a stage before it is still unfinished. */
+  if(overrideSkippedKeys(p).indexOf(key) >= 0) return true;
   /* A deferred training session holds back nothing after it (26 Oct 2026). */
   var deferred = trainingDeferred(p);
   return ANAT_STAGES.slice(0, i).every(function(x){
@@ -17010,6 +17012,20 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.3.0", date: "26 October 2026", groups: [
+    { h:"Override on a stage", items:[
+      "When a screening stage is not finished, the <b>first locked stage</b> now has a button. A <b>Manager, QA or App Admin</b> opens it at once (<b>Open this stage (override)</b>); a <b>Clinical PM or Employee</b> asks for it (<b>Ask for an override</b>), and a Manager, QA or App Admin approves or refuses it on the stage itself or on QA Approval. Everyone who can decide is told in the app and by email, and whoever asked is told the decision.",
+      "The override asks for a <b>reason</b> and the date by which the skipped stages must be <b>finished</b>. It opens that stage and the ones after it. The skipped stages no longer hold up scheduling, but stay open as tasks for the subject’s Clinical PM, and the daily mail lists them as overdue once that date passes.",
+      "The old “Ask for an override” button at the top of the evaluation is gone. An override already recorded keeps working."
+    ] },
+    { h:"Stage 7 last for a perfect fit", items:[
+      "When the latest finished evaluation before stage 7 (usually stage 6) says <b>Suitable</b>, stages 8, 9 and 10 open without the <b>Training session</b>. Stage 7 moves below the order, is due <b>three days before the procedure</b>, and the procedure report cannot be submitted until it is finished. <b>Borderline</b> keeps stage 7 where it was."
+    ] },
+    { h:"Stage rules", items:[
+      "<b>Stage 8 (Eligibility & Approvals) always comes before scheduling and the product order</b>, whatever override or assignment there is.",
+      "<b>Assigning someone no longer opens a stage.</b> A stage opens when the stages before it are finished, or by an override."
+    ] }
+  ] },
   { version: "3.2.2", date: "22 October 2026", groups: [
     { h:"Study figures", items:[
       "A subject at a site that was <b>not in the study</b> when they were registered - the site has no opening date, or opened later - is now counted as a <b>compassionate case</b> in the study’s figures, even when the record says Study. One implant had been counted as a study implant this way. The figures say how many were counted like this.",
@@ -25405,8 +25421,8 @@ function openDisqualifyDialog(p, opts){
    stays editable, a name already chosen is never replaced, and the person is told exactly
    as for an assignment by hand (announceAssignment: in-app alert and the task mail).
 
-   AT THE MOMENT IT OPENS, NOT UP FRONT: an assignment opens a stage in this app
-   (anatUnlocked), so naming somebody on all three at once would skip the sequence. And
+   AT THE MOMENT IT OPENS, NOT UP FRONT: an assignment used to open a stage (it no longer
+   does since 26 Oct 2026), so naming somebody on all three at once skipped the sequence. And
    only on the opening - a stage already open before this release is left as it was,
    the owner's decision.
 
