@@ -11739,7 +11739,10 @@ function stageTouched(p, s){
                 /* An automatic assignment is no more work than one by hand. Every stage
                    gets one since 6 Oct 2026, and each would otherwise read In progress
                    the moment it opened. */
-                autoAssignedAt:1, autoAssignChanged:1 };
+                autoAssignedAt:1, autoAssignChanged:1,
+                /* Set aside by a stage override (26 Oct 2026): a marker on the task,
+                   not work in it - the stage is still exactly as unfinished as it was. */
+                skippedByOverride:1 };
   return Object.keys(a).some(function(k){
     return !admin[k] && String(a[k] || "").trim() !== "";
   });
@@ -11815,6 +11818,170 @@ function stageByKey(k){
   return null;
 }
 
+/* ---- STAGE 7 LAST FOR A PERFECT FIT (26 Oct 2026, the owner) ---------------------------
+   The training session exists for a borderline anatomy. When the latest completed
+   evaluation before it (stages 1, 2 and 6, usually 6) says Suitable - a perfect fit for one
+   size - stage 7 no longer stands between the subject and scheduling: stages 8, 9 and 10
+   open without it, and it becomes the last task, due three days before the procedure. The
+   procedure report cannot be submitted until it is done (caseService.submit). Borderline
+   keeps it where it was. "The latest one", the owner's answer when asked which evaluation
+   decides: an earlier Borderline that stage 6 resolved to Suitable no longer counts. */
+var TRAINING_KEY = "fluoro";
+var TRAINING_DUE_DAYS = 3;
+function latestSuitability(p){
+  var out = "";
+  for(var i = 0; i < ANAT_STAGES.length; i++){
+    var s = ANAT_STAGES[i];
+    if(s.k === TRAINING_KEY) break;
+    var a = (p.anat || {})[s.k] || {};
+    if(s.kind === "eval" && stageComplete(p, s) && a.suitability) out = a.suitability;
+  }
+  return out;
+}
+function trainingDeferred(p){
+  if(!p || !p.anat) return false;
+  var s = stageByKey(TRAINING_KEY);
+  if(!s || stageComplete(p, s)) return false;
+  /* Not while an evaluation before it is still open: stage 6 may yet say Borderline, and
+     until it has spoken the "latest" verdict is an earlier stage's. One a stage override
+     set aside does not hold this up - it was decided to go on without it. */
+  var skipped = overrideSkippedKeys(p);
+  for(var i = 0; i < ANAT_STAGES.length && ANAT_STAGES[i].k !== TRAINING_KEY; i++){
+    var e = ANAT_STAGES[i];
+    if(e.kind === "eval" && !stageComplete(p, e) && skipped.indexOf(e.k) < 0) return false;
+  }
+  return latestSuitability(p) === "Suitable";
+}
+/* Three days before the procedure, as YYYY-MM-DD; "" when there is no date yet. */
+function trainingDueDate(p){
+  var d = String((p && (p.procedureDate || ((p.anat || {}).scheduling || {}).completionDate)) || "").slice(0, 10);
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(d)) return "";
+  var t = Date.parse(d + "T00:00:00Z");
+  if(isNaN(t)) return "";
+  return new Date(t - TRAINING_DUE_DAYS * 864e5).toISOString().slice(0, 10);
+}
+
+/* ---- AN OVERRIDE ON A STAGE (26 Oct 2026, the owner) -----------------------------------
+   Replaces the one-per-subject override of v3.0.0 for anything new; a recorded
+   anatOverride keeps working (below). Given on the FIRST locked stage only, it opens that
+   stage and everything after it. The unfinished stages before it are "skipped": they stop
+   blocking scheduling and the order, and stay open as tasks - given to the subject's CPM
+   with the finish-by date the override names, so the daily mail chases them once late.
+   A Manager, QA or App Admin gives one at once; a CPM or an Employee asks (a
+   STAGE_OVERRIDE request) and one of those three decides. Stored in p.stageOverrides,
+   server-owned like anatOverride: written by the override route or the approval route
+   alone, through applyStageOverride below, which the page's standalone path also uses. */
+function stageIndex(k){
+  for(var i = 0; i < ANAT_STAGES.length; i++) if(ANAT_STAGES[i].k === k) return i;
+  return -1;
+}
+function stageOverridesOf(p){ return (p && Array.isArray(p.stageOverrides)) ? p.stageOverrides : []; }
+function openedByStageOverride(p, i){
+  return stageOverridesOf(p).some(function(o){ var j = stageIndex(o && o.stage); return j >= 0 && j <= i; });
+}
+/* Every stage an override set aside, finished since or not. */
+function overrideSkippedKeys(p){
+  var out = [];
+  stageOverridesOf(p).forEach(function(o){
+    ((o && o.skipped) || []).forEach(function(k){ if(out.indexOf(k) < 0) out.push(k); });
+  });
+  return out;
+}
+/* The mandatory stages that still stand between the subject and scheduling: unfinished,
+   not set aside by a stage override, and not a deferred training session. The old
+   per-subject anatOverride is answered by the callers, as before. */
+function schedulingBlockers(p){
+  var skipped = overrideSkippedKeys(p), deferred = trainingDeferred(p);
+  return ANAT_STAGES.filter(function(s){
+    if(ANAT_MANDATORY.indexOf(s.k) < 0 || stageComplete(p, s)) return false;
+    if(skipped.indexOf(s.k) >= 0 && s.k !== "approvals") return false;   // stage 8 is never set aside
+    if(deferred && s.k === TRAINING_KEY) return false;
+    return true;
+  });
+}
+/* The one stage an override may be given on now, or null. Not the product order (it
+   waits for scheduling, override or not), and nothing a Not-suitable review is holding. */
+function overridableStage(p){
+  if(!p || !p.anat) return null;
+  if(!(p.screening && p.screening.ct && p.screening.ct.done)) return null;
+  for(var i = 1; i < ANAT_STAGES.length; i++){
+    var s = ANAT_STAGES[i];
+    if(anatUnlocked(p, s.k)) continue;
+    if(s.k === "order") return null;
+    /* Stage 8 is never skipped (the owner, 26 Oct 2026): no override on stage 9 before it. */
+    if(s.k === "scheduling" && !stageComplete(p, stageByKey("approvals"))) return null;
+    var rv = (p.anat || {}).suitabilityReview;
+    if(rv && rv.open && stageIndex(rv.stage) >= 0 && i > stageIndex(rv.stage)) return null;
+    return s;
+  }
+  return null;
+}
+/* What an override on stage `key` would set aside: the unfinished stages before it. */
+function stageOverrideSkips(p, key){
+  var i = stageIndex(key);
+  /* A training session moved to the end is not skipped: it already has its place and due date. */
+  var deferred = trainingDeferred(p);
+  return ANAT_STAGES.slice(0, Math.max(i, 0)).filter(function(s){
+    return !stageComplete(p, s) && !(deferred && s.k === TRAINING_KEY);
+  });
+}
+/* Why an override cannot be given on `key` now, as { code, message }; null when it can. */
+function stageOverrideProblem(p, key){
+  if(!p) return { code:"NOT_FOUND", message:"No such subject." };
+  if(p.fileLocked) return { code:"LOCKED", message:"This subject's file is locked." };
+  if(p.cancelled && p.cancelled.is) return { code:"CANCELLED", message:"This subject has been stopped." };
+  if((key === "scheduling" || key === "order") && !stageComplete(p, stageByKey("approvals"))){
+    return { code:"APPROVALS_FIRST", message:"Stage 8 (Eligibility & Approvals) must be finished before scheduling " +
+      "and the product order. It cannot be skipped." };
+  }
+  var s = overridableStage(p);
+  if(!s || s.k !== key){
+    return { code:"NOT_OVERRIDABLE", message: s
+      ? "Only the first locked stage takes an override - that is now stage " + stageName(s) + "."
+      : "No stage of this subject is waiting on an earlier one any more." };
+  }
+  if(!stageOverrideSkips(p, key).length) return { code:"NOT_OVERRIDABLE", message:"Nothing before this stage is unfinished." };
+  return null;
+}
+/* Write an override onto the subject. `o`: stageKey, reason, dueDate (YYYY-MM-DD), cpm
+   (email), by, byName, at (ISO); optionally approvedBy, approvedByName, approvedAt,
+   requestId. Throws an Error carrying .code when stageOverrideProblem objects. Returns
+   { record, reassigned: [{ k, prev, next }] } - the caller tells the people concerned. */
+function applyStageOverride(p, o){
+  var bad = stageOverrideProblem(p, o.stageKey);
+  if(bad){ var e = new Error(bad.message); e.code = bad.code; throw e; }
+  var s = stageByKey(o.stageKey);
+  var skipped = stageOverrideSkips(p, o.stageKey);
+  var record = {
+    stage: s.k, stageLabel: stageName(s),
+    skipped: skipped.map(function(x){ return x.k; }),
+    skippedLabels: skipped.map(stageName),
+    reason: String(o.reason || ""), dueDate: String(o.dueDate || ""), cpm: String(o.cpm || ""),
+    by: o.by || "", byName: o.byName || o.by || "", at: o.at || "",
+    approvedBy: o.approvedBy || "", approvedByName: o.approvedByName || "",
+    approvedAt: o.approvedAt || "", requestId: o.requestId || ""
+  };
+  var reassigned = [];
+  skipped.forEach(function(x){
+    var a = p.anat[x.k] = p.anat[x.k] || {};
+    var prev = String(a.assignedTo || "").trim();
+    a.assignedTo = record.cpm;
+    a.dueDate = record.dueDate;
+    a.skippedByOverride = { stage: s.k, at: record.at };
+    reassigned.push({ k: x.k, prev: prev, next: record.cpm });
+  });
+  /* The stage it opens gets the CPM too, as any stage does when it opens (autoAssignStage
+     in the page); one already given to somebody keeps them. */
+  var opened = p.anat[s.k] = p.anat[s.k] || {};
+  if(!String(opened.assignedTo || "").trim() && record.cpm){
+    opened.assignedTo = record.cpm;
+    opened.autoAssignedAt = record.at;
+    reassigned.push({ k: s.k, prev: "", next: record.cpm });
+  }
+  p.stageOverrides = stageOverridesOf(p).concat([record]);
+  return { record: record, reassigned: reassigned };
+}
+
 /* A stage may only be worked on once every earlier stage is finished - unless it has
    been assigned to somebody, an App Admin has recorded an override, or work has already
    been done in it.
@@ -11850,13 +12017,27 @@ function anatUnlocked(p, key){
     if(isControl(p)) return false;
     if(!stageComplete(p, stageByKey("scheduling"))) return false;
   }
+  /* STAGE 8 BEFORE SCHEDULING AND THE ORDER, ALWAYS (26 Oct 2026, the owner: "Eligibility must
+     always be done before products are ordered"). Neither an override, old or new, nor an
+     assignment opens stage 9 or 10 while stage 8 is unfinished. Two things already on a
+     record are left reachable: a stage 9 that holds work (entered data must never become
+     unreachable) and an order already sent. */
+  if((key === "scheduling" || key === "order") && !stageComplete(p, stageByKey("approvals"))){
+    var held = (p.anat || {})[key] || {};
+    if(!(key === "scheduling" && stageTouched(p, s)) && !(key === "order" && held.requestedBy)) return false;
+  }
   var a = (p.anat || {})[key] || {};
   if(String(a.assignedTo || "").trim()) return true;
   /* Once a stage holds work it stays reachable, even if the assignee is later cleared -
      data already entered must never become unreachable. */
   if(stageTouched(p, s)) return true;
   if(p.anatOverride) return true;
-  return ANAT_STAGES.slice(0, i).every(function(x){ return stageComplete(p, x); });
+  if(openedByStageOverride(p, i)) return true;
+  /* A deferred training session holds back nothing after it (26 Oct 2026). */
+  var deferred = trainingDeferred(p);
+  return ANAT_STAGES.slice(0, i).every(function(x){
+    return stageComplete(p, x) || (deferred && x.k === TRAINING_KEY);
+  });
 }
 
 var api = {
@@ -11882,6 +12063,18 @@ var api = {
   stageState: stageState,
   stageComplete: stageComplete,
   anatUnlocked: anatUnlocked,
+  TRAINING_KEY: TRAINING_KEY,
+  TRAINING_DUE_DAYS: TRAINING_DUE_DAYS,
+  latestSuitability: latestSuitability,
+  trainingDeferred: trainingDeferred,
+  trainingDueDate: trainingDueDate,
+  stageOverridesOf: stageOverridesOf,
+  overrideSkippedKeys: overrideSkippedKeys,
+  schedulingBlockers: schedulingBlockers,
+  overridableStage: overridableStage,
+  stageOverrideSkips: stageOverrideSkips,
+  stageOverrideProblem: stageOverrideProblem,
+  applyStageOverride: applyStageOverride,
   ANAT_FILE_FOLDER: ANAT_FILE_FOLDER,
   anatFilesOf: anatFilesOf
 };
@@ -14257,6 +14450,23 @@ function anatIncomplete(p){
   return ANAT_STAGES.filter(s => ANAT_MANDATORY.includes(s.k) && !stageComplete(p, s))
                     .map(s => s.n + ". " + s.label);
 }
+/* What still blocks scheduling: anatIncomplete less the stages a stage override set aside
+   and a training session moved to the end (26 Oct 2026). The rules are in anatStages.js;
+   the old per-subject anatOverride is still answered by the callers. */
+const trainingDeferred   = window.AnatStages.trainingDeferred;
+const trainingDueDate    = window.AnatStages.trainingDueDate;
+const overridableStage   = window.AnatStages.overridableStage;
+const stageOverrideSkips = window.AnatStages.stageOverrideSkips;
+function anatBlockers(p){
+  return window.AnatStages.schedulingBlockers(p).map(s => s.n + ". " + s.label);
+}
+function schedulingBlocked(p){
+  /* Stage 8 first, always - even under the old per-subject override (the owner, 26 Oct 2026).
+     An order already sent can still be updated. */
+  const ordered = !!(p.anat && p.anat.order && p.anat.order.requestedBy);
+  if(!ordered && !stageComplete(p, ANAT_STAGES.find(s => s.k === "approvals"))) return true;
+  return anatBlockers(p).length > 0 && !p.anatOverride;
+}
 /* Each evaluation stage may revise the one before it, so the operative recommendation
    is whatever the LAST completed evaluation said - not the first. */
 /* Delegates: the report the SERVER now produces prints this, so the rule lives in the
@@ -14305,7 +14515,7 @@ function recomputeWorkflow(p){
   if(order.requestedBy || anatDone(order.status) || order.status === "In progress")
     return "ORDER_REQUESTED";
   if(stageComplete(p, stageOf("scheduling")) && p.procedureDate) return "SCHEDULED";
-  if(anatIncomplete(p).length === 0) return "ELIGIBLE";
+  if(anatBlockers(p).length === 0) return "ELIGIBLE";
   if(ANAT_STAGES.some(s => p.anat[s.k].status !== "Not started")) return "ANATOMICAL";
   if(SCREENING_STEPS.some(s => p.screening[s.k].done)) return "SCREENING";
   return "CREATED";
@@ -14857,7 +15067,10 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               "checkedOutBy", "checkedOutAt", "offlineHold",
                               /* the procedure summary (20 Oct 2026): written only by its
                                  own routes, so the server's copy is always the newer one */
-                              "procSummary"];
+                              "procSummary",
+                              /* stage overrides (26 Oct 2026): written only by their
+                                 route and the approval route */
+                              "stageOverrides"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -22477,7 +22690,8 @@ function applyLabelChangeLocally(r, note){
    queue on QA Approval, and the one helper every screen asks through. */
 const APPROVAL_KINDS = {
   FIFO_OVERRIDE:      { label:"FIFO override",      approvers:["ADMIN"] },
-  SCREENING_OVERRIDE: { label:"Screening override", approvers:["ADMIN","MANAGER"] }
+  SCREENING_OVERRIDE: { label:"Screening override", approvers:["ADMIN","MANAGER"] },
+  STAGE_OVERRIDE:     { label:"Stage override",     approvers:["ADMIN","MANAGER","QA"] }
 };
 function approvals(){ return (S.db && Array.isArray(S.db.approvals)) ? S.db.approvals : []; }
 function myEmailLc(){ return String((S.me && S.me.email) || "").trim().toLowerCase(); }
@@ -22539,6 +22753,13 @@ async function decideApproval(r, approve, note){
     sp.anatOverride = { by:r.requestedByName || r.requestedBy, at:String(r.requestedAt || "").slice(0, 10), reason:r.reason,
       incomplete:(r.subject || {}).incomplete || [], approvedBy:S.me.name, approvedAt:nowISO(), requestId:r.requestId };
     sp.status = recomputeWorkflow(sp);
+    r.status = "USED";
+  }
+  const so = approve && r.kind === "STAGE_OVERRIDE" ? patient((r.subject || {}).patientId) : null;
+  if(so){
+    applyStageOverrideHere(so, { stageKey:(r.subject || {}).stageKey, reason:r.reason, dueDate:(r.subject || {}).dueDate,
+      by:r.requestedBy, byName:r.requestedByName || r.requestedBy, at:r.requestedAt,
+      approvedBy:myEmailLc(), approvedByName:S.me.name, approvedAt:nowISO(), requestId:r.requestId });
     r.status = "USED";
   }
   logAction("Approval " + (approve ? "GRANTED" : "REFUSED") + " — " + APPROVAL_KINDS[r.kind].label + " (" + r.requestId + ")",
@@ -22614,6 +22835,177 @@ document.addEventListener("click", async e => {
     renderNav(); render(); toast("Request withdrawn.", "good");
   }catch(err){ t.disabled = false; toast(err.message || "The server refused that.", "bad"); }
 });
+
+/* ===================== AN OVERRIDE ON A STAGE (26 Oct 2026, the owner) =====================
+   The button on the first locked screening stage. What it opens and sets aside is
+   anatStages.applyStageOverride; who may press it is the server's
+   (POST /api/patients/:id/stage-override). the owner's answers: a Manager, QA or App Admin gives
+   it at once; a CPM or an Employee asks, and one of those three decides - here on the
+   stage or on QA Approval; the skipped stages stay open as tasks for the subject's CPM with
+   a finish-by date that is required, so the daily mail chases them. */
+const STAGE_OVERRIDE_GIVE = ["ADMIN","MANAGER","QA"];
+const STAGE_OVERRIDE_ASK  = ["CPM","EMPLOYEE"];
+function mayGiveStageOverride(){ return !isExternalUser() && myRoles().some(r => STAGE_OVERRIDE_GIVE.includes(r)); }
+function mayAskStageOverride(){ return !isExternalUser() && myRoles().some(r => STAGE_OVERRIDE_ASK.includes(r)); }
+function stageOverrideRequest(p, k){
+  return approvals().find(r => r.kind === "STAGE_OVERRIDE" && r.subjectKey === p.id + "#" + k && r.status === "PENDING") || null;
+}
+/* Drawn inside the locked card of the one stage that may take an override. */
+function stageOverrideBlock(p, s){
+  const o = overridableStage(p);
+  if(!o || o.k !== s.k || p.fileLocked || (p.cancelled && p.cancelled.is)) return "";
+  const skips = stageOverrideSkips(p, s.k);
+  if(!skips.length) return "";
+  const req = stageOverrideRequest(p, s.k);
+  if(req){
+    const sj = req.subject || {};
+    const mine = String(req.requestedBy || "").toLowerCase() === myEmailLc();
+    return '<div class="info" style="margin-top:8px"><span class="pill p-orange">override requested</span> by ' +
+      esc(req.requestedByName || req.requestedBy) + ', ' + esc(fmtTs(req.requestedAt)) + ' — ' + esc(req.reason) +
+      '<div class="hint">Skips ' + esc((sj.skippedLabels || []).join("; ")) + ' · to be finished by ' + esc(fmtDate(sj.dueDate)) + '</div>' +
+      '<div class="row" style="margin-top:6px">' +
+        (mayDecideApproval(req)
+          ? '<button class="btn btn-sm btn-primary" data-aprok="' + esc(req.requestId) + '">Approve</button>' +
+            '<button class="btn btn-sm btn-danger" data-aprno="' + esc(req.requestId) + '">Refuse</button>'
+          : '<button class="btn btn-sm" data-sovcheck="' + esc(s.k) + '">Check for a decision</button>') +
+        (mine ? '<button class="btn btn-sm" data-aprwd="' + esc(req.requestId) + '">Withdraw</button>' : '') +
+      '</div></div>';
+  }
+  const give = mayGiveStageOverride(), ask = !give && mayAskStageOverride();
+  if(!give && !ask) return "";
+  return '<div class="row" style="margin-top:8px">' +
+    '<button class="btn" data-sovask="' + esc(s.k) + '">' + (give ? "Open this stage (override)" : "Ask for an override") + '</button>' +
+    '<span class="hint">Skips ' + esc(skips.map(stageName).join("; ")) + ', which stay open as tasks for the subject’s Clinical PM.</span></div>';
+}
+/* On the stage header: a stage set aside and not yet finished, and a stage opened by one. */
+function stageOverridePill(p, s, settled){
+  const list = window.AnatStages.stageOverridesOf(p);
+  const by = list.find(o => (o.skipped || []).includes(s.k));
+  if(by && !settled) return '<span class="pill p-orange" title="' + esc("Skipped by an override on stage " + by.stageLabel + ": " + by.reason) +
+    '">Skipped — finish by ' + esc(fmtDate((p.anat[s.k] || {}).dueDate || by.dueDate)) + '</span>';
+  const op = list.find(o => o.stage === s.k);
+  if(op) return '<span class="pill p-grey" title="' + esc(op.reason) + '">Opened by override</span>';
+  return "";
+}
+/* Above the stages: every override given on this subject, who, why, and what it skipped. */
+function stageOverridesNote(p){
+  const list = window.AnatStages.stageOverridesOf(p);
+  if(!list.length) return "";
+  return '<div class="warn">' + list.map(o =>
+    '<div><b>Override on stage ' + esc(o.stageLabel) + '.</b> ' + esc(o.reason) + ' — ' + esc(o.byName || o.by) +
+    ', ' + esc(fmtTs(o.at)) + (o.approvedByName ? '; approved by ' + esc(o.approvedByName) + ', ' + esc(fmtTs(o.approvedAt)) : '') +
+    '. Skipped: ' + esc((o.skippedLabels || []).join("; ")) + ' — given to ' + esc(assigneeLabel(o.cpm)) +
+    ', to finish by ' + esc(fmtDate(o.dueDate)) + '.</div>').join("") + '</div>';
+}
+function askStageOverride(p, s){
+  const give = mayGiveStageOverride();
+  const skips = stageOverrideSkips(p, s.k);
+  const cpm = patientCpm(p, s.k);
+  modal(give ? "Open stage " + stageName(s) + " (override)" : "Ask for an override on stage " + stageName(s),
+    '<p>Stage ' + esc(stageName(s)) + ' and every stage after it will open, although these are not finished:</p>' +
+    '<ul class="hint">' + skips.map(x => '<li>' + esc(stageName(x)) + '</li>').join("") + '</ul>' +
+    '<p>They stop blocking scheduling and the order, and stay open as tasks for ' +
+      (cpm ? '<b>' + esc(assigneeLabel(cpm)) + '</b>, the subject’s Clinical PM' : '<b>the subject’s Clinical PM</b> (none is known yet)') +
+      '. The daily mail lists them as overdue once the date below passes.</p>' +
+    '<div class="field"><label class="req" for="sov-why">Reason for the override</label>' +
+      '<textarea id="sov-why" maxlength="400" placeholder="Why is it clinically acceptable to go on before these are finished?"></textarea></div>' +
+    '<div class="field"><label class="req" for="sov-due">The skipped stage(s) must be finished by</label>' +
+      '<input type="date" id="sov-due" min="' + esc(nowISO().slice(0, 10)) + '"></div>' +
+    '<div class="hint">' + (give
+      ? 'You are a Manager, QA or App Admin, so this takes effect at once. Recorded with your name, the date and the reason.'
+      : 'A Manager, QA or App Admin - somebody other than you - approves it, on this stage or on QA Approval. They are told by email.') +
+    '</div>' + whyBox("sov-err"),
+    '<div class="row"><button class="btn" data-close="1">Cancel</button><span class="spacer"></span>' +
+      '<button class="btn btn-pri" id="sov-go">' + (give ? "Open the stage" : "Send the request") + '</button></div>');
+  $("#sov-go").onclick = async () => {
+    const reason = ($("#sov-why").value || "").trim(), dueDate = $("#sov-due").value || "";
+    if(reason.length < 10){ $("#sov-why").focus(); return showWhy("sov-err", "Say why - at least a sentence. It goes on the record."); }
+    if(!dueDate) return showWhy("sov-err", "Give the date the skipped stage(s) must be finished by.");
+    if(dueDate < nowISO().slice(0, 10)) return showWhy("sov-err", "That date is in the past.");
+    clearWhy("sov-err");
+    const go = $("#sov-go"); go.disabled = true;
+    try{
+      const out = await sendStageOverride(p, s, reason, dueDate, give);
+      closeModal(); renderNav(); renderKeepingPlace();
+      toast(out.applied ? "Stage " + s.n + " is open. The skipped stage(s) are with the Clinical PM, due " + fmtDate(dueDate) + "."
+        : out.existing ? "A request for this stage is already waiting." : "Sent. A Manager, QA or App Admin decides.", "good");
+    }catch(e){ go.disabled = false; showWhy("sov-err", e.message || "The server refused that."); }
+  };
+}
+async function sendStageOverride(p, s, reason, dueDate, give){
+  if(S.backend){
+    const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/stage-override",
+      { stageKey:s.k, reason, dueDate });
+    if(out.patient){
+      mergePatient(out.patient, { authoritative:true });
+      if(out.audit) S.db.logs.unshift(out.audit);
+      const was = p.status; p.status = recomputeWorkflow(p); commit();
+      if(p.status !== was) schedulePatientSave(p);
+    }
+    if(out.request) putApproval(out.request);
+    return out;
+  }
+  /* Standalone: the same rule, written here. */
+  if(give){
+    applyStageOverrideHere(p, { stageKey:s.k, reason, dueDate, by:myEmailLc(), byName:S.me.name, at:nowISO() });
+    return { applied:true };
+  }
+  const skips = stageOverrideSkips(p, s.k);
+  const request = await requestApproval({ kind:"STAGE_OVERRIDE", subjectKey:p.id + "#" + s.k, locationId:p.siteId, reason,
+    subject:{ patientId:p.id, patientCode:p.patientCode, siteId:p.siteId, stageKey:s.k, stageLabel:stageName(s),
+      skipped:skips.map(x => x.k), skippedLabels:skips.map(stageName), dueDate,
+      summary:"Subject " + p.patientCode + " — open stage " + stageName(s) + ", skipping " + skips.map(stageName).join("; ") + "; finish by " + dueDate } });
+  return { requested:true, request };
+}
+/* Standalone mirror of the server's giveStageOverride: the shared rule, then the people told. */
+function applyStageOverrideHere(p, o){
+  const cpm = patientCpm(p, o.stageKey);
+  if(!cpm) throw new Error("No Clinical PM is known for this subject or its site. Set a Responsible CPM for the site first.");
+  const out = window.AnatStages.applyStageOverride(p, Object.assign({ cpm }, o));
+  out.reassigned.forEach(ch => {
+    const st = ANAT_STAGES.find(x => x.k === ch.k);
+    notify("You have stage " + stageName(st) + " for subject " + p.patientCode +
+      (out.record.skipped.includes(ch.k) ? " by " + fmtDate(out.record.dueDate) + " — skipped by an override, still to finish." : " — opened by an override."),
+      [], [ch.next], p.siteId);
+    if(ch.prev && ch.prev !== ch.next) notify("Stage " + stageName(st) + " for subject " + p.patientCode +
+      " is no longer assigned to you (stage override).", [], [ch.prev], p.siteId);
+  });
+  logAction("Stage override for " + p.patientCode + ": stage " + out.record.stageLabel + " opened",
+    { locationId:p.siteId, highPriority:true,
+      stateChanges:"Skipped, still to finish: " + out.record.skippedLabels.join("; ") + " → " + cpm + ", by " + out.record.dueDate,
+      comments:"Reason (" + out.record.byName + "): " + out.record.reason +
+        (out.record.approvedByName ? " | Approved by " + out.record.approvedByName : " | Given directly") });
+  p.status = recomputeWorkflow(p);
+  commit();
+  return out;
+}
+document.addEventListener("click", async e => {
+  const t = e.target.closest && e.target.closest("[data-sovask],[data-sovcheck]");
+  if(!t) return;
+  const p = S.db.patients.find(x => x.id === SCR.patientId); if(!p) return;
+  const s = ANAT_STAGES.find(x => x.k === (t.dataset.sovask || t.dataset.sovcheck)); if(!s) return;
+  if(t.dataset.sovask) return askStageOverride(p, s);
+  t.disabled = true;
+  S.db.approvals = await loadApprovalRequests();
+  const r = approvals().find(x => x.kind === "STAGE_OVERRIDE" && x.subjectKey === p.id + "#" + s.k && x.decision &&
+    String(x.requestedBy || "").toLowerCase() === myEmailLc());
+  if(S.backend && r && r.status !== "REJECTED" && r.status !== "WITHDRAWN"){
+    try{ const fresh = (await api("GET", "/api/patients")).find(x => x.id === p.id); if(fresh) mergePatient(fresh, { authoritative:true }); }
+    catch(err){}
+  }
+  p.status = recomputeWorkflow(p); commit(); renderKeepingPlace();
+  toast(!r ? "No decision yet." : r.status === "REJECTED" ? "Refused: " + ((r.decision || {}).note || "") : "Approved.",
+    r && r.status === "REJECTED" ? "bad" : "good");
+});
+/* STAGE 7 LAST FOR A PERFECT FIT (26 Oct 2026): its due date is three days before the
+   procedure and follows the date. True when it changed something. */
+function syncTrainingDue(p){
+  if(!p || !p.anat || !trainingDeferred(p)) return false;
+  const d = trainingDueDate(p), a = p.anat.fluoro;
+  if(!d || !a || a.dueDate === d) return false;
+  a.dueDate = d;
+  return true;
+}
 
 /* THE APPROVAL QUEUE, on QA Approval. Shown to everybody who opens the screen; acted on by
    QA and App Admin (approveLabelChange, enforced by the server). */
@@ -24293,7 +24685,7 @@ VIEWS.screening = {
     migrateAssignees(p);
 
     const rec = currentRecommendation(p);
-    const missing = anatIncomplete(p);
+    const missing = anatBlockers(p);
     /* Open the first stage that is unlocked and not yet settled - the one place the
        user can do something. Nothing to do anywhere means everything stays collapsed. */
     if(!SCR.open || !p.anat[SCR.open] || !anatUnlocked(p, SCR.open)){
@@ -24395,20 +24787,22 @@ VIEWS.screening = {
     }
 
     const ovReq = openApproval("SCREENING_OVERRIDE", p.id);
-    if(missing.length && can("managePatients")){
+    /* The per-subject override of v3.0.0 is no longer asked for here (26 Oct 2026): the
+       button is on the first locked stage now (stageOverrideBlock). A recorded one, and a
+       request still waiting from before, are shown as they were. */
+    if(missing.length && (can("managePatients") || p.anatOverride || ovReq)){
       h += '<div class="' + (p.anatOverride ? "warn" : "info") + '">' +
         (p.anatOverride
           ? '<b>Override recorded.</b> ' + esc(p.anatOverride.reason) + ' — ' +
             esc(p.anatOverride.by) + ', ' + esc(fmtDate(p.anatOverride.at)) +
             '. Incomplete at the time: ' + esc(p.anatOverride.incomplete.join("; ")) + '.'
           : '<b>' + missing.length + ' mandatory stage(s) still open.</b> A procedure cannot ' +
-            'be scheduled until they are finished, unless an App Admin or a Manager approves an override.' +
-            /* v3.0.0 (the owner, item 17b): asked for, then approved by somebody else. */
+            'be scheduled until they are finished, unless an override is given on the first locked stage.' +
             (ovReq && ovReq.status === "PENDING"
               ? '<div style="margin-top:6px"><span class="pill p-orange">override requested</span> by ' +
                 esc(ovReq.requestedByName || ovReq.requestedBy) + ', ' + esc(fmtTs(ovReq.requestedAt)) + ' — ' + esc(ovReq.reason) +
                 ' <button class="btn btn-sm" id="scr-ov-check">Check for a decision</button></div>'
-              : ' <button class="btn" id="scr-override">Ask for an override</button>')) +
+              : '')) +
         (p.anatOverride && p.anatOverride.approvedBy ? ' Approved by ' + esc(p.anatOverride.approvedBy) + ', ' +
           esc(fmtTs(p.anatOverride.approvedAt)) + '.' : '') +
         '</div>';
@@ -24422,16 +24816,28 @@ VIEWS.screening = {
       let healed = false;
       ANAT_STAGES.forEach(s => { if(reconcileStageStatus(p, s)) healed = true; });
       if(healed) commit();
+      /* A training session moved to the end is due three days before the procedure, and
+         follows the date when it moves. Saved, because the daily mail reads it. */
+      if(!p.fileLocked && syncTrainingDue(p)){ commit(); schedulePatientSave(p); }
     }
     /* The anatomical block, then - separately framed - what happens once the patient
        is eligible. Scheduling and the product order are not part of deciding whether
        the anatomy suits; putting them inside that block made them look like they were. */
-    h += ANAT_STAGES.filter(s => !s.eligible).map(s => anatStageHtml(p, s, ctReady)).join("");
+    h += stageOverridesNote(p);
+    /* A perfect fit moves stage 7 after the order (26 Oct 2026): drawn there, last. */
+    const deferred = trainingDeferred(p);
+    h += ANAT_STAGES.filter(s => !s.eligible && !(deferred && s.k === "fluoro"))
+                    .map(s => anatStageHtml(p, s, ctReady)).join("");
+    if(deferred){
+      h += '<div class="note">Stage 7 (Training session) is <b>last for this subject</b>: the latest evaluation ' +
+           'found a perfect fit (Suitable), so scheduling and the order do not wait for it. It is shown ' +
+           'below the order.</div>';
+    }
     h += '</div></div>';
 
     const eligibleStages = ANAT_STAGES.filter(s => s.eligible);
     const armed = p.anat.approvals && p.anat.approvals.studyArm;
-    const gateOpen = anatIncomplete(p).length === 0 || !!p.anatOverride;
+    const gateOpen = !schedulingBlocked(p);
     h += '<div class="card"><div class="card-hd"><h2>Subject is eligible</h2>' +
       (armed
         ? '<span class="pill ' + (armed === "CONTROL" ? "p-grey" : "p-green") + '">' +
@@ -24444,6 +24850,12 @@ VIEWS.screening = {
         : '<div class="warn">These open once the anatomical evaluation is complete and ' +
           'stage 8 has recorded the eligibility decision and the allocation.</div>') +
       eligibleStages.map(s => anatStageHtml(p, s, ctReady)).join("") +
+      (deferred
+        ? '<div class="info" style="margin-top:10px">Stage 7 moved here because the subject is a perfect fit. ' +
+          'It is due three days before the procedure' + (trainingDueDate(p) ? ' (<b>' + esc(fmtDate(trainingDueDate(p))) + '</b>)' : '') +
+          ', and the procedure report cannot be submitted until it is finished.</div>' +
+          anatStageHtml(p, ANAT_STAGES.find(s => s.k === "fluoro"), ctReady)
+        : '') +
     '</div></div>';
     return h;
   },
@@ -24869,36 +25281,6 @@ VIEWS.screening = {
       toast(r && r.status === "REJECTED" ? "Refused: " + ((r.decision || {}).note || "") : r && r.status !== "PENDING" ? "Approved." : "No decision yet.",
         r && r.status === "REJECTED" ? "bad" : "good");
     };
-    const ov = $("#scr-override");
-    if(ov) ov.onclick = () => {
-      const incomplete = anatIncomplete(p);
-      modal("Ask for an override",
-        '<p>Scheduling normally requires every mandatory stage to be finished. ' +
-        'These are still open:</p><ul class="hint">' +
-        incomplete.map(x => '<li>' + esc(x) + '</li>').join("") + '</ul>' +
-        '<div class="field"><label class="req" for="ov-why">Reason for override</label>' +
-        '<textarea id="ov-why" placeholder="Why is it clinically acceptable to proceed without these?"></textarea>' +
-        '<div class="hint">An App Admin or a Manager - somebody other than you - approves it on ' +
-        'QA Approval. Recorded with your name, the date, the reason and exactly which stages ' +
-        'were incomplete.</div></div>' + whyBox("ov-err"),
-        '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
-        '<span class="spacer"></span>' +
-        '<button class="btn btn-pri" id="ov-go">Send the request</button></div>');
-      $("#ov-go").onclick = async () => {
-          const why = ($("#ov-why").value || "").trim();
-          if(why.length < 10){ $("#ov-why").focus(); return; }
-          const go = $("#ov-go"); go.disabled = true;
-          try{
-            await requestApproval({ kind:"SCREENING_OVERRIDE", subjectKey:p.id, locationId:p.siteId,
-              subject:{ patientId:p.id, patientCode:p.patientCode, siteId:p.siteId, incomplete,
-                summary:"Subject " + p.patientCode + " — open stages: " + incomplete.join("; ") },
-              reason: why });
-            closeModal(); renderKeepingPlace();
-            toast("Sent. An App Admin or a Manager decides on QA Approval.", "good");
-          }catch(e){ go.disabled = false; showWhy("ov-err", e.message || "The request could not be sent."); }
-      };
-    };
-
     const un = $("#scr-uncancel");
     if(un) un.onclick = () => resumePatient(p);
   }
@@ -25064,7 +25446,14 @@ function autoAssignNext(p, done, opts){
   const i = ANAT_STAGES.findIndex(s => s.k === done.k);
   /* The first stage after it still open: a Not required one has nobody to give it to. */
   const next = ANAT_STAGES.slice(i + 1).find(s => !stageComplete(p, s));
-  return autoAssignStage(p, next, opts);
+  const got = autoAssignStage(p, next, opts);
+  /* A training session moved to the end (26 Oct 2026) opens together with the stage
+     after it, so that one gets its owner now too. */
+  if(next && next.k === "fluoro" && trainingDeferred(p)){
+    const j = ANAT_STAGES.findIndex(s => s.k === "fluoro");
+    autoAssignStage(p, ANAT_STAGES.slice(j + 1).find(s => !stageComplete(p, s)), opts);
+  }
+  return got;
 }
 /* Stage 1 opens when the CT is in, so that is when it gets its owner. */
 function autoAssignFirst(p){
@@ -25499,6 +25888,7 @@ function anatStageHtml(p, s, ctReady){
     '<h2><span class="stage-n">' + s.n + '</span>' + esc(s.label) +
       (summary ? ' <span class="acc-sum">' + esc(summary) + '</span>' : "") + '</h2>' +
     (who ? '<span class="pill p-grey">' + esc(who) + '</span>' : "") +
+    stageOverridePill(p, s, settled) +
     (overdue ? '<span class="pill p-red">Overdue</span>' : "") +
     '<span class="badge ' + badgeCls + '">' + esc(badgeTxt) + '</span>' +
     (open ? '<span class="acc-caret">' + (isOpen ? "\u2212" : "+") + '</span>' : "") +
@@ -25507,7 +25897,8 @@ function anatStageHtml(p, s, ctReady){
   if(!open){
     return '<div class="card stage is-locked">' + head +
       '<div class="card-bd"><div class="locked-ov">Locked until stage ' + s.n +
-      ' can be started \u2014 finish the stage before it, or record an override.</div></div></div>';
+      ' can be started \u2014 finish the stage before it, or record an override.</div>' +
+      (ctReady ? stageOverrideBlock(p, s) : '') + '</div></div>';
   }
   if(!isOpen) return '<div class="card stage">' + head + '</div>';
 
@@ -25762,7 +26153,7 @@ function anatStageHtml(p, s, ctReady){
           '<div class="field"><label class="req">Procedure date</label><input type="text" value="' +
             esc(fmtDate(a.completionDate) || "not set") + '" disabled></div>' +
         '</div>' +
-        (can("orderProducts") && !p.fileLocked && !(anatIncomplete(p).length && !p.anatOverride)
+        (can("orderProducts") && !p.fileLocked && !schedulingBlocked(p)
           ? '<div class="row" style="margin:0 0 10px">' +
               '<button class="btn btn-primary" data-orderopen="order">' +
                 (ordered ? "Change date / update order" : "Set date and order products") + '</button>' +
@@ -25793,9 +26184,9 @@ function anatStageHtml(p, s, ctReady){
       inner += '<div class="hint" style="margin-top:10px">Choose an allocation to continue. ' +
         'A study subject is then given a procedure date.</div>';
     }
-    if(anatIncomplete(p).length && !p.anatOverride){
+    if(schedulingBlocked(p)){
       inner += '<div class="warn">Mandatory stages are still open, so scheduling is blocked. ' +
-               'An App Admin can record an override above.</div>';
+               'An override can be given on the first locked stage.</div>';
     }
   }
   else if(s.kind === "order"){
@@ -26326,6 +26717,7 @@ function openOrderDialog(p){
     const sched = p.anat.scheduling;
     sched.completionDate = v.date;
     p.procedureDate = v.date;
+    syncTrainingDue(p);
     /* Whether THIS press is what confirms stage 9 - the stage-done mail goes once, then. */
     let schedJustDone = false;
     if(sched.status !== "Completed" && !stageMissing(p, ANAT_STAGES.find(x => x.k === "scheduling")).length){
@@ -27550,6 +27942,10 @@ function missingForSubmit(p){
   }
   const uo = usedOutstanding(p);
   if(uo) out.push("Stage 4 — " + uo);
+  /* A training session moved after the order for a perfect fit (26 Oct 2026) must be done
+     before the report goes in; caseService.submit refuses it too. Not when cancelling. */
+  const cancelling = c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED";
+  if(!cancelling && trainingDeferred(p)) out.push("Screening stage 7 — the training session is not finished yet");
   return out;
 }
 function outstandingList(p){
