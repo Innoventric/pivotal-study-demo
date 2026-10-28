@@ -17012,6 +17012,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.4.0", date: "28 October 2026", groups: [
+    { h:"Daily summary", items:[
+      "The daily summary email is now sent <b>Sunday to Thursday</b> only. It is <b>not sent on Friday, Saturday or Israeli public holidays</b> (Rosh Hashana, Yom Kippur, Sukkot, Shemini Atzeret, Pesach, Shavuot, Yom Ha'atzmaut).",
+      "After a weekend or a holiday, the summary compares against the last one that went out and says so - for example <b>“No change since Thursday”</b>."
+    ] }
+  ] },
   { version: "3.3.0", date: "26 October 2026", groups: [
     { h:"Override on a stage", items:[
       "When a screening stage is not finished, the <b>first locked stage</b> now has a button. A <b>Manager, QA or App Admin</b> opens it at once (<b>Open this stage (override)</b>); a <b>Clinical PM or Employee</b> asks for it (<b>Ask for an override</b>), and a Manager, QA or App Admin approves or refuses it on the stage itself or on QA Approval. Everyone who can decide is told in the app and by email, and whoever asked is told the decision.",
