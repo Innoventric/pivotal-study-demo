@@ -12984,6 +12984,26 @@ if(typeof window !== "undefined") window.StudyMeasures = api;
     return !alreadyResolved(dev, shipment);
   }
 
+  /* IS THIS UNIT'S CURRENT JOURNEY THIS SHIPMENT? Added 3 Nov 2026.
+
+     A shipment row lists the units it carried and reads their LIVE records, so a unit that
+     arrived and has since been sent again showed the NEW journey's status on the OLD row:
+     a site -> HQ hand-carry of 7 Oct read "In Transit 1d" on 3 Nov because the unit had left
+     HQ for another site the day before - and offered Confirm arrival, at that other site,
+     from the old row. Every finished shipment whose units moved on stayed "on the way" for ever.
+
+     `masterPackId` is the unit's own statement of which dispatch it is on: ship and
+     handCarry stamp it, and the dispatch retry test already reads it this way. A
+     reconstructed row is built FROM the unit's current fields, so its units are on it by
+     construction. Strict on purpose: a unit with no pack id is not on a filed shipment -
+     it is in a reconstructed row of its own, and one unit in motion must be outstanding on
+     exactly one row. */
+  function unitOnShipment(dev, shipment){
+    if(!dev || !shipment) return false;
+    if(shipment.reconstructed) return true;
+    return !!dev.masterPackId && dev.masterPackId === shipment.shipmentId;
+  }
+
   /* The sweep, for callers holding whole collections - the reconciliation script and the
      server's alert. Returns pairs, because every message about one of these has to name
      both the unit and the shipment that is still claiming it. */
@@ -13030,6 +13050,7 @@ if(typeof window !== "undefined") window.StudyMeasures = api;
 
   var api = {
     unitOffShipment: unitOffShipment,
+    unitOnShipment: unitOnShipment,
     offShipmentUnits: offShipmentUnits,
     offShipmentAlert: offShipmentAlert,
     alreadyAlerted: alreadyAlerted
@@ -14004,6 +14025,8 @@ const CAPABILITIES = {
   overrideFifo:    Object.keys(ROLES),
   registerDevice:  ["ADMIN","EMPLOYEE","QA","MANAGER"],  // prepare a batch at an HQ location
   approveRegistration: ["ADMIN","QA","MANAGER","WH_ADMIN"],  // counter-sign a batch into stock; never on your own batch
+  overrideOpsScan: ["ADMIN","MANAGER"],  // register an implant OPS stops (not Done, MRB, hold, unknown), with a reason; roleStore.js
+  overrideOpsRelease: ["ADMIN","MANAGER","QA"],  // release despite an OPS docs problem, or go on when OPS cannot be asked; roleStore.js
   editAnatomical:  ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"],  // edit ONLY the anatomical-evaluation fields
   reopenStage:     ["ADMIN","CPM","MANAGER"],  // withdraw a confirmed stage, with a reason
   orderProducts:   ["ADMIN","CPM","MANAGER"],  // set the procedure date and order its products, one act
@@ -14637,8 +14660,11 @@ function unitCheckCard(o){
    actually built, whereas the Device Master Record is the specification it was built
    to - it is the DHR that gets signed per batch. QA approval used to be a third box
    here; it is now a separate signature by a different person, further down. */
+/* 30 Oct 2026 (the owner): the first box used to read "Batch release is complete", which
+   said the opposite of the truth at this moment - the release is QA's, AFTER this. Its
+   key stays batchRelease, so batches already filed read the same. */
 const REG_CHECKS = [
-  { k:"batchRelease", t:"Batch release is complete" },
+  { k:"batchRelease", t:"All documents are ready for QA inspection" },
   { k:"dhrSigned",    t:"DHR documents are signed" }
 ];
 
@@ -14919,6 +14945,8 @@ async function api(method, path, body, o){
   if(!r.ok){
     const e = new Error((j && j.error && j.error.message) || ("HTTP " + r.status));
     e.code = j && j.error && j.error.code; e.status = r.status;
+    /* The units an OPS stop names (30 Oct 2026), to be drawn as a list. */
+    if(j && j.error && Array.isArray(j.error.units)) e.units = j.error.units;
     throw e;
   }
   return j;
@@ -17012,6 +17040,21 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.5.0", date: "3 November 2026", groups: [
+    { h:"New Device Registration checks OPS", items:[
+      "When an implant is scanned in <b>New Device Registration</b>, the app asks <b>OPS</b> where that unit stands and shows it beside the scanned row. A unit OPS has not finished, or holds in MRB, on hold, rejected, voided or does not know, is stopped; a <b>Manager or App Admin</b> can register it anyway, with a reason.",
+      "When QA <b>releases</b> the batch, OPS is asked again. A stop that appeared after the scan cannot be overridden. If OPS does not answer, a Manager, QA or App Admin can go ahead with a reason.",
+      "OPS is told each step: the unit shows <b>Pending QA Release</b> in OPS after registration, and <b>Released for Clinical use</b> after QA releases it here.",
+      "The first tick in Step 2 now reads <b>All documents are ready for QA inspection</b>, and batches waiting for QA read <b>Pending QA Release</b> (or <b>Pending QA Release – MRB</b>)."
+    ] },
+    { h:"Stage completed email", items:[
+      "The email sent when a screening stage is completed now <b>carries the stage’s images and documents</b>. Images are shown in the email and attached. Every file is still listed with its link in the app, and a file too large to send says so."
+    ] },
+    { h:"In Transit", items:[
+      "A completed shipment now appears only under <b>History — completed shipments</b>, and an open one only under <b>On-going</b>. A shipment is never in both.",
+      "A unit that arrived and was later sent again no longer makes its old shipment read <b>In Transit</b>. On the old shipment it reads <b>arrived</b>; <b>Confirm arrival</b> is offered only on the shipment the unit is on now. Before this, the old row could offer to confirm the unit’s arrival at its <b>new</b> destination."
+    ] }
+  ] },
   { version: "3.4.0", date: "28 October 2026", groups: [
     { h:"Daily summary", items:[
       "The daily summary email is now sent <b>Sunday to Thursday</b> only. It is <b>not sent on Friday, Saturday or Israeli public holidays</b> (Rosh Hashana, Yom Kippur, Sukkot, Shemini Atzeret, Pesach, Shavuot, Yom Ha'atzmaut).",
@@ -22023,9 +22066,64 @@ function restoreRegister(){
   }
   if(!d.production || !d.production.at) d.production = null;
   d.done = null;
+  /* What OPS said when the draft was saved may no longer be true: ask again. */
+  d.units.forEach(u => { delete u.opsView; });
   REG = d;
   return true;
 }
+
+/* ---- The OPS link at the scan (30 Oct 2026, opsLink.js on the server) ----
+   Each scanned implant is looked up in OPS, the production app: is it Done, is it on
+   MRB or hold, are its docs in order, does OPS know it at all. The answer is drawn on
+   its row. A red one stops the production confirmation unless somebody allowed to
+   override gives a reason. This is only the early warning - the server asks OPS again
+   when the batch is made and when QA releases it, and that answer is the one that counts. */
+const REG_OPS = { on:null, busy:false };
+function regOpsViewFrom(v){
+  if(!v) return { state:"red", blocking:["OPS_UNREACHABLE"], overridable:can("overrideOpsRelease"),
+                  findings:[{ code:"OPS_UNREACHABLE", text:"OPS did not answer for this serial" }] };
+  if(!v.linked) return { state:"skip" };
+  if((v.blocking || []).length) return { state:"red", blocking:v.blocking, findings:v.findings || [], overridable:!!v.overridable };
+  if((v.warnings || []).length) return { state:"warn", findings:(v.findings || []).filter(f => (v.warnings || []).includes(f.code)) };
+  return { state:"ok", stageName:v.stageName || "" };
+}
+async function regCheckOps(){
+  if(!S.backend || !REG || REG_OPS.busy || REG_OPS.on === false) return;
+  const todo = REG.units.filter(u => !u.opsView);
+  if(!todo.length) return;
+  REG_OPS.busy = true;
+  todo.forEach(u => { u.opsView = { state:"checking" }; });
+  if(S.view === "register") render();
+  try{
+    const r = await api("GET", "/api/ops/units?" + todo.map(u => "sn=" + encodeURIComponent(u.sn)).join("&"));
+    REG_OPS.on = !!r.on;
+    todo.forEach(u => {
+      if(!r.on){ u.opsView = { state:"off" }; return; }
+      u.opsView = r.reachable ? regOpsViewFrom((r.units || []).find(x => sameSn(x.sn, u.sn)))
+                              : regOpsViewFrom(null);
+    });
+  }catch(e){
+    todo.forEach(u => { u.opsView = regOpsViewFrom(null); u.opsView.findings[0].text = "OPS could not be asked (" + e.message + ")"; });
+  }finally{
+    REG_OPS.busy = false;
+    saveDrafts();
+    if(S.view === "register" && !(REG && REG.done)) render();
+    if(REG && REG.units.some(u => !u.opsView)) regCheckOps();
+  }
+}
+function regOpsChip(u){
+  const v = u.opsView;
+  if(!v || v.state === "off") return "";
+  const lines = f => (f || []).map(x => esc(x.text)).join("<br>");
+  switch(v.state){
+    case "checking": return '<span class="pill p-grey">Checking OPS…</span>';
+    case "ok":       return '<span class="pill p-green" title="' + esc(v.stageName) + '">✓ Ready in OPS</span>';
+    case "skip":     return '<span class="pill p-grey" title="Only finished implants are checked in OPS">Not checked</span>';
+    case "warn":     return '<span class="pill p-orange">OPS: note</span><div class="hint">' + lines(v.findings) + '</div>';
+    default:         return '<span class="pill p-red">OPS stops it</span><div class="hint" style="color:var(--bad-fg)">' + lines(v.findings) + '</div>';
+  }
+}
+function regOpsReds(){ return (REG ? REG.units : []).filter(u => u.opsView && u.opsView.state === "red"); }
 
 /* Parse one scanned label into a new unit and add it to the batch. Refuses a label
    that fails the REF/SN cross-check, a serial already in this batch or already in the
@@ -22047,6 +22145,7 @@ function regAddScan(code){
   saveDrafts();
   toast("Added " + parsed.ref + " · " + parsed.sn, "good");
   render();
+  regCheckOps();
 }
 
 /* Step 3 — the production confirmation, and the only button that does anything.
@@ -22059,8 +22158,23 @@ function regAddScan(code){
    submit - two controls that both read as "confirm", where stopping at the first one
    looked exactly like success and sent nothing anywhere. One button now. */
 function productionStepHtml(units){
-  const ready = !!(REG.locationId && units.length && REG_CHECKS.every(c => REG.checks[c.k]));
+  const reds = regOpsReds();
+  const checking = units.some(u => u.opsView && u.opsView.state === "checking");
+  const mayLift = reds.length > 0 && reds.every(u => u.opsView.overridable);
+  const opsOk = !checking && (!reds.length || (mayLift && String(REG.opsReason || "").trim()));
+  const ready = !!(REG.locationId && units.length && REG_CHECKS.every(c => REG.checks[c.k]) && opsOk);
   const who = approverWordFor(S.me && S.me.role);
+  /* OPS stops, said before the button rather than after it is pressed. */
+  const opsBox = !reds.length ? "" :
+    '<div class="warn" style="margin-bottom:10px"><b>OPS stops ' + reds.length + ' unit(s):</b> ' +
+      reds.map(u => '<span class="mono">' + esc(u.sn) + '</span>').join(", ") + '.<br>' +
+      (mayLift
+        ? 'You may override this with a reason. It is recorded on the batch with your name, and QA sees it.' +
+          '<div class="field" style="margin-top:8px"><label class="req" for="reg-ops-reason">Reason for the override</label>' +
+          '<textarea id="reg-ops-reason" rows="2">' + esc(REG.opsReason || "") + '</textarea></div>'
+        : 'Remove these units from the batch, or ask an App Admin or a Manager to register them — only they ' +
+          'may override OPS here (QA too, when OPS cannot be reached).') +
+    '</div>';
   return '<div class="card"><div class="card-hd"><h2>Step 3 · Production confirmation</h2>' +
     '<span class="pill p-grey">Not signed</span>' +
     '</div><div class="card-bd">' +
@@ -22068,10 +22182,13 @@ function productionStepHtml(units){
     'complete. Your name and the time are recorded automatically — there is nothing ' +
     'to type.</p>' +
     '<p><b>This sends the batch for approval.</b> ' + esc(who.sentence) + '</p>' +
+    opsBox +
     '<button class="btn btn-primary btn-lg" id="reg-confirm-prod"' + (ready ? "" : " disabled") +
       '>Production confirmation · send ' + units.length + ' unit(s) for approval</button>' +
-    (ready ? "" : '<div class="hint" style="margin-top:6px">Scan at least one unit and ' +
-      'complete the batch approvals first.</div>') +
+    (ready ? "" : '<div class="hint" id="reg-prod-hint" style="margin-top:6px">' +
+      (checking ? 'Waiting for OPS to answer about the scanned units…'
+       : reds.length && !opsOk ? (mayLift ? 'Give a reason for the override first.' : 'OPS stops a unit in this batch.')
+       : 'Scan at least one unit and complete the batch approvals first.') + '</div>') +
     whyBox("reg-why") +
   '</div></div>';
 }
@@ -22209,6 +22326,7 @@ VIEWS.register = {
     }
 
     const units = REG.units;
+    const showOps = S.backend && REG_OPS.on !== false && units.some(u => u.opsView && u.opsView.state !== "off");
     const nChecks = REG_CHECKS.length;
     const doneChecks = REG_CHECKS.filter(c => REG.checks[c.k]).length;
     SCANFIELDS["reg-scan"] = { label:"device label", onCode:(code) => regAddScan(code) };
@@ -22224,11 +22342,14 @@ VIEWS.register = {
       '</div>' +
       (units.length ?
         '<div class="tbl-wrap" style="margin-top:12px"><table><thead><tr><th>#</th><th>REF</th><th>Serial</th>' +
-          '<th>Product</th><th>Size</th><th>Mfg</th><th>Expiry</th><th></th></tr></thead><tbody>' +
+          '<th>Product</th><th>Size</th><th>Mfg</th><th>Expiry</th>' +
+          (showOps ? '<th title="What the production app (OPS) says about this unit">OPS</th>' : '') +
+          '<th></th></tr></thead><tbody>' +
         units.map((u,i) => '<tr><td>' + (i+1) + '</td><td class="mono">' + esc(u.ref) + '</td>' +
           '<td class="mono">' + esc(u.sn) + '</td><td>' + esc(u.productType) + '</td>' +
           '<td>' + esc(u.size) + '</td><td>' + esc(fmtDate(u.mfgDate)) + '</td>' +
           '<td>' + esc(fmtDate(u.expiryDate)) + '</td>' +
+          (showOps ? '<td>' + regOpsChip(u) + '</td>' : '') +
           '<td><button class="btn btn-sm btn-danger" data-reg-rm="' + i + '">Remove</button></td></tr>').join("") +
         '</tbody></table></div>' +
         '<div class="hint" style="margin-top:6px">' + units.length + ' unit(s) scanned.</div>'
@@ -22275,6 +22396,18 @@ VIEWS.register = {
     $$("[data-reg-rm]").forEach(b => b.onclick = () => {
       REG.units.splice(+b.dataset.regRm, 1); saveDrafts(); render();
     });
+    /* The override reason enables the button in place, without a re-render that would
+       take the cursor out of the box. */
+    const or = $("#reg-ops-reason");
+    if(or) or.oninput = e => {
+      REG.opsReason = e.target.value; saveDrafts();
+      const cp = $("#reg-confirm-prod");
+      if(cp) cp.disabled = !(REG.locationId && REG.units.length && REG_CHECKS.every(x => REG.checks[x.k])
+                             && String(REG.opsReason || "").trim());
+      const hint = $("#reg-prod-hint");
+      if(hint) hint.hidden = !!(cp && !cp.disabled);
+    };
+    if(REG.units.some(u => !u.opsView)) regCheckOps();
     /* Update the counter pill in place, like the arrival checks, so ticking a box
        does not re-render the page and lose the operator's scroll position. The
        exception is the last box: completing the approvals is what unlocks the
@@ -22321,8 +22454,13 @@ function submitRegister(){
   clearWhy("reg-why");
 
   const locationId = REG.locationId;
-  const units = REG.units.map(u => Object.assign({}, u));
+  /* opsView is this screen's own note of what OPS said; the server asks OPS itself. */
+  const units = REG.units.map(u => { const c = Object.assign({}, u); delete c.opsView; return c; });
   const prod = REG.production;
+  const opsReds = regOpsReds();
+  if(opsReds.length && !(opsReds.every(u => u.opsView.overridable) && String(REG.opsReason || "").trim()))
+    return showWhy("reg-why", "OPS stops " + opsReds.length + " unit(s) — see Step 3.");
+  const opsOverride = opsReds.length ? { reason:String(REG.opsReason).trim() } : undefined;
 
   function finish(res){
     const l2 = loc(locationId) || {};
@@ -22362,7 +22500,7 @@ function submitRegister(){
            the approval on that batch by the server, whatever capabilities they hold,
            so a batch always carries two signatures from two different people. */
         const batch = await api("POST", "/api/device-batches",
-          { locationId, checks:Object.assign({}, REG.checks), units });
+          { locationId, checks:Object.assign({}, REG.checks), units, opsOverride });
 
         const who = approverWordFor(S.me && S.me.role);
         logAction("Prepared batch " + batch.batchId + " for approval at " + (loc(locationId) || {}).name, {
@@ -22389,6 +22527,15 @@ function submitRegister(){
         approvalMailAlert(batch.notified, who.list, batch.batchId);
       }catch(e){
         if(btn) btn.disabled = false;
+        /* OPS answered differently from what the screen showed (it changed, or the
+           screen never heard back): redraw the rows from the server's answer. */
+        if(Array.isArray(e.units)){
+          e.units.forEach(x => {
+            const u = REG.units.find(y => sameSn(y.sn, x.sn));
+            if(u) u.opsView = { state:"red", blocking:x.blocking || [], findings:x.findings || [], overridable:!!x.overridable };
+          });
+          REG.production = null; saveDrafts(); render();
+        }
         showWhy("reg-why", e.message || "The server refused this batch.");
       }
     })();
@@ -30551,7 +30698,9 @@ function shipmentUnits(sh){
    does not. Kept as its own name because the question the row asks is "is this unit still
    outstanding", and reading that off a function called inTransit is how the two drifted
    apart in the first place. */
-function unitOutstanding(d){ return !!d && inTransit(d); }
+/* Since 3 Nov 2026 it also asks WHICH journey: a unit in motion on a LATER shipment is
+   outstanding on that row only, never on the one it finished. See unitOnShipment. */
+function unitOutstanding(d, sh){ return !!d && inTransit(d) && unitOnShipment(d, sh); }
 
 /* STILL ATTACHED TO A SHIPMENT IT DID NOT COMPLETE.
 
@@ -30563,6 +30712,18 @@ function unitOutstanding(d){ return !!d && inTransit(d); }
    The rule and the reasoning are in that file. Bound here so every call site reads as it
    did, the way SM and AnatStages are bound above. */
 const unitOffShipment = window.InventoryChecks.unitOffShipment;
+const unitOnShipment  = window.InventoryChecks.unitOnShipment;
+
+/* ON-GOING OR HISTORY - exactly one, never both (the owner, 3 Nov 2026). A shipment is
+   on-going while it is packed and not handed over, while any unit is still on the way ON
+   IT (a courier delivery not yet checked in counts as on the way), or while a unit that
+   came back is still attached to it and needs an Admin's correction. Otherwise it is
+   complete and lives in History only. */
+function shipmentOngoing(sh, us){
+  return !shipmentDispatched(sh) ||
+    us.some(d => unitOutstanding(d, sh)) ||
+    us.some(d => unitOffShipment(d, sh));
+}
 
 VIEWS.transit = {
   title:"In Transit",
@@ -30629,7 +30790,8 @@ VIEWS.transit = {
 
     const all = shipmentList().map(sh => {
       const us = shipmentUnits(sh);
-      return { sh, us, outstanding: us.filter(unitOutstanding).length,
+      return { sh, us, ongoing: shipmentOngoing(sh, us),
+               outstanding: us.filter(d => unitOutstanding(d, sh)).length,
                /* Units back at the origin and still attached to this shipment. Counted
                   here so the DEFAULT view can keep the row - see the filter below. The
                   "already taken off the note" clause lives inside unitOffShipment now,
@@ -30655,8 +30817,10 @@ VIEWS.transit = {
          was always filtered out - and the correction for it lives on that very card. The
          control was added the day before and could still not be reached from the default
          screen. A view that hides exactly the rows with work attached is not a default. */
-      (TRL.scope === "all" || r.outstanding > 0 || r.offShipment > 0 ||
-       !shipmentDispatched(r.sh)));
+      /* Since 3 Nov 2026 the two views are EXCLUSIVE (shipmentOngoing): "Every shipment"
+         used to repeat the on-going rows, and a finished shipment whose unit had moved on
+         stayed on-going for ever. */
+      (TRL.scope === "done" ? !r.ongoing : r.ongoing));
     rows.sort((a, b) => {
       const av = String(a.sh.sentAt || ""), bv = String(b.sh.sentAt || "");
       return TRL.sort === "newest" ? bv.localeCompare(av) : av.localeCompare(bv);
@@ -30664,7 +30828,7 @@ VIEWS.transit = {
 
     h += '<div class="card"><div class="card-bd"><div class="grid g2" style="margin:0">' +
       selField("tr-scope","Show", TRL.scope,
-        [["open","Still on the way"],["all","Every shipment, including delivered"]]) +
+        [["open","On-going — not completed yet"],["done","History — completed shipments"]]) +
       selField("tr-sort","Order", TRL.sort,
         [["oldest","Longest in transit first"],["newest","Most recent first"]]) +
     '</div><div class="grid g2" style="margin:10px 0 0">' +
@@ -30676,10 +30840,11 @@ VIEWS.transit = {
 
     if(!rows.length){
       h += '<div class="empty">' +
-        (TRL.scope === "all" ? '<b>Nothing has been sent yet.</b>'
-                             : '<b>Nothing is on the way.</b>') +
-        (all.length ? 'Nothing matches these filters. Try “Every shipment”.'
-                    : 'A shipment appears here the moment units leave on Send Devices Out.') +
+        (TRL.scope === "done" ? '<b>No completed shipments.</b>'
+                              : '<b>Nothing is on the way.</b>') +
+        (!all.length ? 'A shipment appears here the moment units leave on Send Devices Out.'
+         : TRL.scope === "done" ? 'Nothing matches these filters.'
+         : 'Completed shipments are under “History”.') +
         '</div>';
       if(SHIPSEL){ const o = all.find(r => r.sh.shipmentId === SHIPSEL); if(o) h += shipmentCard(o.sh); }
       return h;
@@ -30737,7 +30902,11 @@ VIEWS.transit = {
            button that checks it in - all without opening anything. */
         '<td>' + (us.length ? us.map(u => {
           const days = u.shippedAt ? daysInTransit(u) : null;
-          const out  = unitOutstanding(u);
+          const out  = unitOutstanding(u, sh);
+          /* Finished THIS journey and travelling again on a later one: its live status is
+             the other row's, and showing it here is what made a finished shipment read as
+             in transit. */
+          const movedOn = !out && !gone.has(u.id) && inTransit(u) && !unitOnShipment(u, sh);
           const late = out && days != null && days >= 14;
           return '<div class="spread" style="gap:8px;padding:2px 0">' +
             '<span><span class="mono">' + esc(u.sn || u.id || "—") + '</span> ' +
@@ -30747,6 +30916,7 @@ VIEWS.transit = {
             '<span style="flex:none">' +
               (gone.has(u.id)
                 ? '<span class="pill p-grey">never left</span>'
+                : movedOn ? '<span class="pill p-grey">arrived</span>'
                 : unitStatusPill(u)) +
               (days != null && out
                 ? ' <span class="hint' + (late ? ' warn-cell' : '') + '"' +
@@ -31027,7 +31197,7 @@ function shipmentCard(sh){
      Ticking one only detaches it from a shipment it did not complete. */
   const alreadyHome = d => unitOffShipment(d, sh);
   const stillOut = shipmentUnits(sh).filter(d => !d.missing &&
-    (unitOutstanding(d) || alreadyHome(d)) &&
+    (unitOutstanding(d, sh) || alreadyHome(d)) &&
     !(sh.outcome || []).some(o => o.deviceId === d.id && o.shipped === false));
   const homeCount = stillOut.filter(alreadyHome).length;
   if(!sh.reconstructed && shipmentDispatched(sh) && can("amendShipment") && stillOut.length){
@@ -33744,8 +33914,9 @@ function srLeftText(r){
    batch. The server decides which rows each of them may see; this screen only
    decides which BUTTONS to show, and shows none it cannot honour. */
 const BATCH_STATUS = {
-  AWAITING_QA: { label:"Awaiting QA",   cls:"p-orange" },
-  HELD_MRB:    { label:"Held for MRB",  cls:"p-red"    },
+  /* the owner's words, the same as OPS shows (30 Oct 2026). The code is unchanged. */
+  AWAITING_QA: { label:"Pending QA Release", cls:"p-orange" },
+  HELD_MRB:    { label:"Pending QA Release – MRB", cls:"p-red" },
   COMPLETED:   { label:"Completed",     cls:"p-green"  }
 };
 let MRB = null;   // { batchId, decisions:{SN:RELEASED|REJECTED} } while a hold is judged
@@ -34046,6 +34217,43 @@ async function refreshBatches(authoritative){
     if(i >= 0) S.db.batches[i] = authoritative; else S.db.batches.unshift(authoritative);
   }
 }
+/* ---- The OPS link at release (30 Oct 2026, opsLink.js) ----
+   What was overridden at the scan, shown to QA before they sign; and, when the server
+   refuses because OPS stops a unit, the units and reasons - with a reason box when this
+   person may override (a docs problem, or OPS not answering), and a plain "hold it for
+   MRB" when nobody may (a stop that appeared in OPS after the scan). */
+function opsScanOverridesHtml(b){
+  const ov = (b.units || []).filter(u => u.ops && u.ops.override);
+  if(!ov.length) return "";
+  return '<div class="warn" style="margin-top:8px"><b>OPS was overridden at the scan</b> for ' + ov.length +
+    ' unit(s):<br>' + ov.map(u => '<span class="mono">' + esc(u.sn) + '</span> — ' +
+      esc((u.ops.findings || []).filter(f => (u.ops.override.codes || []).includes(f.code)).map(f => f.text).join("; ")) +
+      ' · by ' + esc(u.ops.override.byName || u.ops.override.by) + ': “' + esc(u.ops.override.reason) + '”').join("<br>") +
+    '</div>';
+}
+function showOpsStop(prefix, e){
+  const box = $("#" + prefix + "-ops"); if(!box) return false;
+  if(!Array.isArray(e.units)) { box.innerHTML = ""; return false; }
+  const mine = e.code === "OPS_BLOCKED";
+  box.innerHTML = '<div class="warn" style="margin-top:8px"><b>OPS stops ' + e.units.length + ' unit(s):</b><br>' +
+    e.units.map(x => '<span class="mono">' + esc(x.sn) + '</span> — ' +
+      esc((x.findings || []).map(f => f.text).join("; "))).join("<br>") +
+    (mine
+      ? '<div class="field" style="margin-top:8px"><label class="req" for="' + prefix + '-ops-reason">' +
+          'Reason to override OPS (recorded with your name)</label><textarea id="' + prefix + '-ops-reason" rows="2"></textarea></div>'
+      : e.code === "OPS_BLOCKED_HARD"
+        ? '<p style="margin-top:6px">This changed in OPS after the scan and cannot be overridden. ' +
+          'Hold the batch for MRB and reject the unit, or wait until OPS releases it.</p>'
+        : '<p style="margin-top:6px">Only an App Admin, a Manager or QA may override this.</p>') +
+    '</div>';
+  return mine;
+}
+function opsOverrideFrom(prefix){
+  const r = $("#" + prefix + "-ops-reason");
+  const reason = r ? String(r.value || "").trim() : "";
+  return reason ? { reason } : undefined;
+}
+
 function confirmApprove(batchId){
   const b = findBatch(batchId); if(!b) return;
   const n = (b.units || []).filter(u => u.disposition !== "REJECTED").length;
@@ -34054,13 +34262,16 @@ function confirmApprove(batchId){
       esc((loc(b.locationId) || {}).name || "—") + '</b>, under your name.</p>' +
     '<p class="hint">Produced by ' + esc((b.production || {}).byName || (b.production || {}).by || "—") +
       ' · ' + esc(fmtTs((b.production || {}).at)) + '</p>' +
+    opsScanOverridesHtml(b) +
+    '<div id="bapp-ops"></div>' +
     whyBox("bapp-why"),
     '<div class="row"><button class="btn btn-primary" id="bapp-go">Approve &amp; register</button>' +
     '<button class="btn" data-close="1">Cancel</button></div>');
   $("#bapp-go").onclick = async () => {
     const go = $("#bapp-go"); go.disabled = true;
     try{
-      const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/approve", {});
+      const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/approve",
+        { opsOverride: opsOverrideFrom("bapp") });
       logAction("QA approved batch " + batchId + " — " + out.result.created + " device(s) into stock", {
         locationId: b.locationId, highPriority:true,
         stateChanges: out.result.created + " unit(s) added as In WH · batch " + batchId,
@@ -34077,7 +34288,11 @@ function confirmApprove(batchId){
       await refreshBatches(out.batch);
       closeModal(); renderNav(); render();
       toast(out.result.created + " device(s) registered.", "good");
-    }catch(e){ go.disabled = false; showWhy("bapp-why", e.message || "The server refused the approval."); }
+    }catch(e){
+      go.disabled = false;
+      if(showOpsStop("bapp", e)){ go.textContent = "Override OPS & register"; clearWhy("bapp-why"); return; }
+      showWhy("bapp-why", e.message || "The server refused the approval.");
+    }
   };
 }
 function askHold(batchId){
@@ -34132,6 +34347,8 @@ function confirmDispose(batchId){
       esc(rej.map(u => u.sn).join(", ")) + '</div>' : '') +
     '<div class="field" style="margin-top:8px"><label for="mrb-note">MRB note (optional)</label>' +
       '<textarea id="mrb-note" rows="2" placeholder="Board reference, decision summary"></textarea></div>' +
+    opsScanOverridesHtml({ units: rel }) +
+    '<div id="mrb-ops"></div>' +
     whyBox("mrb-why"),
     '<div class="row"><button class="btn btn-primary" id="mrb-go">Confirm disposition</button>' +
     '<button class="btn" data-close="1">Cancel</button></div>');
@@ -34139,7 +34356,7 @@ function confirmDispose(batchId){
     const go = $("#mrb-go"); go.disabled = true;
     try{
       const out = await api("POST", "/api/device-batches/" + encodeURIComponent(batchId) + "/dispose",
-        { decisions, note: ($("#mrb-note").value || "").trim() });
+        { decisions, note: ($("#mrb-note").value || "").trim(), opsOverride: opsOverrideFrom("mrb") });
       logAction("MRB disposition on batch " + batchId + " — " + out.released +
                 " released, " + out.rejected + " rejected", {
         locationId: b.locationId, highPriority:true,
@@ -34158,7 +34375,11 @@ function confirmDispose(batchId){
       await refreshBatches(out.batch);
       closeModal(); renderNav(); render();
       toast(out.released + " released, " + out.rejected + " rejected.", out.rejected ? "bad" : "good");
-    }catch(e){ go.disabled = false; showWhy("mrb-why", e.message || "The server refused the disposition."); }
+    }catch(e){
+      go.disabled = false;
+      if(showOpsStop("mrb", e)){ go.textContent = "Override OPS & confirm"; clearWhy("mrb-why"); return; }
+      showWhy("mrb-why", e.message || "The server refused the disposition.");
+    }
   };
 }
 
