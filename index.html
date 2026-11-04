@@ -393,6 +393,10 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
    the caret rotates when open. The expansion is one full-width cell holding a plain
    nested table, so the sticky/z-index rules of the outer matrix must be neutralised
    on it or the first serial column would float over the rest. */
+/* A completed batch on QA Approval opens to the units released under it (4 Nov 2026). */
+tr[data-bopen]{cursor:pointer; user-select:none;}
+tr[data-bopen]:hover td{background:#fafbfc;}
+tr.bopen-sub > td{background:#fafbfc; padding:8px 12px 12px;}
 .matrix td[data-stk]{cursor:pointer; user-select:none;}
 .matrix td[data-stk]:hover{background:#fafbfc;}
 .stk-caret{display:inline-block; transition:transform .15s; color:var(--brand,#9E005D); font-size:11px;}
@@ -17040,6 +17044,17 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.6.0", date: "4 November 2026", groups: [
+    { h:"Back from rework is a batch release", items:[
+      "Units brought back from rework together go to QA as <b>one release</b>. Every label is checked before any is sent; if one does not match, nothing is sent and the unit is named.",
+      "On <b>QA Approval</b>, QA enters the <b>sterilization date</b> and releases the whole group with one signature. That files batch <b>BATCH-DDMMYY-NN-R</b>, listed with the production batches under <b>Completed</b>.",
+      "<b>Send back</b> returns the whole release to rework, with one reason."
+    ] },
+    { h:"QA Approval", items:[
+      "Click a batch under <b>Completed</b> to see every unit released under it, with its serial, product, size, expiry and whether it was released or rejected. A rework batch also shows each unit's old serial and who brought it back.",
+      "The Completed list has a <b>Sterilized</b> column and marks rework batches."
+    ] }
+  ] },
   { version: "3.5.0", date: "3 November 2026", groups: [
     { h:"New Device Registration checks OPS", items:[
       "When an implant is scanned in <b>New Device Registration</b>, the app asks <b>OPS</b> where that unit stands and shows it beside the scanned row. A unit OPS has not finished, or holds in MRB, on hold, rejected, voided or does not know, is stopped; a <b>Manager or App Admin</b> can register it anyway, with a reason.",
@@ -32357,22 +32372,23 @@ async function submitReworkReturn(go){
   const bad = units.find(u => rwbProblem(u));
   if(bad) return showWhy("rwb-why-box", bad.sn + ": " + rwbProblem(bad).message);
   clearWhy("rwb-why-box"); go.disabled = true;
-  const done = [], failed = [];
   if(!Array.isArray(S.db.reworkReleases)) S.db.reworkReleases = [];
-  for(const u of units){
-    const sc = RWB.scans[u.id];
-    try{
-      if(S.backend){
-        const out = await api("POST", "/api/devices/" + encodeURIComponent(u.id) + "/rework-return",
-          { version, hqId:RWB.hqId, expiration, labelReplaced:true, labelCode:sc.code, labelManual:sc.manual });
-        if(out.release && !S.db.reworkReleases.some(r => r.releaseId === out.release.releaseId)) S.db.reworkReleases.unshift(out.release);
-        if(out.audit) S.db.logs.unshift(out.audit);
-        done.push(Object.assign({ unit:u }, out));
-      }else{
-        /* Standalone: mirror deviceService.requestReworkReturn. */
-        const now = nowISO();
-        const r = { releaseId:"RWK-" + now.replace(/[^0-9]/g, "").slice(0, 14) + "-" + Math.random().toString(16).slice(2, 8).toUpperCase(),
-          deviceId:u.id, sn:u.sn, newSn:window.DeviceQr.withRework(u.sn), productType:u.productType || "", size:u.size || "",
+  /* ONE release for every unit on the screen (4 Nov 2026, the owner): QA signs them once, as one
+     batch. The server checks every unit before it files any, so it is all or nothing. */
+  try{
+    if(S.backend){
+      const out = await api("POST", "/api/rework-returns", { version, hqId:RWB.hqId, expiration, labelReplaced:true,
+        units: units.map(u => ({ deviceId:u.id, labelCode:RWB.scans[u.id].code, labelManual:RWB.scans[u.id].manual })) });
+      for(const r of out.releases || []) if(!S.db.reworkReleases.some(x => x.releaseId === r.releaseId)) S.db.reworkReleases.unshift(r);
+      for(const a of (out.audits || []).slice().reverse()) S.db.logs.unshift(a);
+    }else{
+      /* Standalone: mirror deviceService.requestReworkReturnGroup. */
+      const now = nowISO(), stamp = p => p + "-" + now.replace(/[^0-9]/g, "").slice(0, 14) + "-" + Math.random().toString(16).slice(2, 8).toUpperCase();
+      const groupId = stamp("RWG");
+      for(const u of units){
+        const sc = RWB.scans[u.id];
+        const r = { releaseId:stamp("RWK"), groupId,
+          deviceId:u.id, sn:u.sn, newSn:window.DeviceQr.withRework(u.sn), productType:u.productType || "", size:u.size || "", ref:u.ref || "",
           hqId:RWB.hqId, version, expiration, oldExpiration:u.expiration || "", oldVersion:u.version || "",
           label:{ sn:sc.sn, expiry:sc.expiry, manual:sc.manual, at:now },
           requestedBy:(S.me && S.me.email) || "", requestedByName:(S.me && S.me.name) || "", requestedAt:now, status:"AWAITING_QA" };
@@ -32380,16 +32396,19 @@ async function submitReworkReturn(go){
         logAction("Back from REWORK, awaiting QA: " + r.sn + " → " + r.newSn + " (" + r.releaseId + ")", {
           locationId:RWB.hqId, highPriority:true, stateChanges:"In rework → awaiting QA release",
           comments:"Label replaced: yes. New label " + (sc.manual ? "HAND-ENTERED" : "scanned") + ": " + sc.sn + "." });
-        notify(r.sn + " is back from rework as " + r.newSn + " and waits for QA release (QA Approval).", ["QA"], [], RWB.hqId);
-        done.push({ unit:u, release:r });
       }
-    }catch(e){ failed.push({ unit:u, message:e.message || "refused" }); }
+      notify((units.length === 1 ? units[0].sn + " is back from rework and waits" : units.length + " units are back from rework and wait") +
+        " for QA release (QA Approval).", ["QA"], [], RWB.hqId);
+    }
+  }catch(e){
+    go.disabled = false;
+    return showWhy("rwb-why-box", "Nothing was sent to QA: " + (e.message || "refused"));
   }
   commit();
-  if(!failed.length){ RWB = null; S.view = "stock"; }
+  RWB = null; S.view = "stock";
   renderNav(); render();
-  if(failed.length) toast(done.length + " sent to QA. Not done: " + failed.map(f => f.unit.sn + " — " + f.message).join("; "), "bad");
-  else toast(done.length + (done.length === 1 ? " unit" : " units") + " sent to QA. It stays in rework until QA releases it.", "good");
+  toast(units.length + (units.length === 1 ? " unit" : " units") + " sent to QA as one release. " +
+    (units.length === 1 ? "It stays" : "They stay") + " in rework until QA releases " + (units.length === 1 ? "it." : "them."), "good");
 }
 document.addEventListener("click", e => {
   const t = e.target && e.target.closest && e.target.closest("[data-rework],[data-unrework]");
@@ -34021,15 +34040,22 @@ VIEWS.batches = {
       (done.length
         ? '<div class="card"><div class="card-hd"><h2>Completed</h2>' +
             '<span class="pill p-grey">' + done.length + '</span></div><div class="card-bd">' +
+          '<p class="hint" style="margin-top:0">Click a batch to see the units released under it.</p>' +
           '<div class="tbl-wrap"><table><thead><tr><th>Batch</th><th>Location</th><th>Units</th>' +
-            '<th>Released</th><th>Rejected</th><th>QA</th></tr></thead><tbody>' +
+            '<th>Released</th><th>Rejected</th><th>Sterilized</th><th>QA</th></tr></thead><tbody>' +
           done.map(b => {
             const rel = (b.units || []).filter(u => u.disposition === "RELEASED").length;
             const rej = (b.units || []).filter(u => u.disposition === "REJECTED").length;
-            return '<tr><td class="mono" title="' + esc(b.batchId) + '">' + esc(batchLabel(b.batchId)) + '</td>' +
+            const isOpen = BATCH_OPEN.has(b.batchId);
+            return '<tr data-bopen="' + esc(b.batchId) + '" tabindex="0" aria-expanded="' + isOpen + '">' +
+              '<td class="mono" title="' + esc(b.batchId) + '">' + (isOpen ? "▾ " : "▸ ") + esc(batchLabel(b.batchId)) +
+                (b.kind === "REWORK" ? ' <span class="pill p-orange">Rework</span>' : '') + '</td>' +
               '<td>' + esc((loc(b.locationId) || {}).name || "—") + '</td>' +
               '<td>' + ((b.units || []).length) + '</td><td>' + rel + '</td><td>' + rej + '</td>' +
-              '<td>' + esc((b.qa || {}).byName || (b.qa || {}).by || "—") + '</td></tr>';
+              '<td>' + (b.sterilizedAt ? esc(fmtDate(b.sterilizedAt)) : '<span class="hint">—</span>') + '</td>' +
+              '<td>' + esc((b.qa || {}).byName || (b.qa || {}).by || "—") +
+                ((b.qa || {}).at ? '<br><span class="hint">' + esc(fmtTs(b.qa.at)) + '</span>' : '') + '</td></tr>' +
+              (isOpen ? '<tr class="bopen-sub"><td colspan="7">' + releasedUnitsTable(b) + '</td></tr>' : '');
           }).join("") + '</tbody></table></div></div></div>'
         : "");
   },
@@ -34048,14 +34074,53 @@ VIEWS.batches = {
       render();
     });
     $$("[data-bdispose]").forEach(btn => btn.onclick = () => confirmDispose(btn.dataset.bdispose));
+    $$("[data-bopen]").forEach(tr => {
+      const flip = () => {
+        const id = tr.dataset.bopen;
+        if(BATCH_OPEN.has(id)) BATCH_OPEN.delete(id); else BATCH_OPEN.add(id);
+        const y = window.scrollY; render(); window.scrollTo(0, y);
+      };
+      tr.onclick = flip;
+      tr.onkeydown = e => { if(e.key === "Enter" || e.key === " "){ e.preventDefault(); flip(); } };
+    });
   }
 };
+/* A completed batch, opened (4 Nov 2026, the owner): every unit released under it, and the
+   rejected ones beside them, so QA can read off what one signature put into stock. */
+const BATCH_OPEN = new Set();
+function releasedUnitsTable(b){
+  const rw = b.kind === "REWORK";
+  const units = b.units || [];
+  if(!units.length) return '<div class="hint">No units recorded on this batch.</div>';
+  return '<div class="hint" style="margin:2px 0 6px">' +
+      (rw ? 'Back from rework · brought back by ' : 'Produced by ') +
+      esc((b.production || {}).byName || (b.production || {}).by || "—") +
+      (b.sterilizedAt ? ' · sterilized ' + esc(fmtDate(b.sterilizedAt)) : '') +
+      ' · released by ' + esc((b.qa || {}).byName || (b.qa || {}).by || "—") +
+      ((b.qa || {}).at ? ' on ' + esc(fmtTs(b.qa.at)) : '') + '</div>' +
+    '<div class="tbl-wrap"><table><thead><tr><th>#</th><th>REF</th><th>Serial</th>' + (rw ? '<th>Was</th>' : '') +
+      '<th>Product</th><th>Size</th><th>Expiry</th>' + (rw ? '<th>Version</th>' : '') + '<th>Disposition</th></tr></thead><tbody>' +
+    units.map((u, i) => '<tr><td>' + (i + 1) + '</td><td class="mono">' + esc(u.ref || "—") + '</td>' +
+      '<td class="mono">' + esc(u.sn) + '</td>' + (rw ? '<td class="mono">' + esc(u.oldSn || "—") + '</td>' : '') +
+      '<td>' + esc(u.productType === "UNICA" ? "Unica" : u.productType ? "DS" : "—") + '</td>' +
+      '<td>' + esc(u.size || "—") + '</td><td>' + esc(fmtDate(u.expiryDate || u.expiration)) + '</td>' +
+      (rw ? '<td>' + esc(u.version || "—") + '</td>' : '') +
+      '<td>' + (u.disposition === "RELEASED" ? '<span class="pill p-green">Released</span>'
+              : u.disposition === "REJECTED" ? '<span class="pill p-red">Rejected</span>'
+              : '<span class="pill p-grey">—</span>') + '</td></tr>').join("") +
+    '</tbody></table></div>';
+}
 
 /* UNITS BACK FROM REWORK, WAITING FOR QA (4 Oct 2026, the owner). Shown to everybody who opens
    this screen; acted on only by QA, and never by the admin who brought the unit back - the
    server enforces both (approveReworkReturn). QA may scan the label again; it is optional,
-   and a re-scan that does not match is refused here and by the server. */
+   and a re-scan that does not match is refused here and by the server.
+   A BATCH RELEASE (4 Nov 2026, the owner): the units brought back together are one release
+   (rows sharing a groupId; an older row is a group of its own). QA signs the release once,
+   enters the date the units were sterilized, and that files BATCH-DDMMYY-NN-R, listed with
+   the production batches under Completed. */
 const RWQ = {};   // releaseId -> { code, manual, sn, expiry } : QA's optional re-scan
+const rwGroupOf = r => r.groupId || r.releaseId;
 SCANFIELDS["rwq-scan"] = { label:"label (optional re-check)", onCode:(code, manual) => {
   let lab;
   try{ lab = window.DeviceQr.readLabel(code); }
@@ -34069,104 +34134,167 @@ SCANFIELDS["rwq-scan"] = { label:"label (optional re-check)", onCode:(code, manu
   toast(lab.sn + " ✓ re-checked", "good");
   render();
 }};
+/* The open releases, each { key, rows }, oldest request first. */
+function reworkGroups(){
+  const m = new Map();
+  for(const r of reworkReleases().filter(x => x.status === "AWAITING_QA")){
+    const k = rwGroupOf(r);
+    if(!m.has(k)) m.set(k, []);
+    m.get(k).push(r);
+  }
+  return [...m.entries()].map(([key, rows]) => ({ key, rows }))
+    .sort((a, b) => String(a.rows[0].requestedAt || "").localeCompare(String(b.rows[0].requestedAt || "")));
+}
 function reworkQaSection(){
-  const open = reworkReleases().filter(r => r.status === "AWAITING_QA");
-  if(!open.length) return "";
+  const groups = reworkGroups();
+  if(!groups.length) return "";
   const me = String((S.me && S.me.email) || "").toLowerCase();
   const qa = can("releaseRework");
+  const units = groups.reduce((n, g) => n + g.rows.length, 0);
   const row = r => {
-    const mine = String(r.requestedBy || "").toLowerCase() === me;
     const re = RWQ[r.releaseId];
     const lab = r.label || {};
     return '<tr><td class="mono">' + esc(r.sn) + ' → <b>' + esc(r.newSn || window.DeviceQr.withRework(r.sn)) + '</b></td>' +
       '<td>' + esc((r.productType === "UNICA" ? "Unica " : r.productType ? "DS " : "") + (r.size || "")) + '</td>' +
-      '<td>' + esc(locName(r.hqId)) + '</td>' +
       '<td>' + (r.version ? esc((r.oldVersion || "—") + " → " + r.version) : '<span class="hint">unchanged</span>') + '</td>' +
       '<td>' + (r.expiration ? esc(fmtDate(r.oldExpiration) + " → " + fmtDate(r.expiration)) : '<span class="hint">unchanged</span>') + '</td>' +
       '<td class="mono">' + esc(lab.sn || "—") + (lab.expiry ? ' <span class="hint">exp ' + esc(fmtDate(lab.expiry)) + '</span>' : '') +
         (lab.manual ? ' <span class="pill p-orange">hand-entered</span>' : '') +
-        (re ? '<br><span class="pill p-green">✓ re-checked by you</span>' : '') + '</td>' +
-      '<td>' + esc(r.requestedByName || r.requestedBy) + '<br><span class="hint">' + esc(fmtTs(r.requestedAt)) + '</span></td>' +
-      '<td>' + (qa && !mine
-        ? '<div class="row"><button class="btn btn-sm btn-primary" data-rwapprove="' + esc(r.releaseId) + '">Approve — into stock</button>' +
-          '<button class="btn btn-sm btn-danger" data-rwsendback="' + esc(r.releaseId) + '">Send back</button></div>'
-        : qa && mine ? '<span class="hint">You brought it back — another QA person must approve.</span>'
-        : '<span class="hint">Waiting for QA</span>') + '</td></tr>';
+        (re ? '<br><span class="pill p-green">✓ re-checked by you</span>' : '') + '</td></tr>';
+  };
+  const group = g => {
+    const f = g.rows[0];
+    const mine = g.rows.some(r => String(r.requestedBy || "").toLowerCase() === me);
+    return '<div class="card" style="margin:10px 0 0"><div class="card-hd"><h2>' +
+        (g.rows.length === 1 ? "1 unit" : g.rows.length + " units") + ' into ' + esc(locName(f.hqId)) + '</h2>' +
+        '<span class="hint">Brought back by ' + esc(f.requestedByName || f.requestedBy) + ' · ' + esc(fmtTs(f.requestedAt)) + '</span></div>' +
+      '<div class="card-bd"><div class="tbl-wrap"><table><thead><tr><th>Serial</th><th>Product</th><th>Version</th><th>Expiry</th>' +
+        '<th>New label scanned</th></tr></thead><tbody>' + g.rows.map(row).join("") + '</tbody></table></div></div>' +
+      '<div class="card-ft">' + (qa && !mine
+        ? '<div class="row"><button class="btn btn-primary" data-rwapprove="' + esc(g.key) + '">Batch release — ' +
+            (g.rows.length === 1 ? "1 unit" : g.rows.length + " units") + ' into stock</button>' +
+          '<button class="btn btn-danger" data-rwsendback="' + esc(g.key) + '">Send back</button></div>'
+        : qa && mine ? '<div class="note">You brought it back — another QA person must approve.</div>'
+        : '<div class="note">Waiting for QA</div>') + '</div></div>';
   };
   return '<div class="card"><div class="card-hd"><h2>Back from rework — waiting for QA</h2>' +
-      '<span class="pill p-orange">' + open.length + '</span></div><div class="card-bd">' +
-    '<p class="hint" style="margin-top:0">These units are still <b>In rework</b>. Approving puts the unit into stock at HQ with its new serial' +
-      ' (and version or expiry date, if changed), under your name.</p>' +
+      '<span class="pill p-orange">' + units + '</span></div><div class="card-bd">' +
+    '<p class="hint" style="margin-top:0">These units are still <b>In rework</b>. Each group is one batch release: you enter the' +
+      ' date the units were sterilized, and approving puts every unit into stock at HQ with its new serial (and version or' +
+      ' expiry date, if changed) as batch <b>BATCH-DDMMYY-NN-R</b>, under your name.</p>' +
     (qa ? scanField("rwq-scan", "Re-check a label (optional)", "", {}) : '') +
-    '<div class="tbl-wrap"><table><thead><tr><th>Serial</th><th>Product</th><th>Into</th><th>Version</th><th>Expiry</th>' +
-      '<th>New label scanned</th><th>Brought back by</th><th></th></tr></thead><tbody>' +
-      open.map(row).join("") + '</tbody></table></div>' + whyBox("rwq-why") +
+    groups.map(group).join("") + whyBox("rwq-why") +
     '</div></div>';
 }
 async function refreshReworkReleases(authoritative){
   const fresh = await loadReworkReleases();
   S.db.reworkReleases = Array.isArray(fresh) ? fresh : reworkReleases();
-  if(authoritative && authoritative.releaseId){
-    const i = S.db.reworkReleases.findIndex(r => r.releaseId === authoritative.releaseId);
-    if(i >= 0) S.db.reworkReleases[i] = authoritative; else S.db.reworkReleases.unshift(authoritative);
+  for(const a of [].concat(authoritative || [])){
+    if(!a || !a.releaseId) continue;
+    const i = S.db.reworkReleases.findIndex(r => r.releaseId === a.releaseId);
+    if(i >= 0) S.db.reworkReleases[i] = a; else S.db.reworkReleases.unshift(a);
   }
 }
-function confirmReworkRelease(releaseId){
-  const r = reworkReleases().find(x => x.releaseId === releaseId); if(!r) return;
-  const re = RWQ[releaseId];
-  modal("Release " + (r.newSn || r.sn) + " into stock",
-    '<p>This is the QA release. <b class="mono">' + esc(r.sn) + '</b> goes into stock at <b>' + esc(locName(r.hqId)) +
-      '</b> as <b class="mono">' + esc(r.newSn || r.sn) + '</b>, under your name.</p>' +
-    '<p class="hint">Brought back by ' + esc(r.requestedByName || r.requestedBy) + ' · ' + esc(fmtTs(r.requestedAt)) +
-      '. New label ' + ((r.label || {}).manual ? 'hand-entered' : 'scanned') + ': <span class="mono">' + esc((r.label || {}).sn || "") + '</span>.' +
-      (re ? ' You re-checked it.' : ' You did not re-scan it (optional).') + '</p>' +
+/* The batch id the standalone app gives a release - the server's rule (nextBatchId): the
+   day's next number, shared with production batches, with -R at the end. */
+function nextLocalBatchId(suffix){
+  const day = new Date(), pfx = "BATCH-" + String(day.getDate()).padStart(2, "0") +
+    String(day.getMonth() + 1).padStart(2, "0") + String(day.getFullYear()).slice(2) + "-";
+  const used = (S.db.batches || []).map(b => String(b.batchId || "")).concat(S.db.devices.map(d => String(d.batchId || "")))
+    .filter(id => id.startsWith(pfx)).map(id => parseInt(id.slice(pfx.length), 10) || 0);
+  return pfx + String(Math.max(0, ...used) + 1).padStart(2, "0") + (suffix || "");
+}
+function confirmReworkRelease(key){
+  const g = reworkGroups().find(x => x.key === key); if(!g) return;
+  const f = g.rows[0], n = g.rows.length;
+  const rescanned = g.rows.filter(r => RWQ[r.releaseId]).length;
+  modal("Batch release — " + (n === 1 ? (f.newSn || f.sn) : n + " units") + " into stock",
+    '<p>This is the QA release. ' + (n === 1 ? 'The unit goes' : 'These ' + n + ' units go') + ' into stock at <b>' +
+      esc(locName(f.hqId)) + '</b> as one batch, <b>BATCH-DDMMYY-NN-R</b>, under your name:</p>' +
+    '<p class="mono">' + g.rows.map(r => esc(r.sn) + ' → <b>' + esc(r.newSn || r.sn) + '</b>').join("<br>") + '</p>' +
+    '<div class="field"><label class="req" for="rwa-ster">Sterilization date</label>' +
+      '<input type="date" id="rwa-ster" max="' + esc(todayISO()) + '" style="max-width:200px"></div>' +
+    '<p class="hint">Brought back by ' + esc(f.requestedByName || f.requestedBy) + ' · ' + esc(fmtTs(f.requestedAt)) + '. ' +
+      (rescanned ? 'You re-checked ' + rescanned + ' of ' + n + ' label' + (n === 1 ? '' : 's') + '.' : 'You did not re-scan (optional).') + '</p>' +
     whyBox("rwa-why"),
     '<div class="row"><button class="btn btn-primary" id="rwa-go">Approve — into stock</button>' +
     '<button class="btn" data-close="1">Cancel</button></div>');
   $("#rwa-go").onclick = async () => {
+    const sterilizedAt = ($("#rwa-ster").value || "").trim();
+    if(!sterilizedAt) return showWhy("rwa-why", "Enter the date the units were sterilized.");
+    if(sterilizedAt > todayISO()) return showWhy("rwa-why", "The sterilization date cannot be in the future.");
+    clearWhy("rwa-why");
     const go = $("#rwa-go"); go.disabled = true;
     try{
       if(S.backend){
-        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(releaseId) + "/approve",
-          re ? { rescanCode:re.code, rescanManual:re.manual } : {});
-        const i = S.db.devices.findIndex(x => x.id === r.deviceId);
-        if(i >= 0 && out.device) S.db.devices[i] = out.device;
-        if(out.audit) S.db.logs.unshift(out.audit);
-        await refreshReworkReleases(out.release);
-        delete RWQ[releaseId];
+        const rescans = {};
+        for(const r of g.rows) if(RWQ[r.releaseId]) rescans[r.releaseId] = { code:RWQ[r.releaseId].code, manual:RWQ[r.releaseId].manual };
+        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(key) + "/approve", { sterilizedAt, rescans });
+        for(const x of out.released || []){
+          const i = S.db.devices.findIndex(d => d.id === x.device.id);
+          if(i >= 0) S.db.devices[i] = x.device;
+        }
+        for(const a of (out.audits || []).slice().reverse()) S.db.logs.unshift(a);
+        await refreshReworkReleases((out.released || []).map(x => x.release));
+        if(out.batch) await refreshBatches(out.batch);
+        g.rows.forEach(r => delete RWQ[r.releaseId]);
         commit(); closeModal(); renderNav(); render();
-        if(out.auditFailed) toast("Released, but the log line could not be written. Record it by hand.", "bad");
-        else toast(out.expired ? "Released — but its expiry date has passed, so it is on the record as expired."
-                               : (out.device ? out.device.sn : r.newSn) + " is in stock.", "good");
+        const expired = (out.released || []).filter(x => x.expired).length;
+        if(out.failed && out.failed.length) toast(out.batchId + ": " + out.released.length + " released. NOT released: " +
+          out.failed.map(x => x.sn + " — " + x.message).join("; "), "bad");
+        else if(out.batchFailed) toast("Released, but the batch record " + out.batchId + " could not be written. Record it by hand.", "bad");
+        else if(out.auditFailed) toast("Released, but the log line could not be written. Record it by hand.", "bad");
+        else toast(out.batchId + ": " + out.released.length + (out.released.length === 1 ? " unit" : " units") + " in stock" +
+          (expired ? " — " + expired + " came back expired." : "."), expired ? "bad" : "good");
         return;
       }
       /* Standalone: mirror deviceService.approveReworkReturn. */
       const me = String((S.me && S.me.email) || "").toLowerCase();
-      if(String(r.requestedBy || "").toLowerCase() === me) throw new Error("You brought it back, so you cannot also release it.");
-      const u = S.db.devices.find(x => x.id === r.deviceId);
-      if(!u || u.status !== "REWORK") throw new Error("That unit is not in rework any more.");
-      const oldSn = u.sn;
-      if(r.expiration) u.expiration = r.expiration;
-      u.status = u.expiration && u.expiration < todayISO() ? "EXPIRED" : "IN_WH";
-      u.locationId = r.hqId; u.sn = window.DeviceQr.withRework(u.sn);
-      if(r.version) u.version = r.version;
-      u.destinationId = null; u.masterPackId = null; u.shippedFromId = null; u.shippedAt = null; u.shippedBy = null;
-      u.receivedVia = "REWORK"; u.receivedAt = nowISO(); u.receivedBy = r.requestedBy;
-      r.status = "APPROVED"; r.qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"APPROVED",
-        rescan: re ? { sn:re.sn, expiry:re.expiry, manual:re.manual } : null };
-      logAction("Back from REWORK: " + oldSn + " is now " + u.sn + ", in stock at " + locName(r.hqId) + " — QA released",
-        { locationId:r.hqId, highPriority:true, stateChanges:"In rework → " + u.status + " · serial " + oldSn + " → " + u.sn,
-          comments:"Brought back by " + (r.requestedByName || r.requestedBy) + (re ? "; QA re-scanned the label." : "; QA did not re-scan.") });
-      delete RWQ[releaseId];
+      if(g.rows.some(r => String(r.requestedBy || "").toLowerCase() === me)) throw new Error("You brought it back, so you cannot also release it.");
+      for(const r of g.rows){
+        const u = S.db.devices.find(x => x.id === r.deviceId);
+        if(!u || u.status !== "REWORK") throw new Error(r.sn + ": that unit is not in rework any more.");
+      }
+      const batchId = nextLocalBatchId("-R"), at = nowISO();
+      const qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at, decision:"APPROVED" };
+      const units = [];
+      for(const r of g.rows){
+        const u = S.db.devices.find(x => x.id === r.deviceId);
+        const re = RWQ[r.releaseId];
+        const oldSn = u.sn;
+        if(r.expiration) u.expiration = r.expiration;
+        u.status = u.expiration && u.expiration < todayISO() ? "EXPIRED" : "IN_WH";
+        u.locationId = r.hqId; u.sn = window.DeviceQr.withRework(u.sn);
+        if(r.version) u.version = r.version;
+        u.destinationId = null; u.masterPackId = null; u.shippedFromId = null; u.shippedAt = null; u.shippedBy = null;
+        u.receivedVia = "REWORK"; u.receivedAt = at; u.receivedBy = r.requestedBy;
+        r.status = "APPROVED"; r.batchId = batchId; r.sterilizedAt = sterilizedAt;
+        r.qa = Object.assign({}, qa, { rescan: re ? { sn:re.sn, expiry:re.expiry, manual:re.manual } : null });
+        units.push({ id:u.id, ref:u.ref || "", sn:u.sn, oldSn, productType:u.productType || "", size:u.size || "",
+          expiration:u.expiration || "", version:u.version || "", disposition:"RELEASED", releaseId:r.releaseId, rescanned:!!re });
+        logAction("Back from REWORK: " + oldSn + " is now " + u.sn + ", in stock at " + locName(r.hqId) + " — QA released in " + batchId,
+          { locationId:r.hqId, highPriority:true, stateChanges:"In rework → " + u.status + " · serial " + oldSn + " → " + u.sn,
+            comments:"Sterilized " + sterilizedAt + ". Brought back by " + (r.requestedByName || r.requestedBy) +
+              (re ? "; QA re-scanned the label." : "; QA did not re-scan.") });
+        delete RWQ[r.releaseId];
+      }
+      if(!Array.isArray(S.db.batches)) S.db.batches = [];
+      S.db.batches.unshift({ batchId, id:batchId, kind:"REWORK", reworkGroupId:key, sterilizedAt, locationId:f.hqId,
+        status:"COMPLETED", checks:{}, units, production:{ by:f.requestedBy, byName:f.requestedByName || "", at:f.requestedAt },
+        qa, createdAt:at });
+      logAction("Batch release " + batchId + " (back from rework) — " + units.length + " unit(s) QA released",
+        { locationId:f.hqId, highPriority:true, stateChanges:"Sterilized " + sterilizedAt + " · released: " + units.map(x => x.sn).join(", ") });
       commit(); closeModal(); renderNav(); render();
-      toast(u.sn + " is in stock.", "good");
+      toast(batchId + ": " + units.length + (units.length === 1 ? " unit" : " units") + " in stock.", "good");
     }catch(e){ go.disabled = false; showWhy("rwa-why", e.message || "The server refused the release."); }
   };
 }
-function askReworkSendBack(releaseId){
-  const r = reworkReleases().find(x => x.releaseId === releaseId); if(!r) return;
-  modal("Send " + r.sn + " back",
-    '<p>The unit stays <b>In rework</b> and is not released. The App Admin is told why and can bring it back again.</p>' +
+function askReworkSendBack(key){
+  const g = reworkGroups().find(x => x.key === key); if(!g) return;
+  const n = g.rows.length;
+  modal("Send " + (n === 1 ? g.rows[0].sn : n + " units") + " back",
+    '<p>' + (n === 1 ? 'The unit stays' : 'All ' + n + ' units stay') + ' <b>In rework</b> and ' + (n === 1 ? 'is' : 'are') +
+      ' not released. The App Admin is told why and can bring ' + (n === 1 ? 'it' : 'them') + ' back again.</p>' +
     '<div class="field"><label class="req" for="rwsb-why">Why is it not released?</label>' +
       '<input type="text" id="rwsb-why" maxlength="400" placeholder="e.g. the label is crooked and the expiry is smudged"></div>' +
     whyBox("rwsb-box"),
@@ -34178,21 +34306,23 @@ function askReworkSendBack(releaseId){
     const go = $("#rwsb-go"); go.disabled = true;
     try{
       if(S.backend){
-        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(releaseId) + "/send-back", { reason });
-        if(out.audit) S.db.logs.unshift(out.audit);
-        await refreshReworkReleases(out.release);
+        const out = await api("POST", "/api/rework-releases/" + encodeURIComponent(key) + "/send-back", { reason });
+        for(const a of (out.audits || []).slice().reverse()) S.db.logs.unshift(a);
+        await refreshReworkReleases(out.releases || out.release);
       }else{
         const me = String((S.me && S.me.email) || "").toLowerCase();
-        if(String(r.requestedBy || "").toLowerCase() === me) throw new Error("You brought it back, so you cannot also send it back.");
-        r.status = "SENT_BACK";
-        r.qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"SENT_BACK", note:reason };
-        logAction("QA sent " + r.sn + " back — not released from rework (" + r.releaseId + ")",
-          { locationId:r.hqId, highPriority:true, stateChanges:"Awaiting QA → still in rework", comments:"Reason: " + reason });
-        notify("QA did not release " + r.sn + " from rework: " + reason, ["ADMIN"], [], r.hqId);
+        if(g.rows.some(r => String(r.requestedBy || "").toLowerCase() === me)) throw new Error("You brought it back, so you cannot also send it back.");
+        const qa = { by:(S.me && S.me.email) || "", byName:(S.me && S.me.name) || "", at:nowISO(), decision:"SENT_BACK", note:reason };
+        for(const r of g.rows){
+          r.status = "SENT_BACK"; r.qa = qa;
+          logAction("QA sent " + r.sn + " back — not released from rework (" + r.releaseId + ")",
+            { locationId:r.hqId, highPriority:true, stateChanges:"Awaiting QA → still in rework", comments:"Reason: " + reason });
+        }
+        notify("QA did not release " + g.rows.map(r => r.sn).join(", ") + " from rework: " + reason, ["ADMIN"], [], g.rows[0].hqId);
       }
-      delete RWQ[releaseId];
+      g.rows.forEach(r => delete RWQ[r.releaseId]);
       commit(); closeModal(); renderNav(); render();
-      toast("Sent back. The unit stays in rework.", "good");
+      toast("Sent back. " + (n === 1 ? "The unit stays" : "The units stay") + " in rework.", "good");
     }catch(e){ go.disabled = false; showWhy("rwsb-box", e.message || "The server refused that."); }
   };
 }
