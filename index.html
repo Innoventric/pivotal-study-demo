@@ -12446,6 +12446,75 @@ function screenFailure(patients){
            pct: screened.length ? (failed.length / screened.length) * 100 : null };
 }
 
+/* ---- 5. HOW LONG SCREENING TAKES (6 Nov 2026, the owner) --------------------------------
+   Average, longest and shortest, for EVERY protocol - Study and compassionate together
+   (the owner: "whether the subject is a study subject or CU"), which is why it is not one of
+   the four study measures above and does not go through studyCohort().
+
+   From registration to the END of screening either way (the owner's choice):
+     · declared eligible   - the decision date, eligibleDate(), the same end "Days to
+                             Eligible" uses;
+     · a screen failure    - stopped before eligibility, ended on the day it was stopped
+                             (cancelled.at).
+   A subject still in screening has not ended it and is not measured - a duration that is
+   still running is not a duration. The same honesty rules as Days to Eligible: no
+   registration date, or an end dated before the registration, is counted out and said. */
+function screeningEnd(p){
+  if(!p) return null;
+  if(reachedEligible(p)) return { day: String(eligibleDate(p) || "").slice(0, 10), how: "ELIGIBLE" };
+  if(wasStopped(p)) return { day: String((p.cancelled && p.cancelled.at) || "").slice(0, 10), how: "FAILED" };
+  return null;
+}
+function screeningDuration(patients, logs){
+  var ended = 0, noDate = 0, badOrder = 0, eligibleN = 0, failedN = 0, compN = 0;
+  var spans = [];
+  (patients || []).forEach(function(p){
+    var end = screeningEnd(p);
+    if(!end) return;
+    ended++;
+    var from = registrationDate(p, logs);
+    if(!from || !end.day){ noDate++; return; }
+    var d = daysBetween(from, end.day);
+    if(d === null){ badOrder++; return; }
+    spans.push({ days: d, code: String(p.patientCode || p.id || "?") });
+    if(end.how === "ELIGIBLE") eligibleN++; else failedN++;
+    if(isCompassionate(p)) compN++;
+  });
+  spans.sort(function(a, b){ return a.days - b.days || a.code.localeCompare(b.code); });
+  var n = spans.length;
+  return {
+    ended: ended, measured: n, noDate: noDate, badOrder: badOrder,
+    eligible: eligibleN, failed: failedN, compassionate: compN, study: n - compN,
+    avg: n ? spans.reduce(function(a, s){ return a + s.days; }, 0) / n : null,
+    median: n ? (n % 2 ? spans[(n - 1) / 2].days : (spans[n / 2 - 1].days + spans[n / 2].days) / 2) : null,
+    shortest: n ? spans[0] : null,
+    longest: n ? spans[n - 1] : null
+  };
+}
+/* The three tiles, worded here so any screen that shows them says the same thing. */
+function screeningDurationTiles(sd){
+  var days = function(d){ return d === 1 ? "1 day" : round1(d) + " days"; };
+  if(!sd.measured){
+    var why = sd.ended
+      ? "no registration date or no end-of-screening date on record for any of the " + sd.ended +
+        " who finished screening"
+      : "no subject has finished screening yet";
+    return [
+      { value: "—", label: "Average screening", sub: why },
+      { value: "—", label: "Longest screening", sub: why },
+      { value: "—", label: "Shortest screening", sub: why }
+    ];
+  }
+  return [
+    { value: round1(sd.avg), label: "Average screening (days)",
+      sub: "registration to eligible or screen failure · median " + round1(sd.median) +
+           " · " + sd.measured + " subject" + (sd.measured === 1 ? "" : "s") + ": " +
+           sd.study + " study, " + sd.compassionate + " CU" },
+    { value: sd.longest.days, label: "Longest screening (days)", sub: "subject " + sd.longest.code },
+    { value: sd.shortest.days, label: "Shortest screening (days)", sub: "subject " + sd.shortest.code }
+  ];
+}
+
 /* ---- the three operational counts ------------------------------------------------
    These count WORK - every patient in front of the team, whichever protocol - while the
    four measures above count the STUDY. The two "implanted" numbers therefore differ the
@@ -12613,8 +12682,12 @@ function report(ctx){
           " subject" + (sf.open === 1 ? "" : "s") + " still in screening in its denominator, " +
           "which is the convention. It will move as they resolve." });
 
+  /* Screening duration (6 Nov 2026): every protocol, so it sits apart from `study` - the
+     daily mail prints `study` as its tile list and was not asked to carry these. */
+  var sd = screeningDuration(patients, logs);
   return { counts: counts, rate: rate, tte: tte, enr: enr, sf: sf,
-           work: work, study: study, notes: notes, rereadCompassionate: reread };
+           work: work, study: study, notes: notes, rereadCompassionate: reread,
+           screenDur: sd, screenDurTiles: screeningDurationTiles(sd) };
 }
 
 /* ============================ 5. THE SITES =================================
@@ -12843,6 +12916,23 @@ function inScreeningPhase(p){
   return p.status === "SUSPECTED" || i < 0 || i < PT_FLOW.indexOf("SCHEDULED");
 }
 
+/* WHY IS THIS SUBJECT STUCK (6 Nov 2026, the owner). From day STUCK_DAYS a subject that has not
+   moved gets a mail every mail day, to the assignee of the stage it waits on and the site's
+   Responsible CPM, until somebody writes a reason or the subject moves. A reason belongs to
+   ONE stuck episode: it is stamped with the subject's lastMovedAt when it was written, and it
+   holds only while that is still when the subject last moved (the owner: "until the subject
+   moves"). p.stuckReasons is server-owned (caseService.save keeps the stored list) and is
+   written only by POST /api/patients/:id/stuck-reason; the old ones stay as history. */
+function stuckReasonNow(p){
+  var list = (p && Array.isArray(p.stuckReasons)) ? p.stuckReasons : [];
+  var moved = lastMovedAt(p);
+  for(var i = list.length - 1; i >= 0; i--){
+    var r = list[i];
+    if(r && r.text && String(r.movedAt || "") === String(moved || "")) return r;
+  }
+  return null;
+}
+
 /* Every stuck subject, longest-still first. `today` is "YYYY-MM-DD" in Israel time. */
 function stuckSubjects(patients, today, days){
   var limit = days == null ? STUCK_DAYS : days;
@@ -12853,7 +12943,8 @@ function stuckSubjects(patients, today, days){
     var still = daysApart(String(moved).slice(0, 10), today);
     if(still === null || still < limit) return;
     var reg = p.registeredAt ? daysApart(String(p.registeredAt).slice(0, 10), today) : null;
-    out.push({ patient: p, lastMovedAt: moved, daysStill: still, daysSinceRegistration: reg });
+    out.push({ patient: p, lastMovedAt: moved, daysStill: still, daysSinceRegistration: reg,
+               reason: stuckReasonNow(p) });
   });
   return out.sort(function(a, b){ return b.daysStill - a.daysStill; });
 }
@@ -12865,6 +12956,10 @@ var api = {
   lastMovedAt: lastMovedAt,
   inScreeningPhase: inScreeningPhase,
   stuckSubjects: stuckSubjects,
+  stuckReasonNow: stuckReasonNow,
+  screeningEnd: screeningEnd,
+  screeningDuration: screeningDuration,
+  screeningDurationTiles: screeningDurationTiles,
   PROTOCOLS: PROTOCOLS,
   PROTOCOL_DEFAULT: PROTOCOL_DEFAULT,
   STUDY_PROTOCOL: STUDY_PROTOCOL,
@@ -15104,7 +15199,12 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               "procSummary",
                               /* stage overrides (26 Oct 2026): written only by their
                                  route and the approval route */
-                              "stageOverrides"];
+                              "stageOverrides",
+                              /* stuck in screening (6 Nov 2026): the server stamps when the
+                                 subject last moved and keeps the reasons, written only by
+                                 POST /api/patients/:id/stuck-reason - without both, the
+                                 screen would judge a reason against a stale move date */
+                              "lastMovedAt", "stuckReasons"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -17044,6 +17144,16 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.7.0", date: "6 November 2026", groups: [
+    { h:"Study Status", items:[
+      "A new block, <b>How long screening takes</b>: the <b>average</b>, <b>longest</b> and <b>shortest</b> screening, for study and CU subjects together. Screening runs from registration until the subject is declared eligible or stopped as a screen failure; longest and shortest name the subject."
+    ] },
+    { h:"Stuck subjects", items:[
+      "A subject that has not moved for <b>3 days</b> now gets an email every mail day to whoever holds the stage it is waiting on and to the site’s Clinical PM: which day it is, and how to stop it.",
+      "To stop it, open the subject in <b>Subject Screening</b> and press <b>Why is this subject stuck?</b> — or change the subject’s status. The reason holds until the subject moves; if it stalls again, a new reason is asked for.",
+      "In the daily summary a stuck subject is now on the <b>same row as its open task</b>, with the reason written under it. There is no separate stuck section any more."
+    ] }
+  ] },
   { version: "3.6.0", date: "4 November 2026", groups: [
     { h:"Back from rework is a batch release", items:[
       "Units brought back from rework together go to QA as <b>one release</b>. Every label is checked before any is sent; if one does not match, nothing is sent and the unit is named.",
@@ -24932,6 +25042,7 @@ VIEWS.screening = {
         '</div>';
     }else{
       h += suitabilityBanner(p);
+      h += stuckBanner(p);
       if(mayDisqualify(p)){
         h += '<div class="row" style="justify-content:flex-end;margin:-4px 0 10px">' +
           '<button class="btn btn-sm btn-danger" data-disq="' + esc(p.id) + '">Disqualify subject</button>' +
@@ -25729,6 +25840,60 @@ function suitabilityBanner(p){
         : '<div class="hint">A Clinical PM, Manager or App Admin decides.</div>') +
     '</div>';
 }
+/* STUCK IN SCREENING (6 Nov 2026, the owner). A subject that has not moved for SM.STUCK_DAYS is
+   mailed about every mail day - to the waiting stage's assignee and the site CPM - until a
+   reason is written here or the subject moves. The rule is studyMeasures.stuckSubjects; the
+   reason holds for this stuck episode only (SM.stuckReasonNow). Any internal user may write
+   one; the server keeps the list (POST /api/patients/:id/stuck-reason). */
+function stuckBanner(p){
+  if(!p || p.fileLocked || isExternalUser()) return "";
+  const x = SM.stuckSubjects([p], localDay())[0];
+  if(!x) return "";
+  const r = x.reason;
+  return '<div class="warn"><b>Stuck — day ' + x.daysStill + ' without a move.</b> ' +
+    (r ? 'Reason (' + esc(r.byName || r.by || "") + ', ' + esc(fmtDate(r.day || r.at)) + '): ' + esc(r.text) +
+         '<div class="hint">The daily alert is stopped until the subject moves. The reason is shown in the daily summary.</div>'
+       : 'An alert is mailed every day to the assignee and the site CPM until a reason is written or the subject moves.') +
+    '<div class="row" style="margin-top:8px"><button class="btn btn-sm" data-stuckwhy="' + esc(p.id) + '">' +
+      (r ? 'Update the reason' : 'Why is this subject stuck?') + '</button></div></div>';
+}
+function askStuckReason(p){
+  if(!p) return;
+  const x = SM.stuckSubjects([p], localDay())[0];
+  const now = x && x.reason ? x.reason.text : "";
+  modal("Why is " + p.patientCode + " stuck?",
+    '<p>Day ' + (x ? x.daysStill : "?") + ' without a move. The reason stops the daily alert until the subject moves, ' +
+      'and is shown under the subject in the daily summary to the managers and the CPM.</p>' +
+    '<div class="field"><label class="req" for="stk-why">Reason</label>' +
+      '<textarea id="stk-why" maxlength="500">' + esc(now) + '</textarea></div>' + whyBox("stk-err"),
+    '<div class="row"><button class="btn btn-primary" id="stk-go">Save the reason</button>' +
+      '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#stk-go").onclick = async () => {
+    const reason = $("#stk-why").value.replace(/\s+/g, " ").trim();
+    if(reason.length < 3) return showWhy("stk-err", "Write the reason the subject is stuck.");
+    const go = $("#stk-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/stuck-reason", { reason });
+        if(out.patient) mergePatient(out.patient);
+        if(out.audit) S.db.logs.unshift(out.audit);
+      }else{
+        /* Standalone: the same record the server writes. */
+        p.stuckReasons = (p.stuckReasons || []).concat([{ text: reason, by: myEmailLc(), byName: S.me.name,
+          at: nowISO(), day: localDay(), movedAt: SM.lastMovedAt(p) || "" }]);
+        logAction("Stuck reason for " + p.patientCode, { locationId: p.siteId || null,
+          stateChanges: "Daily stuck alert stopped until the subject moves", comments: "Reason: " + reason });
+      }
+      commit(); closeModal(); render();
+      toast("Saved. The daily alert for " + p.patientCode + " stops until the subject moves.", "good");
+    }catch(e){ go.disabled = false; showWhy("stk-err", e.message || "The server refused that."); }
+  };
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-stuckwhy]");
+  if(t) askStuckReason(patient(t.dataset.stuckwhy));
+});
+
 function decideSuitable(p){
   const rv = suitabilityReview(p);
   if(!rv || !can("disqualifyPatient")) return;
@@ -35445,6 +35610,19 @@ VIEWS.overview = {
   wire(){ wirePatientStatusWidget(); }
 };
 
+/* What the screening-duration tiles left out, said under them like every other measure. */
+function screenDurNote(sd){
+  const out = [];
+  if(sd.noDate) out.push(sd.noDate + " subject" + (sd.noDate === 1 ? "" : "s") +
+    " who finished screening " + (sd.noDate === 1 ? "has" : "have") +
+    " no registration or end date on record and " + (sd.noDate === 1 ? "is" : "are") + " left out.");
+  if(sd.badOrder) out.push(sd.badOrder + " subject" + (sd.badOrder === 1 ? "" : "s") +
+    " ended screening on a date BEFORE registration — left out; one of the two dates wants correcting.");
+  if(!out.length) return "";
+  return '<div class="hint dash-hide" style="margin:-4px 0 14px">' +
+    out.map(t => '<div style="margin-bottom:3px">' + esc(t) + '</div>').join("") + '</div>';
+}
+
 VIEWS.studystatus = {
   title:"Study Status",
   sub:"How the study is going, and the numbers worth watching. " +
@@ -35459,6 +35637,11 @@ VIEWS.studystatus = {
     return dashboardTiles(rep) +
       '<h3 class="dash-h">How the study is going</h3>' +
       studyTiles(rep, sites) +
+      /* Screening duration (6 Nov 2026, the owner): Study and CU together, registration to
+         eligible or screen failure. Words and numbers from studyMeasures. */
+      '<h3 class="dash-h">How long screening takes</h3>' +
+      '<div class="dash">' + rep.screenDurTiles.map(t => dashTile(t.value, t.label, t.sub)).join("") + '</div>' +
+      screenDurNote(rep.screenDur) +
       '<div class="dash-hide">' + implantChart(rep) + '</div>' +
       '<div class="dash-hide">' + siteTable(sites) + '</div>' +
       '<div class="row dash-hide" style="margin-bottom:12px">' +
