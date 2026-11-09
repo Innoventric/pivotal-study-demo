@@ -112,6 +112,14 @@ button{font-family:inherit; font-size:inherit;}
 .btn-eye{display:inline-flex; align-items:center; justify-content:center;
          width:27px; height:23px; padding:0; margin-left:6px; vertical-align:middle;}
 .btn-eye svg{width:15px; height:15px; display:block;}
+/* Icon + word (9 Nov 2026): the bare icons on Follow up were not understood. */
+.btn-eye.lbl{width:auto; padding:0 7px; gap:4px; font-size:11.5px; white-space:nowrap;}
+.act-row{display:flex; flex-wrap:wrap; gap:5px; margin-top:4px; align-items:center;}
+.act-row .btn-eye{margin-left:0;}
+.file-chip{display:inline-flex; align-items:center; gap:3px; height:23px; padding:0 7px;
+           font-size:11.5px; white-space:nowrap;}
+.file-chip.off{border:1px solid var(--line); border-radius:6px; color:var(--faint);
+               background:var(--grey-bg); opacity:.6; cursor:not-allowed;}
 
 label{display:block; font-size:12px; font-weight:600; color:var(--muted);
       margin:0 0 4px; letter-spacing:.2px;}
@@ -11807,14 +11815,47 @@ function stageMissing(p, s){
     }
     if(s.final && ANAT_FILE_FOLDER[s.k] && !anatFilesOf(p, s.k).length) out.push("The Road Map file (image or PDF)");
   }
+  /* FILES ARE REQUIRED, NOT OPTIONAL (9 Nov 2026, the owner): the CT report as a PDF, two
+     images of the 3D model and two of the pliable model, and the patient presentation
+     at stage 8. The same rule as above - asked only of a stage not yet Completed, so
+     nothing already signed off reopens. */
+  var gap = stageFileGap(p, s);
+  if(gap && a.status !== "Completed") out.push(gap);
   return out;
 }
-/* Where each evaluation stage files its images and PDFs, under the patient's folder. A
-   stage not named here takes no files. */
+/* Where each stage files its documents, under the patient's folder. A stage not named
+   here takes no files. Stage 8 since 9 Nov 2026: the patient presentation. */
 var ANAT_FILE_FOLDER = { ct:"01_CT_report", model3d:"02_3D_model", flexible:"06_Pliable_model",
-                         fluoro:"07_Road_map" };
+                         fluoro:"07_Road_map", approvals:"08_Patient_presentation" };
 function anatFilesOf(p, k){
   return ((p && p.anatFiles) || []).filter(function(f){ return f && f.stage === k; });
+}
+/* What each stage must have filed (9 Nov 2026, the owner). `kinds` are the file kinds that
+   count, `min` how many. The Road Map (stage 7) keeps its own rule above. */
+var STAGE_FILE_RULES = {
+  ct:        { kinds:["pdf"],        min:1, need:"The CT report (PDF)" },
+  model3d:   { kinds:["image"],      min:2, need:"At least 2 images of the 3D model" },
+  flexible:  { kinds:["image"],      min:2, need:"At least 2 images of the pliable model" },
+  approvals: { kinds:["ppt", "pdf"], min:1, need:"The patient presentation (PPT or PDF)" }
+};
+/* A file's kind: what was recorded at upload, else read off the name (old records). */
+function anatFileKind(f){
+  if(f && f.kind) return f.kind;
+  var n = String((f && f.filename) || "");
+  if(/\.pdf$/i.test(n)) return "pdf";
+  if(/\.pptx?$/i.test(n)) return "ppt";
+  return "image";
+}
+function stageFileCount(p, k){
+  var r = STAGE_FILE_RULES[k];
+  if(!r) return anatFilesOf(p, k).length;
+  return anatFilesOf(p, k).filter(function(f){ return r.kinds.indexOf(anatFileKind(f)) >= 0; }).length;
+}
+/* The requirement this stage still lacks, as words; "" when it has what it needs. */
+function stageFileGap(p, s){
+  var r = STAGE_FILE_RULES[s.k];
+  if(!r) return "";
+  return stageFileCount(p, s.k) >= r.min ? "" : r.need;
 }
 function stageState(p, s){
   var a = (p.anat || {})[s.k] || {};
@@ -12100,7 +12141,11 @@ var api = {
   stageOverrideProblem: stageOverrideProblem,
   applyStageOverride: applyStageOverride,
   ANAT_FILE_FOLDER: ANAT_FILE_FOLDER,
-  anatFilesOf: anatFilesOf
+  anatFilesOf: anatFilesOf,
+  STAGE_FILE_RULES: STAGE_FILE_RULES,
+  anatFileKind: anatFileKind,
+  stageFileCount: stageFileCount,
+  stageFileGap: stageFileGap
 };
 
 if(typeof module !== "undefined" && module.exports) module.exports = api;
@@ -17301,6 +17346,17 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.10.0", date: "9 November 2026", groups: [
+    { h:"Evaluation files are required", items:[
+      "A stage can no longer be completed without its files: <b>1. CT Measurements Report</b> needs the CT report as a <b>PDF</b>; <b>2. 3D Model Evaluation</b> and <b>6. Pliable model evaluation</b> need <b>at least 2 images</b> each (a PDF does not count); <b>7.</b> still needs its Road Map file.",
+      "<b>8. Eligibility &amp; Approvals</b> takes the <b>patient presentation</b> — a PowerPoint or a PDF, or both — and needs it to be completed. Large presentations are fine.",
+      "Stages already completed are not reopened by this."
+    ] },
+    { h:"Subject Overview and Follow up", items:[
+      "A new <b>Files</b> column: one button each for the CT report, the 3D model, the pliable model, the Road Map and the presentation, and the subject's <b>Folder</b>. A stage the subject has passed with nothing filed is shown in grey; a stage not reached yet is not shown.",
+      "Every button now says what it does: <b>View</b>, <b>Summary</b>, <b>Folder</b>. <b>Open report</b> is now <b>Edit</b>, with a pencil — it opens the procedure report for editing, and is not shown once the report is locked."
+    ] }
+  ] },
   { version: "3.9.0", date: "9 November 2026", groups: [
     { h:"Hold and Cancel", items:[
       "Two new buttons on the subject in <b>Subject Screening</b>, beside <b>Disqualify</b>. <b>Put on hold</b> pauses screening: the subject is not complying, or an operational reason stops screening being finished. <b>Cancel subject</b> records that the subject will not be implanted, for a reason that has nothing to do with screening.",
@@ -20397,7 +20453,9 @@ const ICON = {
      a pupil rather than a page, because the question it answers is "let me see it", not
      "let me edit it" - and because a document glyph beside a document pill says nothing. */
   eye: 'M1.8 10S5 4.8 10 4.8 18.2 10 18.2 10 15 15.2 10 15.2 1.8 10 1.8 10zM10 12.2a2.2 2.2 0 100-4.4 2.2 2.2 0 000 4.4z',
-  folder: 'M2.5 5.5a1 1 0 011-1h4l1.6 1.8h7.4a1 1 0 011 1v8.2a1 1 0 01-1 1h-13a1 1 0 01-1-1z'
+  folder: 'M2.5 5.5a1 1 0 011-1h4l1.6 1.8h7.4a1 1 0 011 1v8.2a1 1 0 01-1 1h-13a1 1 0 01-1-1z',
+  /* Editing the procedure report (9 Nov 2026): a pencil, beside the eye that only reads. */
+  pencil: 'M13.2 3.6l3.2 3.2L7.2 16H4v-3.2zM11.4 5.4l3.2 3.2'
 };
 function icon(k){
   return '<svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" ' +
@@ -21881,7 +21939,7 @@ document.addEventListener("click", e => {
   e.preventDefault(); e.stopPropagation();
   openSiteDetails(t.dataset.siteinfo);
 }, true);
-function patientRowCells(p){
+function patientRowCells(p, opts){
   /* Implant / DS sizes come from the anatomical evaluation, not registration, so they
      read "Pending" until that evaluation produces a recommendation. */
   const implant = p.unicaSize ? esc(p.unicaSize) : '<span class="hint">Pending</span>';
@@ -21896,7 +21954,11 @@ function patientRowCells(p){
     '<td>' + esc(fmtDate(p.procedureDate)) + '</td><td>' + implant + '</td>' +
     '<td>' + ds + '</td><td>' + allocationCell(p) + '</td><td>' + procCountdown(p) + '</td>' +
     '<td>' + pill(PT_STATUS, displayStatus(p)) + '</td>' +
-    '<td>' + stuckWithCell(p) + '</td><td>' + casefile + reportEyeBtn(p) + folderLinkBtn(p) + '</td>';
+    '<td>' + stuckWithCell(p) + '</td><td>' + filesCell(p) + '</td>' +
+    /* The folder moved into Files (9 Nov 2026). The pencil only where the report is what a
+       click on the row opens anyway, and only on Subject Overview / Home (opts.edit). */
+    '<td>' + casefile + '<div class="act-row">' + reportEyeBtn(p) +
+      (opts && opts.edit && canSeeReport() && patientLandsOnReport(p) ? editReportBtn(p) : "") + '</div></td>';
 }
 /* HAS THE WAREHOUSE RESERVED THE UNITS, AND WHICH (27 Sep 2026, the owner). Read straight off
    the devices - allocatedTo is the reservation - so this column cannot disagree with the
@@ -21996,9 +22058,9 @@ function patientStatusWidget(){
   const table = shown.length
     ? '<div class="tbl-wrap" style="margin-top:11px"><table><thead><tr>' +
       '<th>Code</th><th>Site</th><th>Procedure date</th><th>Unica</th><th>DS</th><th>Allocated</th>' +
-      '<th>Time to/from procedure</th><th>Status</th><th>With</th><th>Procedure report</th></tr></thead><tbody>' +
+      '<th>Time to/from procedure</th><th>Status</th><th>With</th><th>Files</th><th>Procedure report</th></tr></thead><tbody>' +
       shown.slice().sort(byProgressDesc)
-        .map(p => '<tr class="row-click" data-patient="' + p.id + '">' + patientRowCells(p) + '</tr>').join("") +
+        .map(p => '<tr class="row-click" data-patient="' + p.id + '">' + patientRowCells(p, { edit:true }) + '</tr>').join("") +
       '</tbody></table></div>'
     : '<div class="hint" style="margin-top:11px">No subjects match the current filters.</div>';
 
@@ -26454,8 +26516,8 @@ function mayAddAnatFile(p, s){
 }
 function fileTile(p, f){
   const thumb = ANAT_THUMBS.get(f.id) || f.thumb;
-  const pic = f.kind === "pdf"
-    ? '<span class="ftile-pdf">PDF</span>'
+  const pic = f.kind === "pdf" || f.kind === "ppt"
+    ? '<span class="ftile-pdf">' + (f.kind === "ppt" ? "PPT" : "PDF") + '</span>'
     : (thumb ? '<img src="' + thumb + '" alt="">'
        : S.backend ? '<img src="' + anatFileUrl(p, f) + '" alt="" loading="lazy">'
        : '<span class="ftile-pdf">IMG</span>');
@@ -26467,15 +26529,24 @@ function anatFilesBlock(p, s){
   if(!ANAT_FILE_FOLDER[s.k]) return "";
   const a = p.anat[s.k];
   const files = anatFilesOf(p, s.k);
-  const need = s.final ? "A Road Map file — image or PDF — is required to complete this stage."
+  /* Required files (9 Nov 2026, the owner): stage 1 a PDF, stages 2 and 6 two images. */
+  const rule = AnatStages.STAGE_FILE_RULES[s.k];
+  const need = rule ? ({ ct:"The CT report as a PDF is required to complete this stage.",
+                         model3d:"At least 2 images are required to complete this stage (a PDF does not count).",
+                         flexible:"At least 2 images are required to complete this stage (a PDF does not count)." })[s.k] +
+                      (a.suitability === "Not suitable" ? " The files must also show why the subject is not suitable." : "")
+             : s.final ? "A Road Map file — image or PDF — is required to complete this stage."
              : a.suitability === "Not suitable" ? "At least one image or PDF showing why the subject is not suitable is required."
              : "";
+  const short = rule ? !!AnatStages.stageFileGap(p, s) : !files.length;
   const may = mayAddAnatFile(p, s);
   return '<div class="field" style="margin-top:8px"><label' + (need ? ' class="req"' : "") + '>' +
-      (s.final ? "Road Map file" : "Images and documents") + '</label>' +
+      (s.final ? "Road Map file" : "Images and documents") +
+      (rule && rule.min > 1 ? ' <span class="hint">(' + AnatStages.stageFileCount(p, s.k) + ' of ' + rule.min + ')</span>' : "") +
+      '</label>' +
     (files.length ? '<div class="ftiles">' + files.map(f => fileTile(p, f)).join("") + '</div>'
                   : '<div class="hint">Nothing filed for this stage yet.</div>') +
-    (need ? '<div class="' + (files.length ? "hint" : "warn") + '" style="margin-top:4px">' +
+    (need ? '<div class="' + (short && a.status !== "Completed" ? "warn" : "hint") + '" style="margin-top:4px">' +
       esc(need) + '</div>' : "") +
     (may ? '<div class="row" style="margin-top:6px">' +
       '<button type="button" class="btn btn-sm" data-afadd="' + esc(p.id) + '|' + s.k + '|cam"><span class="fic">' + icon("camera") + '</span>Take a photo</button>' +
@@ -26483,6 +26554,78 @@ function anatFilesBlock(p, s){
       '<span class="hint">Images and PDFs, up to about 3 MB. Filed in the subject’s folder.</span>' +
       '</div>' : "") +
     '</div>';
+}
+/* ---- THE PATIENT PRESENTATION, stage 8 (9 Nov 2026, the owner) --------------------------
+   A PowerPoint or a PDF - either or both - required to complete Eligibility & Approvals.
+   No identifier check (the owner: the presentation holds no personal details) and no 4 MB cap:
+   it goes up as the raw file to its own route, which takes up to ANAT_DOC_MAX. */
+const ANAT_DOC_MAX = 150 * 1024 * 1024;
+function presentationBlock(p, s){
+  const files = anatFilesOf(p, s.k);
+  const short = !!AnatStages.stageFileGap(p, s);
+  const may = mayAddAnatFile(p, s);
+  return '<div class="field" style="margin-top:10px"><label class="req">Patient presentation (PPT or PDF)</label>' +
+    (files.length ? '<div class="ftiles">' + files.map(f => fileTile(p, f)).join("") + '</div>'
+                  : '<div class="hint">No presentation filed yet.</div>') +
+    '<div class="' + (short && p.anat[s.k].status !== "Completed" ? "warn" : "hint") + '" style="margin-top:4px">' +
+      'The patient presentation — PowerPoint or PDF — is required to complete this stage.</div>' +
+    (may ? '<div class="row" style="margin-top:6px">' +
+      '<button type="button" class="btn btn-sm" data-afdoc="' + esc(p.id) + '|' + s.k + '">Upload presentation</button>' +
+      '<span class="hint">.pptx, .ppt or .pdf, up to ' + Math.round(ANAT_DOC_MAX / 1048576) + ' MB. Filed in the subject’s folder.</span>' +
+      '</div>' : "") +
+    '</div>';
+}
+function addAnatDoc(p, s){
+  if(!mayAddAnatFile(p, s)) return;
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = ".pptx,.ppt,.pdf,application/pdf,application/vnd.ms-powerpoint," +
+               "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+  inp.style.display = "none";
+  document.body.appendChild(inp);
+  inp.onchange = async () => {
+    const file = inp.files && inp.files[0];
+    inp.remove();
+    if(!file) return;
+    const m = /\.(pptx?|pdf)$/i.exec(file.name || "");
+    if(!m) return toast("Choose a PowerPoint (.pptx or .ppt) or a PDF.", "bad");
+    if(file.size > ANAT_DOC_MAX) return toast("That file is " + Math.round(file.size / 1048576) +
+      " MB. The limit is " + Math.round(ANAT_DOC_MAX / 1048576) + " MB.", "bad");
+    const ext = m[1].toLowerCase();
+    const kind = ext === "pdf" ? "pdf" : "ppt";
+    const label = stageName(s);
+    let folder = patientFolder(p) + "/anatomical/" + ANAT_FILE_FOLDER[s.k];
+    let filename = p.patientCode + "_" + s.k + "_" + new Date().toISOString().replace(/[:.]/g, "-") + "." + ext;
+    /* Uploaded first, recorded after - as addAnatFile does. The server names the file and
+       the folder; what it answers is what is recorded. */
+    if(S.backend){
+      toast("Uploading " + file.name + "…");
+      try{
+        const r = await fetch("/api/patients/" + encodeURIComponent(p.id) + "/anat-doc?stage=" +
+          encodeURIComponent(s.k) + "&name=" + encodeURIComponent(file.name), {
+          method:"POST", credentials:"same-origin",
+          headers:{ "Content-Type":"application/octet-stream" }, body:file });
+        const j = await r.json().catch(() => null);
+        if(!r.ok) throw new Error((j && j.error && j.error.message) || ("HTTP " + r.status));
+        folder = j.folder; filename = j.filename;
+      }catch(e){
+        return toast("Not filed — the upload to SharePoint failed: " +
+          (e.message || "no connection") + ". Nothing was recorded; try again.", "bad");
+      }
+    }
+    const rec = { id:uid("af"), stage:s.k, filename, folder, label, kind,
+      ts:nowISO(), by:(S.me && S.me.email) || "", byName:S.me.name, bytes:file.size,
+      original:String(file.name || "").slice(0, 120) };
+    if(!Array.isArray(p.anatFiles)) p.anatFiles = [];
+    p.anatFiles.push(rec);
+    commit();
+    schedulePatientSave(p);
+    logAction("Patient presentation filed for " + label + " (" + p.patientCode + ")", {
+      locationId:p.siteId, comments:"Filed as " + folder + "/" + filename + " by " + S.me.name });
+    toast("Filed under " + p.patientCode + ".", "good");
+    renderKeepingPlace();
+  };
+  inp.click();
 }
 function readFileBase64(file){
   return new Promise((resolve, reject) => {
@@ -26644,7 +26787,11 @@ function openPatientFiles(p, focusId){
     const { group, f } = list[at];
     const url = anatFileUrl(p, f);
     const thumb = ANAT_THUMBS.get(f.id) || f.thumb;
-    const body = f.kind === "pdf"
+    const body = f.kind === "ppt"
+      ? '<div class="note">A PowerPoint cannot be shown here. ' +
+          (S.backend ? '<a class="btn btn-sm" href="' + anatFileUrl(p, f, true) + '">Download ' + esc(f.original || f.filename) + '</a>'
+                     : 'It is read back from the server; there is none here.') + '</div>'
+      : f.kind === "pdf"
       ? (S.backend ? '<iframe src="' + url + '" title="' + esc(f.filename) + '" class="pf-frame"></iframe>'
                    : '<div class="hint">PDFs are read back from the server; there is none here.</div>')
       : '<img src="' + (thumb || (S.backend ? url : "")) + '" alt="' + esc(f.filename) + '" class="pf-img">';
@@ -26672,11 +26819,16 @@ function openPatientFiles(p, focusId){
    the overview and the dialogs alike. */
 document.addEventListener("click", e => {
   const t = e.target && e.target.closest &&
-    e.target.closest("[data-fview],[data-afadd],[data-files-eye],[data-rv-ok],[data-rv-no],[data-disq]");
+    e.target.closest("[data-fview],[data-afadd],[data-afdoc],[data-files-eye],[data-rv-ok],[data-rv-no],[data-disq]");
   if(!t) return;
   if(t.dataset.fview){
     const [pid, fid] = t.dataset.fview.split("|");
     openPatientFiles(patient(pid), fid);
+  }else if(t.dataset.afdoc){
+    const [pid, k] = t.dataset.afdoc.split("|");
+    const p = patient(pid);
+    const s = ANAT_STAGES.find(x => x.k === k);
+    if(p && s) addAnatDoc(p, s);
   }else if(t.dataset.afadd){
     const [pid, k, how] = t.dataset.afadd.split("|");
     const p = patient(pid);
@@ -26948,7 +27100,8 @@ function anatStageHtml(p, s, ctReady){
     inner += '<div class="grid g2" style="margin-top:10px">' +
       f("completionDate","Decision date","date") +
       '<div class="field"><label>Confirmed by</label><input value="' + esc(a.completedBy || "") +
-      '" disabled></div></div>';
+      '" disabled></div></div>' +
+      presentationBlock(p, s);
   }
   else if(s.kind === "sched"){
     /* Randomisation is DECIDED here as of 2026-08-12 - it moved from stage 8, because
@@ -36366,7 +36519,7 @@ VIEWS.followup = {
         '<th>Implant SN</th><th>System SN</th><th>Time since procedure</th>' +
         /* v3.0.0 (the owner, item 26): who was there - the company's team and the hospital's. */
         '<th>Company team</th><th>Medical team</th>' +
-        '<th>Report</th><th></th></tr></thead><tbody>' +
+        '<th>Files</th><th>Report</th><th></th></tr></thead><tbody>' +
       list.map(p => {
         const when = (p.caseFile && p.caseFile.procDate) || p.procedureDate || "";
         
@@ -36389,10 +36542,13 @@ VIEWS.followup = {
           '<td>' + sinceCell(when) + '</td>' +
           '<td>' + fuTeamCell(p, [["proctor","Proctor"],["tech1","Tech 1"],["tech2","Tech 2"],["clinical","Clinical"]]) + '</td>' +
           '<td>' + fuTeamCell(p, [["physician1","Physician"],["physician2","Physician"],["echoOperator","Echo"]]) + '</td>' +
-          '<td>' + report + reportEyeBtn(p) + fuSummaryBtn(p) + folderLinkBtn(p) + '</td>' +
-          /* 21 Oct 2026, the owner: a locked report cannot be changed, so it has no Open report -
-             the eye still shows the filed PDF. */
-          '<td>' + (p.fileLocked ? "" : '<button class="btn btn-sm" data-fu-open="' + p.id + '">Open report</button>') + '</td></tr>';
+          /* 9 Nov 2026, the owner: each evaluation file and the folder in a column of their own,
+             and every action named in words beside its icon. */
+          '<td>' + filesCell(p) + '</td>' +
+          '<td>' + report + '<div class="act-row">' + reportEyeBtn(p) + fuSummaryBtn(p) + '</div></td>' +
+          /* 21 Oct 2026, the owner: a locked report cannot be changed, so it has no edit button -
+             the eye still shows the filed PDF. A pencil since 9 Nov 2026. */
+          '<td>' + editReportBtn(p) + '</td></tr>';
       }).join("") +
       '</tbody></table></div>' +
       '<div class="hint" style="margin-top:8px">Serial numbers are the units confirmed as ' +
@@ -36405,11 +36561,7 @@ VIEWS.followup = {
     wireReportEyes();
     $$("[data-fu-sum]").forEach(b => b.onclick = () => openSummary(b.dataset.fuSum));
     $$("[data-fu-sum-up]").forEach(b => b.onclick = () => chooseSummaryWay(b.dataset.fuSumUp));
-    $$("[data-fu-open]").forEach(b => b.onclick = () => {
-      const p = patient(b.dataset.fuOpen);
-      claimCaseFile(p.id);
-      go("clinical", { SITEID:p.siteId, PID:p.id });
-    });
+    /* [data-fu-open] (the pencil) is handled by the capture listener beside editReportBtn. */
   }
 };
 
@@ -36420,14 +36572,71 @@ VIEWS.followup = {
 function fuSummaryBtn(p){
   const item = NAV.find(n => n.k === "procsummary");
   if(!p || !item || !navAllowed(item)) return "";
-  if(summaryOf(p)) return '<button class="btn btn-sm btn-eye" data-fu-sum="' + p.id + '" ' +
+  if(summaryOf(p)) return '<button class="btn btn-sm btn-eye lbl" data-fu-sum="' + p.id + '" ' +
     'title="Open the procedure summary" aria-label="Open the procedure summary for ' + esc(p.patientCode) + '">' +
-    icon("case") + '</button>';
-  if(summaryUploadable(p)) return '<button class="btn btn-sm btn-eye" data-fu-sum-up="' + p.id + '" ' +
+    icon("case") + '<span>Summary</span></button>';
+  if(summaryUploadable(p)) return '<button class="btn btn-sm btn-eye lbl" data-fu-sum-up="' + p.id + '" ' +
     'title="No procedure summary yet - fill it in or upload it" aria-label="Add the procedure summary for ' + esc(p.patientCode) + '">' +
-    icon("case") + '</button>';
+    icon("case") + '<span>Add summary</span></button>';
   return "";
 }
+
+/* EDIT THE REPORT - a pencil (9 Nov 2026, the owner: "Open report" did not say it opens the
+   report for editing). Never on a locked report. Handled in the capture phase, so on
+   Subject Overview the row underneath does not also open. */
+function editReportBtn(p){
+  if(!p || p.fileLocked) return "";
+  return '<button class="btn btn-sm btn-eye lbl" data-fu-open="' + p.id + '" ' +
+    'title="Edit the procedure report" aria-label="Edit the procedure report of ' + esc(p.patientCode) + '">' +
+    icon("pencil") + '<span>Edit</span></button>';
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("[data-fu-open]");
+  if(!b) return;
+  e.stopPropagation(); e.preventDefault();
+  const p = patient(b.dataset.fuOpen);
+  if(!p) return;
+  claimCaseFile(p.id);
+  go("clinical", { SITEID:p.siteId, PID:p.id });
+}, true);
+
+/* THE EVALUATION FILES, ONE BUTTON EACH (9 Nov 2026, the owner), on Subject Overview and
+   Follow up: CT report, 3D model, pliable model, Road Map, patient presentation, and the
+   folder. A stage with files opens the viewer on its first one. A stage the subject has
+   already passed with nothing filed is shown greyed and does nothing; a stage not yet
+   reached is not shown at all. */
+const FILE_CHIPS = [["ct","CT","CT report"], ["model3d","3D","3D model images"],
+  ["flexible","Pliable","Pliable model images"], ["fluoro","Road map","Road Map"],
+  ["approvals","PPT","Patient presentation"]];
+function stagePassed(p, k){
+  if(isPostProcedure(p)) return true;
+  const i = ANAT_STAGES.findIndex(s => s.k === k);
+  /* Passed = this stage, or any stage after it, is settled. */
+  return ANAT_STAGES.slice(i).some(s => anatDone(((p.anat || {})[s.k] || {}).status));
+}
+function filesCell(p){
+  if(!p || !canSeeReport() || isExternalUser()) return "";
+  const chips = FILE_CHIPS.map(([k, short, long]) => {
+    const files = anatFilesOf(p, k);
+    if(files.length){
+      return '<button class="btn btn-sm file-chip" data-fchip="' + esc(p.id) + '|' + esc(files[0].id) + '" ' +
+        'title="Open the ' + esc(long) + ' (' + files.length + ' file' + (files.length > 1 ? "s" : "") + ')">' +
+        esc(short) + (files.length > 1 ? ' <small>×' + files.length + '</small>' : "") + '</button>';
+    }
+    if(!stagePassed(p, k)) return "";
+    return '<span class="file-chip off" title="' + esc(long) + ' — nothing filed">' + esc(short) + '</span>';
+  }).join("");
+  const folder = folderLinkBtn(p);
+  return (chips || folder) ? '<div class="act-row">' + chips + folder + '</div>' : '<span class="hint">—</span>';
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("[data-fchip]");
+  if(!b) return;
+  e.stopPropagation(); e.preventDefault();
+  const [pid, fid] = b.dataset.fchip.split("|");
+  const p = patient(pid);
+  if(p) openPatientFiles(p, fid);
+}, true);
 
 /* ======================================================= SHIPMENTS LOG ===
    Every shipment ever recorded, read as PAPERWORK rather than as movement.
@@ -37039,9 +37248,9 @@ function canSeeReport(){ return can("managePatients") || can("editAnatomical"); 
    an await is blocked as a pop-up by most browsers. */
 function folderLinkBtn(p){
   if(!S.backend || !canSeeReport() || isExternalUser() || !p) return "";
-  return '<button class="btn btn-sm btn-eye" data-sp-folder="' + p.id + '" ' +
+  return '<button class="btn btn-sm btn-eye lbl" data-sp-folder="' + p.id + '" ' +
     'title="Open the subject’s folder in SharePoint" ' +
-    'aria-label="Open the SharePoint folder for ' + esc(p.patientCode) + '">' + icon("folder") + '</button>';
+    'aria-label="Open the SharePoint folder for ' + esc(p.patientCode) + '">' + icon("folder") + '<span>Folder</span></button>';
 }
 async function openSharePointFolder(p, btn){
   if(btn) btn.disabled = true;
@@ -37069,10 +37278,10 @@ function reportEyeBtn(p){
      see and no eye. */
   const hasFiles = (p.anatFiles || []).length || (p.images || []).length;
   if(!isPostProcedure(p) && !hasFiles) return "";
-  return '<button class="btn btn-sm btn-eye" data-report-eye="' + p.id + '" ' +
-    'title="View the subject’s folder" ' +
-    'aria-label="View the folder for ' + esc(p.patientCode) + '">' +
-    icon("eye") + '</button>';
+  return '<button class="btn btn-sm btn-eye lbl" data-report-eye="' + p.id + '" ' +
+    'title="View the report and every file filed for this subject" ' +
+    'aria-label="View the files of ' + esc(p.patientCode) + '">' +
+    icon("eye") + '<span>View</span></button>';
 }
 
 /* Bound by every screen that draws a patient row. stopPropagation is load-bearing on
@@ -37309,7 +37518,7 @@ VIEWS.patients = {
       '</div>' +
       (!list.length ? '<div class="empty">No subjects in your scope.</div>' :
       '<div class="tbl-wrap"><table><thead><tr><th>Code</th><th>Site</th><th>Procedure date</th>' +
-        '<th>Unica</th><th>DS</th><th>Allocated</th><th>Time to/from procedure</th><th>Status</th><th>With</th><th>Procedure report</th><th></th>' +
+        '<th>Unica</th><th>DS</th><th>Allocated</th><th>Time to/from procedure</th><th>Status</th><th>With</th><th>Files</th><th>Procedure report</th><th></th>' +
         '</tr></thead><tbody>' +
       list.map(p => '<tr>' + patientRowCells(p) +
         '<td class="row" style="gap:5px">' +
