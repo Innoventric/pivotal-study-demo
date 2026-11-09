@@ -11951,6 +11951,7 @@ function stageOverrideProblem(p, key){
   if(!p) return { code:"NOT_FOUND", message:"No such subject." };
   if(p.fileLocked) return { code:"LOCKED", message:"This subject's file is locked." };
   if(p.cancelled && p.cancelled.is) return { code:"CANCELLED", message:"This subject has been stopped." };
+  if(p.hold && p.hold.is) return { code:"ON_HOLD", message:"This subject is on hold. Release the hold first." };
   if((key === "scheduling" || key === "order") && !stageComplete(p, stageByKey("approvals"))){
     return { code:"APPROVALS_FIRST", message:"Stage 8 (Eligibility & Approvals) must be finished before scheduling " +
       "and the product order. It cannot be skipped." };
@@ -12223,6 +12224,105 @@ function isPostProcedure(p){
 }
 function wasStopped(p){ return !!(p.cancelled && p.cancelled.is); }
 
+/* ==== HOLD AND CANCEL (9 Nov 2026, the owner) ==========================================
+   Two ways a subject leaves the working lists beside a disqualification (Screen Failure /
+   Withdrawn, which is unchanged):
+
+     HOLD    screening is paused - the subject is not complying, or an operational reason
+             stops screening being finished. p.hold = { is:true, category, reason, ... }.
+             Temporary: any internal user releases it, and the subject carries on from the
+             stage it had reached. While it holds, the subject is read-only (the owner: "to work
+             on him he must be returned to screening") and is out of the stuck rule.
+     CANCEL  it was decided not to implant the subject, for a reason that has nothing to do
+             with screening. p.cancelled = { is:true, kind:"CANCELLED", ... } - the same
+             field a disqualification writes, so everything that already treats a stopped
+             subject as stopped keeps doing so. It is NOT a screen failure: out of the
+             screen-failure rate, numerator and denominator (the owner), and listed on the Screen
+             Failure screen under its own label.
+
+   Both are asked for by any internal user and decided by a Manager or an App Admin (a
+   Manager or Admin asking applies it at once); both are any time until the procedure.
+   Both are written by the server alone (approval route and /api/patients/:id/hold|cancel),
+   never by a whole-subject save - caseService keeps the stored copy. These functions are
+   the one rule, read by the server, the page and the daily mail. */
+var HOLD_CATEGORIES = [
+  { k: "NON_COMPLIANCE", label: "Subject not complying" },
+  { k: "OPERATIONAL",    label: "Operational reason preventing screening" }
+];
+function holdCategoryLabel(k){
+  for(var i = 0; i < HOLD_CATEGORIES.length; i++) if(HOLD_CATEGORIES[i].k === k) return HOLD_CATEGORIES[i].label;
+  return "";
+}
+function isOnHold(p){ return !!(p && p.hold && p.hold.is); }
+function isCancelKind(p){ return !!(p && p.cancelled && p.cancelled.is && p.cancelled.kind === "CANCELLED"); }
+/* Why this subject cannot be put on hold / cancelled now, or null. kind: "HOLD" | "CANCEL". */
+function stopProblem(p, kind){
+  if(!p) return { code: "NOT_FOUND", message: "No such subject." };
+  if(p.fileLocked) return { code: "LOCKED", message: "This subject's file is locked." };
+  if(isPostProcedure(p) || p.submitted) return { code: "AFTER_PROCEDURE", message: "The procedure has already happened." };
+  if(p.cancelled && p.cancelled.is) return { code: "STOPPED", message: "This subject has already been stopped." };
+  if(kind === "HOLD" && isOnHold(p)) return { code: "ON_HOLD", message: "This subject is already on hold." };
+  return null;
+}
+function clip(v, n){ return String(v == null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n); }
+/* Where the subject stands, in words, for the record of a hold or a cancel. */
+function stageReached(p){
+  var started = p && p.anat && ANAT_STAGES.some(function(s){
+    return p.anat[s.k] && p.anat[s.k].status && p.anat[s.k].status !== "Not started";
+  });
+  if(!started) return "Clinical screening";
+  for(var i = 0; i < ANAT_STAGES.length; i++){
+    if(!stageComplete(p, ANAT_STAGES[i])) return "Stage " + ANAT_STAGES[i].n + ": " + ANAT_STAGES[i].label;
+  }
+  return "After the anatomical evaluation";
+}
+/* d = { category, reason, by, byName, at, approvedBy, approvedByName, approvedAt, requestId }
+   - written in place; returns p. The proposal of units is dropped (the units themselves are
+   released by the browser that applied it, which is the one holding them in memory). */
+function applyHold(p, d){
+  p.hold = { is: true, category: d.category, reason: clip(d.reason, 1000), stage: stageReached(p),
+    by: d.by || "", byName: d.byName || d.by || "", at: d.at,
+    approvedBy: d.approvedBy || d.by || "", approvedByName: d.approvedByName || d.byName || "",
+    approvedAt: d.approvedAt || d.at, requestId: d.requestId || "" };
+  if(p.anat && p.anat.order && Array.isArray(p.anat.order.proposed)) p.anat.order.proposed = [];
+  p.lastMovedAt = d.approvedAt || d.at;
+  return p;
+}
+/* Released by anybody internal (the owner). The episode goes to holdHistory; release counts as a
+   move, so the stuck clock starts again from the release rather than from before the hold. */
+function releaseHold(p, d){
+  if(!isOnHold(p)) return p;
+  var h = Object.assign({}, p.hold, { releasedBy: d.by || "", releasedByName: d.byName || d.by || "",
+    releasedAt: d.at, releaseNote: clip(d.note, 1000) });
+  p.holdHistory = (Array.isArray(p.holdHistory) ? p.holdHistory : []).concat([h]).slice(-50);
+  p.hold = { is: false };
+  p.lastMovedAt = d.at;
+  return p;
+}
+function applyCancel(p, d){
+  var when = d.approvedAt || d.at;
+  /* A cancelled subject is not also paused - the cancel is the stronger statement. */
+  if(isOnHold(p)) releaseHold(p, { by: d.approvedBy || d.by, byName: d.approvedByName || d.byName, at: when, note: "Cancelled" });
+  p.cancelled = { is: true, kind: "CANCELLED", reason: clip(d.reason, 1000), stage: stageReached(p),
+    by: d.byName || d.by || "", byEmail: d.by || "", at: String(when || "").slice(0, 10),
+    approvedBy: d.approvedByName || d.byName || "", approvedByEmail: d.approvedBy || d.by || "",
+    requestId: d.requestId || "" };
+  if(p.anat && p.anat.order && Array.isArray(p.anat.order.proposed)) p.anat.order.proposed = [];
+  p.status = "CANCELLED";
+  p.lastMovedAt = when;
+  return p;
+}
+/* Manager / App Admin only (the owner). The cancel is kept in cancelHistory; the status is left
+   for the browser to recompute from the stages, which only it can do. */
+function undoCancel(p, d){
+  if(!isCancelKind(p)) return p;
+  p.cancelHistory = (Array.isArray(p.cancelHistory) ? p.cancelHistory : []).concat([Object.assign({}, p.cancelled,
+    { undoneBy: d.by || "", undoneByName: d.byName || d.by || "", undoneAt: d.at, undoNote: clip(d.note, 1000) })]).slice(-50);
+  p.cancelled = { is: false, reason: "", by: "", at: "", stage: "" };
+  p.lastMovedAt = d.at;
+  return p;
+}
+
 function round1(n){ return Math.round(n * 10) / 10; }
 
 /* ============================ THE STUDY'S FOUR MEASURES ======================
@@ -12456,7 +12556,10 @@ function enteredScreening(p){
   return PT_FLOW.indexOf(p.status) > PT_FLOW.indexOf("CREATED") || isPostProcedure(p);
 }
 function screenFailure(patients){
-  var screened = studyCohort(patients).filter(enteredScreening);
+  /* A CANCEL (9 Nov 2026) is out of the rate entirely - not a failure, and not in the
+     denominator either: the decision not to implant had nothing to do with screening. */
+  var screened = studyCohort(patients).filter(enteredScreening)
+    .filter(function(p){ return !isCancelKind(p); });
   var failed = screened.filter(function(p){ return wasStopped(p) && !reachedEligible(p); });
   var stillOpen = screened.filter(function(p){ return !wasStopped(p) && !reachedEligible(p); });
   return { failed: failed.length, screened: screened.length, open: stillOpen.length,
@@ -12478,6 +12581,8 @@ function screenFailure(patients){
    registration date, or an end dated before the registration, is counted out and said. */
 function screeningEnd(p){
   if(!p) return null;
+  /* A cancel ended the subject, not screening - not measured (9 Nov 2026). */
+  if(isCancelKind(p)) return null;
   if(reachedEligible(p)) return { day: String(eligibleDate(p) || "").slice(0, 10), how: "ELIGIBLE" };
   if(wasStopped(p)) return { day: String((p.cancelled && p.cancelled.at) || "").slice(0, 10), how: "FAILED" };
   return null;
@@ -12542,7 +12647,8 @@ function screeningDurationTiles(sd){
    Control patients are not counted: they are not work in front of the team. */
 function dashboardCounts(patients){
   var all = patients.filter(function(p){ return !isControl(p); });
-  var live = function(p){ return !(p.cancelled && p.cancelled.is); };
+  /* On hold is paused, not being screened (9 Nov 2026). */
+  var live = function(p){ return !(p.cancelled && p.cancelled.is) && !isOnHold(p); };
   return {
     implanted: all.filter(isPostProcedure).length,
     screening: all.filter(function(p){
@@ -12893,7 +12999,7 @@ var STUCK_DAYS = 3;
    p.lastMovedAt when it differs. */
 function movementKey(p){
   if(!p) return "";
-  var parts = [String(p.status || ""), (p.cancelled && p.cancelled.is) ? "X" : ""];
+  var parts = [String(p.status || ""), (p.cancelled && p.cancelled.is) ? "X" : "", isOnHold(p) ? "H" : ""];
   SCREENING_STEPS.forEach(function(s){
     parts.push((p.screening && p.screening[s.k] && p.screening[s.k].done) ? "1" : "0");
   });
@@ -12926,6 +13032,8 @@ function lastMovedAt(p){
    procedure scheduled? */
 function inScreeningPhase(p){
   if(!p || (p.cancelled && p.cancelled.is) || p.status === "CANCELLED") return false;
+  /* On hold is paused on purpose - not stuck, and no day-3 alert (9 Nov 2026). */
+  if(isOnHold(p)) return false;
   if(isPostProcedure(p)) return false;
   var sched = ANAT_STAGES.filter(function(s){ return s.k === "scheduling"; })[0];
   if(sched && isControl(p) && stageComplete(p, sched)) return false;
@@ -12988,6 +13096,16 @@ var api = {
   isTreated: isTreated,
   isPostProcedure: isPostProcedure,
   wasStopped: wasStopped,
+  HOLD_CATEGORIES: HOLD_CATEGORIES,
+  holdCategoryLabel: holdCategoryLabel,
+  isOnHold: isOnHold,
+  isCancelKind: isCancelKind,
+  stopProblem: stopProblem,
+  stageReached: stageReached,
+  applyHold: applyHold,
+  releaseHold: releaseHold,
+  applyCancel: applyCancel,
+  undoCancel: undoCancel,
   round1: round1,
   implantMonth: implantMonth,
   monthAdd: monthAdd,
@@ -13774,6 +13892,9 @@ const PT_STATUS = {
   /* 2 Oct 2026: a stage found the patient not suitable, and nobody has decided yet. Derived
      like the rest, and not a step in PT_FLOW - the patient has not moved forward or back. */
   SUSPECTED:       { label:"Suspected unsuitable — decision needed", cls:"p-red" },
+  /* 9 Nov 2026: paused (p.hold). Derived for display, never stored - the stored status
+     stays where the pathway is, so a release carries on from there. */
+  ON_HOLD:         { label:"On hold",                            cls:"p-orange" },
   CANCELLED:       { label:"Cancelled",                          cls:"p-red"    }
 };
 
@@ -14543,6 +14664,7 @@ function siteCpm(siteId){
 }
 function stuckWith(p){
   if(!p.anat || p.status === "TREATED" || (p.cancelled && p.cancelled.is)) return null;
+  if(SM.isOnHold(p)) return null;            // paused on purpose (9 Nov 2026)
   const ctReady = p.screening && p.screening.ct && p.screening.ct.done;
   if(!ctReady){
     const cpm = siteCpm(p.siteId);
@@ -14571,6 +14693,7 @@ function myTasks(){
   for(const p of S.db.patients){
     if(!inPatientScope(p.siteId) || !p.anat) continue;
     if(p.cancelled && p.cancelled.is) continue;
+    if(SM.isOnHold(p)) continue;             // not anybody's task while paused (9 Nov 2026)
     const ctReady = p.screening && p.screening.ct && p.screening.ct.done;
     if(!ctReady) continue;
     for(const s of ANAT_STAGES){
@@ -15235,7 +15358,10 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                                  subject last moved and keeps the reasons, written only by
                                  POST /api/patients/:id/stuck-reason - without both, the
                                  screen would judge a reason against a stale move date */
-                              "lastMovedAt", "stuckReasons"];
+                              "lastMovedAt", "stuckReasons",
+                              /* hold and cancel (9 Nov 2026): written only by their own
+                                 routes and the SUBJECT_HOLD / SUBJECT_CANCEL approvals */
+                              "hold", "holdHistory", "cancelHistory"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -17175,6 +17301,17 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.9.0", date: "9 November 2026", groups: [
+    { h:"Hold and Cancel", items:[
+      "Two new buttons on the subject in <b>Subject Screening</b>, beside <b>Disqualify</b>. <b>Put on hold</b> pauses screening: the subject is not complying, or an operational reason stops screening being finished. <b>Cancel subject</b> records that the subject will not be implanted, for a reason that has nothing to do with screening.",
+      "Anybody in the company can ask; a <b>Manager or App Admin</b> approves or refuses — on the subject, or on <b>QA Approval</b>. They are emailed and alerted at once, and a request still waiting is at the top of their daily summary. When a Manager or App Admin asks, it applies at once.",
+      "A subject on hold is out of the daily summary, the task lists and the stuck alerts, and units reserved for it are released. It can be read but not changed until somebody presses <b>Release the hold</b> — anybody in the company can — and screening carries on from where it stopped.",
+      "A cancelled subject is <b>not a screen failure</b> and is not counted in the screen-failure rate. It is listed on <b>Screen Failure</b> as <b>Cancelled — not implanted</b>; a Manager or App Admin can bring it back."
+    ] },
+    { h:"Home and Subject Overview", items:[
+      "Subjects <b>on hold</b>, <b>cancelled</b> and <b>disqualified</b> are no longer listed by default. Tick them under <b>Show also</b> to bring each back; the number beside each tick says how many there are."
+    ] }
+  ] },
   { version: "3.8.0", date: "8 November 2026", groups: [
     { h:"Rework, in a new order", items:[
       "<b>Send for rework</b> (App Admin or QA, with a reason) takes a unit out of live stock where it stands — expired units too. The dialog lists the rest of the same lot still in stock, at every location, to send with it. A unit that is not at head office is asked back there (or to a place you choose), and its site is told; from then on it can travel only to head office.",
@@ -20901,6 +21038,7 @@ const isPostProcedure    = SM.isPostProcedure;
    display, which keeps the record honest and the screen current at the same time. */
 function displayStatus(p){
   if(isTreated(p) || p.status === "CANCELLED") return p.status;
+  if(SM.isOnHold(p)) return "ON_HOLD";       // 9 Nov 2026: derived, never stored
   return procedurePerformed(p) ? "PERFORMED" : p.status;
 }
 function treatedPatients(){ return allPatients().filter(p => isPostProcedure(p) && inPatientScope(p.siteId)); }
@@ -21648,7 +21786,9 @@ document.addEventListener("click", e => {
 /* Filter state for the three widgets. Kept on one object so a re-render preserves it. */
 let HOME = {
   pStatus:null,
-  pf:{ site:"", phys:"", size:"", from:"", to:"", screen:"", proc:"" },
+  /* show (9 Nov 2026, the owner): subjects on hold, cancelled and disqualified are left out of
+     Home and the Overview unless ticked back in. */
+  pf:{ site:"", phys:"", size:"", from:"", to:"", screen:"", proc:"", show:{ hold:false, cancel:false, disq:false } },
   df:{ site:"", size:"" },
   sf:{ site:"", date:"", status:"" }
 };
@@ -21804,7 +21944,9 @@ function patientStatusWidget(){
   const sites = visiblePatientSites();
   const physicians = [...new Set(homePatients().map(patPhysician).filter(Boolean))].sort();
   const f = HOME.pf;
+  const shownStop = p => { const k = stopClass(p); return !k || !!(f.show || {})[k]; };
   const list = homePatients().filter(p => {
+    if(!shownStop(p)) return false;
     if(f.site && p.siteId !== f.site) return false;
     if(f.phys && patPhysician(p) !== f.phys) return false;
     if(f.size && patImplant(p) !== f.size) return false;
@@ -21814,16 +21956,15 @@ function patientStatusWidget(){
        they used to fall out of this filter the moment it did. */
     if(f.proc === "Scheduled" && !procedureBooked(p)) return false;
     if(f.proc === "Completed" && p.status !== "TREATED") return false;
-    if(f.proc === "Cancelled" && !(p.cancelled && p.cancelled.is)) return false;
     if(f.from && (!p.procedureDate || String(p.procedureDate).slice(0,10) < f.from)) return false;
     if(f.to && (!p.procedureDate || String(p.procedureDate).slice(0,10) > f.to)) return false;
     return true;
   });
-  const statusOf = p => (p.cancelled && p.cancelled.is) ? "CANCELLED" : p.status;
+  const statusOf = p => (p.cancelled && p.cancelled.is) ? "CANCELLED" : SM.isOnHold(p) ? "ON_HOLD" : p.status;
   /* TREATED is absent from the chips because it is absent from the list: those patients
      are on the Follow up screen. A chip that can only ever read zero is worse than no
      chip - it invites a click that shows nothing. */
-  const order = PT_FLOW.filter(k => k !== "TREATED" && k !== "PERFORMED").concat(["CANCELLED"]);
+  const order = PT_FLOW.filter(k => k !== "TREATED" && k !== "PERFORMED").concat(["ON_HOLD", "CANCELLED"]);
   const counts = {}; order.forEach(k => counts[k] = 0);
   list.forEach(p => { const st = statusOf(p); if(counts[st] == null) counts[st] = 0; counts[st]++; });
 
@@ -21832,8 +21973,17 @@ function patientStatusWidget(){
     selField("pf-phys","Physician", f.phys, [["","All"]].concat(physicians.map(x => [x, x]))) +
     selField("pf-size","Implant size", f.size, [["","All"]].concat(UNICA_SIZES.map(x => [x, "Unica " + x]))) +
     selField("pf-screen","Screening", f.screen, ["","Not started","In progress","Complete"]) +
-    selField("pf-proc","Procedure", f.proc, ["","Scheduled","Cancelled"]) +
-    dateField("pf-from","From", f.from) + dateField("pf-to","To", f.to) + '</div>';
+    selField("pf-proc","Procedure", f.proc, ["","Scheduled"]) +
+    dateField("pf-from","From", f.from) + dateField("pf-to","To", f.to) + '</div>' +
+    /* Out by default, each one back with a tick (9 Nov 2026, the owner). The count says how
+       many each tick would bring back, so nobody has to tick to find out. */
+    '<div class="row" style="gap:14px;margin:2px 0 6px;flex-wrap:wrap"><span class="hint">Show also:</span>' +
+      [["hold","On hold"],["cancel","Cancelled"],["disq","Disqualified"]].map(([k, l]) => {
+        const n = homePatients().filter(p => stopClass(p) === k).length;
+        return '<label class="check' + ((f.show || {})[k] ? " on" : "") + '" style="margin:0">' +
+          '<input type="checkbox" data-pfshow="' + k + '"' + ((f.show || {})[k] ? " checked" : "") + '>' +
+          '<span>' + l + ' <span class="hint">(' + n + ')</span></span></label>';
+      }).join("") + '</div>';
 
   const chips = '<div class="chip-wrap">' + order.filter(k => counts[k] > 0 || HOME.pStatus === k).map(k =>
     '<button class="stat-chip' + (HOME.pStatus === k ? " on" : "") + '" data-pstatus="' + k + '">' +
@@ -21903,6 +22053,19 @@ function wirePatientStatusWidget(){
   onSel("pf-size", v => HOME.pf.size = v);   onSel("pf-screen", v => HOME.pf.screen = v);
   onSel("pf-proc", v => HOME.pf.proc = v);   onSel("pf-from", v => HOME.pf.from = v);
   onSel("pf-to", v => HOME.pf.to = v);
+  $$("[data-pfshow]").forEach(c => c.onchange = () => {
+    HOME.pf.show = Object.assign({}, HOME.pf.show || {}, { [c.dataset.pfshow]: c.checked });
+    if(!c.checked && HOME.pStatus === (c.dataset.pfshow === "hold" ? "ON_HOLD" : "CANCELLED")) HOME.pStatus = null;
+    renderKeepingPlace();
+  });
+}
+/* Which of the three stopped kinds the Overview's "Show also" ticks govern (9 Nov 2026),
+   or "" for a subject in the pathway. */
+function stopClass(p){
+  if(SM.isCancelKind(p)) return "cancel";
+  if((p.cancelled && p.cancelled.is) || p.status === "CANCELLED") return "disq";
+  if(SM.isOnHold(p)) return "hold";
+  return "";
 }
 
 /* How far along a patient is, as a number, so a list can be ordered by it. PT_FLOW is
@@ -23091,7 +23254,9 @@ function applyLabelChangeLocally(r, note){
 const APPROVAL_KINDS = {
   FIFO_OVERRIDE:      { label:"FIFO override",      approvers:["ADMIN"] },
   SCREENING_OVERRIDE: { label:"Screening override", approvers:["ADMIN","MANAGER"] },
-  STAGE_OVERRIDE:     { label:"Stage override",     approvers:["ADMIN","MANAGER","QA"] }
+  STAGE_OVERRIDE:     { label:"Stage override",     approvers:["ADMIN","MANAGER","QA"] },
+  SUBJECT_HOLD:       { label:"Subject on hold",    approvers:["ADMIN","MANAGER"] },
+  SUBJECT_CANCEL:     { label:"Cancel subject",     approvers:["ADMIN","MANAGER"] }
 };
 function approvals(){ return (S.db && Array.isArray(S.db.approvals)) ? S.db.approvals : []; }
 function myEmailLc(){ return String((S.me && S.me.email) || "").trim().toLowerCase(); }
@@ -23143,6 +23308,8 @@ async function decideApproval(r, approve, note){
     if(out.audit) S.db.logs.unshift(out.audit);
     /* A screening override is written on the subject by the server; take its copy. */
     if(out.patient) mergePatient(out.patient, { authoritative:true });
+    /* A hold or a cancel (9 Nov 2026): the units go back once it is on the record. */
+    if(approve && out.patient && STOP_BY_APPROVAL[r.kind]) await afterStopApplied(patient(out.patient.id), STOP_BY_APPROVAL[r.kind]);
     return out;
   }
   r.status = approve ? "APPROVED" : "REJECTED";
@@ -23154,6 +23321,16 @@ async function decideApproval(r, approve, note){
       incomplete:(r.subject || {}).incomplete || [], approvedBy:S.me.name, approvedAt:nowISO(), requestId:r.requestId };
     sp.status = recomputeWorkflow(sp);
     r.status = "USED";
+  }
+  const sst = approve && STOP_BY_APPROVAL[r.kind] ? patient((r.subject || {}).patientId || r.subjectKey) : null;
+  if(sst){
+    const kind = STOP_BY_APPROVAL[r.kind];
+    const d = { category:(r.subject || {}).category || "", reason:r.reason, by:r.requestedBy,
+      byName:r.requestedByName || r.requestedBy, at:r.requestedAt, approvedBy:myEmailLc(), approvedByName:S.me.name,
+      approvedAt:nowISO(), requestId:r.requestId };
+    if(kind === "HOLD") SM.applyHold(sst, d); else SM.applyCancel(sst, d);
+    r.status = "USED";
+    await afterStopApplied(sst, kind);
   }
   const so = approve && r.kind === "STAGE_OVERRIDE" ? patient((r.subject || {}).patientId) : null;
   if(so){
@@ -25130,7 +25307,7 @@ VIEWS.screening = {
           : '<div class="hint">Part of the study. Switchable at any stage.</div>') +
       '</div>' +
       '<div><label class="lbl-sm">Workflow status</label><div style="margin-top:5px">' +
-        pill(PT_STATUS, p.status) +
+        pill(PT_STATUS, SM.isOnHold(p) ? "ON_HOLD" : p.status) +
         (p.cancelled && p.cancelled.is
           ? ' <span class="hint">stopped during ' + esc(p.cancelled.stage || "screening") + '</span>' : "") +
       '</div></div></div>';
@@ -25146,7 +25323,16 @@ VIEWS.screening = {
     if(rec.altSize) h += '<div class="hint">Alternative size on record: ' + esc(rec.altSize) + '</div>';
     h += '</div></div>';
 
-    if(p.cancelled && p.cancelled.is){
+    if(SM.isCancelKind(p)){
+      const c = p.cancelled;
+      h += '<div class="warn"><b>This subject was cancelled — it will not be implanted.</b> ' +
+        'The reason has nothing to do with screening, so it is not a screen failure. ' + esc(c.reason) +
+        ' — asked by ' + esc(c.by) + (c.approvedBy && c.approvedBy !== c.by ? ', approved by ' + esc(c.approvedBy) : '') +
+        ', ' + esc(fmtDate(c.at)) + (c.stage ? ', at ' + esc(c.stage) : '') + '.' +
+        (mayDecideStop() && !p.fileLocked
+          ? ' <button class="btn" data-uncancel="' + esc(p.id) + '">Bring the subject back</button>' : "") +
+        '</div>';
+    }else if(p.cancelled && p.cancelled.is){
       const c = p.cancelled;
       const kindWord = c.kind === "SCREEN_FAILURE" ? "a screen failure"
                      : c.kind === "WITHDRAWN" ? "withdrawn after being declared eligible" : "";
@@ -25159,14 +25345,26 @@ VIEWS.screening = {
           ? ' <button class="btn" id="scr-uncancel">Resume this subject</button>' : "") +
         '</div>';
     }else{
-      h += suitabilityBanner(p);
-      h += stuckBanner(p);
-      if(mayDisqualify(p)){
-        h += '<div class="row" style="justify-content:flex-end;margin:-4px 0 10px">' +
-          '<button class="btn btn-sm btn-danger" data-disq="' + esc(p.id) + '">Disqualify subject</button>' +
-          '<span class="hint">With a category and a reason. Before Eligible it is a screen failure.</span></div>';
+      h += holdBanner(p);
+      h += stopRequestBanner(p);
+      if(!SM.isOnHold(p)){
+        h += suitabilityBanner(p);
+        h += stuckBanner(p);
+      }
+      const stopBtns = (mayAskStop(p, "HOLD") ? '<button class="btn btn-sm" data-askhold="' + esc(p.id) + '">Put on hold</button>' : '') +
+        (mayAskStop(p, "CANCEL") ? '<button class="btn btn-sm" data-askcancel="' + esc(p.id) + '">Cancel subject</button>' : '') +
+        (mayDisqualify(p) ? '<button class="btn btn-sm btn-danger" data-disq="' + esc(p.id) + '">Disqualify subject</button>' : '');
+      if(stopBtns){
+        h += '<div class="row" style="justify-content:flex-end;margin:-4px 0 10px;gap:6px">' + stopBtns + '</div>' +
+          '<div class="hint" style="text-align:right;margin:-6px 0 10px">Hold: paused, not complying or an operational reason. ' +
+          'Cancel: will not be implanted, a reason unrelated to screening. Disqualify: screening found it — a screen failure before Eligible.</div>';
       }
     }
+    /* ON HOLD = READ-ONLY (9 Nov 2026, the owner: "to work on him he must be returned to
+       screening"). Everything below is drawn as it is, inside a disabled fieldset, so the
+       record can be read and nothing can be changed until the hold is released. The server
+       refuses the change too (caseService, ON_HOLD). */
+    const lockFrom = SM.isOnHold(p) ? h.length : -1;
 
     /* ---- Clinical screening ---- */
     const scrDone = SCREENING_STEPS.filter(s => p.screening[s.k].done).length;
@@ -25270,6 +25468,10 @@ VIEWS.screening = {
           anatStageHtml(p, ANAT_STAGES.find(s => s.k === "fluoro"), ctReady)
         : '') +
     '</div></div>';
+    if(lockFrom >= 0){
+      h = h.slice(0, lockFrom) + '<fieldset disabled class="held-lock" style="border:0;padding:0;margin:0;min-width:0;opacity:.75">' +
+        h.slice(lockFrom) + '</fieldset>';
+    }
     return h;
   },
 
@@ -25902,6 +26104,8 @@ function requestStageDoneMail(p, stage){
    what the patient was stopped for, because the record itself is cleared. */
 function resumePatient(p){
   if(!p || !can("disqualifyPatient") || p.fileLocked) return;
+  /* A CANCEL is a Manager's or App Admin's to undo, through the server (9 Nov 2026). */
+  if(SM.isCancelKind(p)) return askUncancel(p);
   const was = p.cancelled || {};
   p.cancelled = { is:false, reason:"", by:"", at:"", stage:"" };
   p.status = recomputeWorkflow(p);
@@ -25911,6 +26115,187 @@ function resumePatient(p){
       (was.category ? " (" + disqCategoryLabel(was.category) + ")" : "") + ": " + (was.reason || "") });
   commit(); schedulePatientSave(p); renderKeepingPlace();
 }
+
+/* ==== HOLD AND CANCEL (9 Nov 2026, the owner) ===========================================
+   The rule and the record are studyMeasures (stopProblem / applyHold / applyCancel /
+   releaseHold / undoCancel); the server is the authority (POST /api/patients/:id/hold,
+   /cancel, /hold-release, /uncancel and the SUBJECT_HOLD / SUBJECT_CANCEL approvals). the owner:
+   any internal user asks, a Manager or App Admin decides (and one of them asking applies it
+   at once); any internal user releases a hold; a Manager or App Admin undoes a cancel; units
+   held for the subject go back the moment either is on the record; both any time until the
+   procedure. */
+const STOP_ASK_ROLES = ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"];
+const STOP_DECIDE_ROLES = ["ADMIN","MANAGER"];
+const STOP_BY_APPROVAL = { SUBJECT_HOLD:"HOLD", SUBJECT_CANCEL:"CANCEL" };
+const STOP_APPROVAL = { HOLD:"SUBJECT_HOLD", CANCEL:"SUBJECT_CANCEL" };
+function mayDecideStop(){ return !isExternalUser() && myRoles().some(r => STOP_DECIDE_ROLES.includes(r)); }
+function mayAskStop(p, kind){
+  return !!p && !isExternalUser() && myRoles().some(r => STOP_ASK_ROLES.includes(r)) &&
+    !SM.stopProblem(p, kind) && !openApproval(STOP_APPROVAL[kind], p.id);
+}
+function holdBanner(p){
+  if(!SM.isOnHold(p)) return "";
+  const h = p.hold;
+  return '<div class="warn"><b>On hold — ' + esc(SM.holdCategoryLabel(h.category)) + '.</b> ' + esc(h.reason) +
+    '<div class="hint">Asked by ' + esc(h.byName || h.by) +
+      (h.approvedByName && h.approvedByName !== h.byName ? ', approved by ' + esc(h.approvedByName) : '') +
+      ' · since ' + esc(fmtTs(h.approvedAt || h.at)) + (h.stage ? ' · at ' + esc(h.stage) : '') +
+      '. Out of the daily list and the Overview. Nothing below can be changed until the hold is released.</div>' +
+    (!p.fileLocked && !isExternalUser() && myRoles().some(r => STOP_ASK_ROLES.includes(r))
+      ? '<div class="row" style="margin-top:8px"><button class="btn btn-sm btn-primary" data-holdrelease="' + esc(p.id) + '">' +
+        'Release the hold — back to screening</button></div>' : '') + '</div>';
+}
+/* A hold or cancel waiting for a decision: who asked and why, and the buttons for whoever
+   may act on it - Approve / Refuse for a Manager or App Admin, Withdraw for the asker. */
+function stopRequestBanner(p){
+  return ["SUBJECT_HOLD","SUBJECT_CANCEL"].map(kind => {
+    const r = approvals().find(x => x.kind === kind && x.subjectKey === p.id && x.status === "PENDING");
+    if(!r) return "";
+    const mine = String(r.requestedBy || "").toLowerCase() === myEmailLc();
+    return '<div class="info"><b>' + (kind === "SUBJECT_HOLD" ? "Hold requested" : "Cancel requested") +
+      ' — waiting for a Manager or App Admin.</b> ' +
+      (kind === "SUBJECT_HOLD" && r.subject && r.subject.categoryLabel ? esc(r.subject.categoryLabel) + ': ' : '') +
+      esc(r.reason || "") + '<div class="hint">Asked by ' + esc(r.requestedByName || r.requestedBy) + ' · ' + esc(fmtTs(r.requestedAt)) + '</div>' +
+      '<div class="row" style="margin-top:8px;gap:6px">' +
+        (mayDecideApproval(r) ? '<button class="btn btn-sm btn-primary" data-aprok="' + esc(r.requestId) + '">Approve</button>' +
+          '<button class="btn btn-sm btn-danger" data-aprno="' + esc(r.requestId) + '">Refuse</button>' : '') +
+        (mine ? '<button class="btn btn-sm" data-aprwd="' + esc(r.requestId) + '">Withdraw</button>' : '') +
+      '</div></div>';
+  }).join("");
+}
+function openStopDialog(p, kind){
+  if(!mayAskStop(p, kind)) return;
+  const decide = mayDecideStop();
+  const hold = kind === "HOLD";
+  modal((hold ? "Put on hold — " : "Cancel subject — ") + p.patientCode,
+    (hold
+      ? '<p>Screening is paused. The subject leaves the daily list and the Overview, any units held for them are ' +
+        'released, and nothing can be changed on the subject until somebody releases the hold.</p>'
+      : '<p><b>The subject will not be implanted</b>, for a reason that has nothing to do with screening. It is not a ' +
+        'screen failure and is not counted in the screen-failure rate. Units held for the subject are released. ' +
+        '(If screening found the subject unsuitable, use <b>Disqualify</b> instead.)</p>') +
+    (hold ? '<div class="field"><label class="req" for="stp-cat">Why — category</label><select id="stp-cat">' +
+        '<option value="">— choose —</option>' + SM.HOLD_CATEGORIES.map(c => '<option value="' + c.k + '">' + esc(c.label) + '</option>').join("") +
+      '</select></div>' : '') +
+    '<div class="field"><label class="req" for="stp-why">Why — in words</label>' +
+      '<textarea id="stp-why" maxlength="1000"></textarea></div>' +
+    '<div class="hint">' + (decide ? 'You are a Manager or App Admin, so this applies at once.'
+      : 'A Manager or App Admin decides; they are mailed now.') + '</div>' + whyBox("stp-err"),
+    '<div class="row"><button class="btn ' + (hold ? "btn-primary" : "btn-danger") + '" id="stp-go">' +
+      (decide ? (hold ? "Put on hold" : "Cancel the subject") : "Send the request") + '</button>' +
+      '<button class="btn" data-close="1">Back</button></div>');
+  $("#stp-go").onclick = async () => {
+    const category = hold ? $("#stp-cat").value : "";
+    const reason = ($("#stp-why").value || "").replace(/\s+/g, " ").trim();
+    if(hold && !category) return showWhy("stp-err", "Choose why the subject goes on hold.");
+    if(reason.length < 5) return showWhy("stp-err", "Say why in words — it is what the next reader of this record will see.");
+    const go = $("#stp-go"); go.disabled = true;
+    try{
+      const out = await sendSubjectStop(p, kind, { category, reason });
+      closeModal(); renderNav(); renderKeepingPlace();
+      toast(out.applied ? p.patientCode + (hold ? " is on hold." : " is cancelled.")
+        : out.existing ? "A request for this subject is already waiting." : "Sent. A Manager or App Admin decides.", "good");
+    }catch(e){ go.disabled = false; showWhy("stp-err", e.message || "The server refused that."); }
+  };
+}
+async function sendSubjectStop(p, kind, input){
+  if(S.backend){
+    const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/" + (kind === "HOLD" ? "hold" : "cancel"), input);
+    if(out.request) putApproval(out.request);
+    if(out.audit) S.db.logs.unshift(out.audit);
+    if(out.patient){ mergePatient(out.patient, { authoritative:true }); await afterStopApplied(p, kind); }
+    return out;
+  }
+  /* Standalone: the same rule, written here. */
+  if(mayDecideStop()){
+    const d = Object.assign({ by:myEmailLc(), byName:S.me.name, at:nowISO() }, input);
+    if(kind === "HOLD") SM.applyHold(p, d); else SM.applyCancel(p, d);
+    logAction("Subject " + p.patientCode + (kind === "HOLD" ? " on hold" : " cancelled"), { locationId:p.siteId, highPriority:true,
+      stateChanges:(kind === "HOLD" ? "On hold — " + SM.holdCategoryLabel(input.category) : "Cancelled — will not be implanted"),
+      comments:"Reason: " + input.reason });
+    await afterStopApplied(p, kind);
+    return { applied:true };
+  }
+  const stage = SM.stageReached(p);
+  const summary = "Subject " + p.patientCode + " — " + (kind === "HOLD" ? "on hold: " + SM.holdCategoryLabel(input.category)
+    : "cancel (will not be implanted)") + " · at " + stage;
+  const request = await requestApproval({ kind:STOP_APPROVAL[kind], subjectKey:p.id, locationId:p.siteId, reason:input.reason,
+    subject:{ patientId:p.id, patientCode:p.patientCode, siteId:p.siteId, category:input.category,
+      categoryLabel:SM.holdCategoryLabel(input.category), stage, summary } });
+  return { requested:true, request };
+}
+/* Once a hold or a cancel is on the record: the status, and the units back. The server
+   releases a unit to a clinical role only once the stored record says so, which it now does. */
+async function afterStopApplied(p, kind){
+  if(!p) return;
+  if(kind === "CANCEL") p.status = "CANCELLED";
+  commit();
+  await releaseAfterClose(p, kind === "HOLD" ? "subject on hold" : "subject cancelled");
+}
+function askReleaseHold(p){
+  if(!SM.isOnHold(p)) return;
+  modal("Release the hold — " + p.patientCode,
+    '<p>The subject goes back to screening, where it stopped (' + esc(p.hold.stage || "") + '), and is back in the daily ' +
+      'list and the Overview. Units released when it went on hold are not reserved again by this.</p>' +
+    '<div class="field"><label for="hr-note">Note (optional)</label><input type="text" id="hr-note" maxlength="400"></div>' + whyBox("hr-err"),
+    '<div class="row"><button class="btn btn-primary" id="hr-go">Release the hold</button>' +
+      '<button class="btn" data-close="1">Back</button></div>');
+  $("#hr-go").onclick = async () => {
+    const note = ($("#hr-note").value || "").trim();
+    const go = $("#hr-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/hold-release", { note });
+        if(out.patient) mergePatient(out.patient, { authoritative:true });
+        if(out.audit) S.db.logs.unshift(out.audit);
+      }else{
+        SM.releaseHold(p, { by:myEmailLc(), byName:S.me.name, at:nowISO(), note });
+        logAction("Subject " + p.patientCode + " released from hold", { locationId:p.siteId, highPriority:true,
+          stateChanges:"On hold → back in screening", comments:note ? "Note: " + note : "" });
+      }
+      commit(); closeModal(); renderKeepingPlace();
+      toast(p.patientCode + " is back in screening.", "good");
+    }catch(e){ go.disabled = false; showWhy("hr-err", e.message || "The server refused that."); }
+  };
+}
+function askUncancel(p){
+  if(!SM.isCancelKind(p) || !mayDecideStop()) return;
+  modal("Bring back — " + p.patientCode,
+    '<p>Cancelled: ' + esc(p.cancelled.reason || "") + '. The subject goes back into the pathway at the stage it had reached.</p>' +
+    '<div class="field"><label class="req" for="uc-note">Why does the subject come back?</label>' +
+      '<input type="text" id="uc-note" maxlength="400"></div>' + whyBox("uc-err"),
+    '<div class="row"><button class="btn btn-primary" id="uc-go">Bring the subject back</button>' +
+      '<button class="btn" data-close="1">Back</button></div>');
+  $("#uc-go").onclick = async () => {
+    const note = ($("#uc-note").value || "").trim();
+    if(note.length < 5) return showWhy("uc-err", "Say why the subject comes back.");
+    const go = $("#uc-go"); go.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/uncancel", { note });
+        if(out.patient) mergePatient(out.patient, { authoritative:true });
+        if(out.audit) S.db.logs.unshift(out.audit);
+      }else{
+        const was = p.cancelled.reason;
+        SM.undoCancel(p, { by:myEmailLc(), byName:S.me.name, at:nowISO(), note });
+        logAction("Subject " + p.patientCode + " brought back after a cancel", { locationId:p.siteId, highPriority:true,
+          stateChanges:"Cancelled → back in the pathway", comments:"Note: " + note + " | Was cancelled: " + was });
+      }
+      /* The status comes back from the stages - only the browser can work that out. */
+      p.status = recomputeWorkflow(p);
+      commit(); schedulePatientSave(p); closeModal(); renderKeepingPlace();
+      toast(p.patientCode + " is back in the pathway.", "good");
+    }catch(e){ go.disabled = false; showWhy("uc-err", e.message || "The server refused that."); }
+  };
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-askhold],[data-askcancel],[data-holdrelease],[data-uncancel]");
+  if(!t) return;
+  if(t.dataset.askhold) openStopDialog(patient(t.dataset.askhold), "HOLD");
+  else if(t.dataset.askcancel) openStopDialog(patient(t.dataset.askcancel), "CANCEL");
+  else if(t.dataset.holdrelease) askReleaseHold(patient(t.dataset.holdrelease));
+  else if(t.dataset.uncancel) askUncancel(patient(t.dataset.uncancel));
+});
 
 /* ---- "NOT SUITABLE" OPENS A DISCUSSION (2 Oct 2026, the owner) -----------------------
    Choosing Not suitable used to change nothing at all: no reason was asked, nobody was
@@ -35219,6 +35604,7 @@ let SF = { site:"", cat:"", kind:"", proto:"", from:"", to:"" };
 function sfKind(p){
   const c = p.cancelled || {};
   if(!c.is) return "NO_REASON";
+  if(c.kind === "CANCELLED") return "CANCELLED";     // 9 Nov 2026: not a screen failure
   if(c.kind === "SCREEN_FAILURE" || c.kind === "WITHDRAWN") return c.kind;
   return SM.reachedEligible(p) ? "WITHDRAWN" : "SCREEN_FAILURE";
 }
@@ -35256,6 +35642,7 @@ function sfRows(){
 const SF_KIND = {
   SCREEN_FAILURE: { label:"Screen failure", cls:"p-red" },
   WITHDRAWN:      { label:"Withdrawn after Eligible", cls:"p-orange" },
+  CANCELLED:      { label:"Cancelled — not implanted", cls:"p-grey" },
   NO_REASON:      { label:"Cancelled — no reason recorded", cls:"p-grey" }
 };
 /* ============================================ THE PROCEDURE SUMMARY (CLD-U-104)
@@ -35788,6 +36175,7 @@ VIEWS.screenfail = {
       '<div class="calc"><small>…of which anatomical</small><b>' + anat + '</b></div>' +
       '<div class="calc"><small>Withdrawn after Eligible</small><b>' + n("WITHDRAWN") + '</b>' +
         (n("NO_REASON") ? '<small>' + n("NO_REASON") + ' cancelled with no reason recorded</small>' : '') +
+        (n("CANCELLED") ? '<small>' + n("CANCELLED") + ' cancelled — not implanted, not in the rate</small>' : '') +
       '</div></div>';
     const filters = '<div class="filters">' +
       selField("sf2-site", "Site", SF.site, locationOptions(sites, SF.site, { head:"All sites" })) +
@@ -35809,6 +36197,7 @@ VIEWS.screenfail = {
             '<td><span class="pill ' + k.cls + '">' + esc(k.label) + '</span></td>' +
             '<td>' + (kind === "NO_REASON" ? '<span class="hint">Nothing recorded — the status ' +
                 'was set by hand.</span>'
+              : kind === "CANCELLED" ? '<b>Not related to screening</b><div>' + esc(c.reason || "") + '</div>'
               : '<b>' + (cat.k === "ANATOMY" ? "Anatomical" : "Other") + '</b>' +
                 (cat.k && cat.k !== "ANATOMY" ? ' — ' + esc(cat.label) : '') +
                 (cat.inferred ? ' <span class="hint">(inferred)</span>' : '') +
@@ -35820,7 +36209,9 @@ VIEWS.screenfail = {
             '<td><div class="row" style="gap:6px;margin:0">' + reportEyeBtn(p) +
               (kind === "NO_REASON" && mayDisqualify(p)
                 ? '<button class="btn btn-sm" data-disq="' + esc(p.id) + '">Record the reason</button>' : '') +
-              (kind !== "NO_REASON" && can("disqualifyPatient") && !p.fileLocked
+              (kind === "CANCELLED" && mayDecideStop() && !p.fileLocked
+                ? '<button class="btn btn-sm" data-uncancel="' + esc(p.id) + '">Bring back</button>' : '') +
+              (kind !== "NO_REASON" && kind !== "CANCELLED" && can("disqualifyPatient") && !p.fileLocked
                 ? '<button class="btn btn-sm" data-sfresume="' + esc(p.id) + '">Resume</button>' : '') +
             '</div></td></tr>';
         }).join("") + '</tbody></table></div>'
@@ -37084,7 +37475,7 @@ function patientFormRender(p, isNew){
       /* CANCELLED and SUSPECTED are not offered (2 Oct 2026): a patient is stopped with
          Disqualify, which asks why, and a suspected case is decided on the Screening screen.
          A patient already in one of them keeps it shown, so saving cannot silently move them. */
-      Object.keys(PT_STATUS).filter(k => !["CANCELLED","SUSPECTED"].includes(k) || k === p.status)
+      Object.keys(PT_STATUS).filter(k => k !== "ON_HOLD" && (!["CANCELLED","SUSPECTED"].includes(k) || k === p.status))
         .map(k => '<option value="' + k + '"' + (k === p.status ? " selected" : "") + '>' +
         esc(PT_STATUS[k].label) + '</option>').join("") + '</select>' +
       '<div class="hint">Tracked automatically; correcting it by hand is audit-logged. To stop a ' +
