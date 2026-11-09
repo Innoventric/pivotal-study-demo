@@ -12105,6 +12105,19 @@ function anatUnlocked(p, key){
   });
 }
 
+/* ---- A PRODUCT ORDER REQUEST CANCELLED (9 Nov 2026, the owner) --------------------------
+   An App Admin asks, a Manager or another App Admin approves, and the server writes
+   p.orderCancel (server-owned). The request leaves the shipment queue; stage 10 stays
+   done and units reserved for the subject stay reserved (the owner's answers). The order
+   itself is not touched, so updating it afterwards (stage 10, Update order) puts the
+   request back: the cancellation covers the order as it stood, counted by its updates. */
+function orderCancelled(p){
+  var c = p && p.orderCancel;
+  if(!c || !c.at) return false;
+  var o = (p.anat || {}).order || {};
+  return (c.updates | 0) === (Array.isArray(o.updates) ? o.updates.length : 0);
+}
+
 var api = {
   ANAT_STAGES: ANAT_STAGES,
   ANAT_MANDATORY: ANAT_MANDATORY,
@@ -12142,6 +12155,7 @@ var api = {
   applyStageOverride: applyStageOverride,
   ANAT_FILE_FOLDER: ANAT_FILE_FOLDER,
   anatFilesOf: anatFilesOf,
+  orderCancelled: orderCancelled,
   STAGE_FILE_RULES: STAGE_FILE_RULES,
   anatFileKind: anatFileKind,
   stageFileCount: stageFileCount,
@@ -15406,7 +15420,10 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               "lastMovedAt", "stuckReasons",
                               /* hold and cancel (9 Nov 2026): written only by their own
                                  routes and the SUBJECT_HOLD / SUBJECT_CANCEL approvals */
-                              "hold", "holdHistory", "cancelHistory"];
+                              "hold", "holdHistory", "cancelHistory",
+                              /* a cancelled product order request (9 Nov 2026): written
+                                 only by the REQUEST_CANCEL approval */
+                              "orderCancel"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -17346,6 +17363,13 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.11.0", date: "9 November 2026", groups: [
+    { h:"Cancelling a shipment request", items:[
+      "On <b>Requests &amp; Shipments</b>, an App Admin has a <b>Cancel request</b> button on every open request — a subject’s product order or a stock request. It asks for a reason and needs the approval of a <b>Manager or another App Admin</b>, on <b>QA Approval</b>; until then the row reads <b>Cancel awaiting approval</b>.",
+      "Once approved the request leaves the list, and the asker and the site’s warehouse managers are emailed. For a subject, stage 10 stays done and units already reserved stay reserved; updating the order later puts the request back.",
+      "An App Admin no longer has <b>Withdraw</b> on stock requests — cancelling goes through approval. Whoever raised a stock request can still withdraw their own."
+    ] }
+  ] },
   { version: "3.10.0", date: "9 November 2026", groups: [
     { h:"Evaluation files are required", items:[
       "A stage can no longer be completed without its files: <b>1. CT Measurements Report</b> needs the CT report as a <b>PDF</b>; <b>2. 3D Model Evaluation</b> and <b>6. Pliable model evaluation</b> need <b>at least 2 images</b> each (a PDF does not count); <b>7.</b> still needs its Road Map file.",
@@ -21269,6 +21293,9 @@ function orderRequests(){
     .filter(p => p.anat && p.anat.order &&
                  (p.anat.order.requestedBy || p.anat.order.productsConfirmed ||
                   nearProcedureShortfall(p)))
+    /* A request cancelled with approval (9 Nov 2026) is out of the queue until the order
+       is updated again. */
+    .filter(p => !AnatStages.orderCancelled(p))
     .map(p => {
       const o = p.anat.order, rec = currentRecommendation(p);
       const needs = productNeeds(p, rec);
@@ -21630,9 +21657,77 @@ function announceShipmentRequest(r){
    a queue. */
 function mayWithdrawRequest(r){
   if(!r || r.kind !== "STOCK") return false;
-  const mine = String(r.requestedBy || "").toLowerCase() ===
-               String((S.me && S.me.email) || "").toLowerCase();
-  return mine || myRoles().includes("ADMIN");
+  /* An App Admin cancels through Cancel request, with approval (9 Nov 2026, the owner). */
+  if(myRoles().includes("ADMIN")) return false;
+  return String(r.requestedBy || "").toLowerCase() ===
+         String((S.me && S.me.email) || "").toLowerCase();
+}
+
+/* ---- CANCEL A REQUEST, WITH APPROVAL (9 Nov 2026, the owner) ---------------------------
+   App Admin only, on every open request - a subject's product order (once it has been
+   sent) or a stock request. A reason; a Manager or ANOTHER App Admin approves (QA
+   Approval). Approved: the request leaves the queue; for a subject, stage 10 stays done
+   and reserved units stay reserved. The server writes the effect. */
+function mayCancelRequest(r){
+  return !!r && !isExternalUser() && myRoles().includes("ADMIN") &&
+         (r.kind === "STOCK" || (r.kind === "PATIENT" && r.raised));
+}
+function cancelRequestCell(r){
+  if(!mayCancelRequest(r)) return "";
+  const open = openApproval("REQUEST_CANCEL", r.ref);
+  if(open && open.status === "PENDING"){
+    return '<span class="pill p-orange" title="Asked by ' + esc(open.requestedByName || open.requestedBy) +
+      ': ' + esc(open.reason || "") + '">Cancel awaiting approval</span>';
+  }
+  return '<button class="btn btn-sm btn-danger" data-cancelreq="' + esc(r.ref) + '">Cancel request</button>';
+}
+function askCancelRequest(ref){
+  const row = allShipmentRequests().find(x => x.ref === ref);
+  if(!row) return toast("That request is no longer open.", "bad");
+  const what = row.kind === "PATIENT" ? "the product order request for " + row.id : "stock request " + row.id;
+  modal("Cancel this request",
+    '<p>Cancelling <b>' + esc(what) + '</b> to <b>' + esc(locName(row.siteId)) + '</b>.</p>' +
+    '<div class="note">A <b>Manager or another App Admin</b> has to approve it — on QA Approval. ' +
+      'Until then nothing changes. Once approved it leaves this list' +
+      (row.kind === "PATIENT" ? '; stage 10 stays done and units already reserved for the subject stay reserved' : '') +
+      '. You and the site’s warehouse managers are told.</div>' +
+    '<div class="field"><label class="req" for="cr-why">Why should it be cancelled</label>' +
+      '<input type="text" id="cr-why" maxlength="400" autocomplete="off"></div>' + whyBox("cr-err"),
+    '<div class="row"><button class="btn btn-danger" id="cr-go">Ask for approval</button>' +
+    '<button class="btn" data-close="1">Keep it</button></div>');
+  $("#cr-go").onclick = async () => {
+    const reason = ($("#cr-why").value || "").trim();
+    if(reason.length < 5) return showWhy("cr-err", "Say why — the approver decides on what you write.");
+    const btn = $("#cr-go"); btn.disabled = true;
+    try{
+      if(S.backend){
+        const out = await api("POST", "/api/shipment-requests/cancel-request", { ref, reason });
+        putApproval(out.request);
+      }else{
+        await requestApproval({ kind:"REQUEST_CANCEL", subjectKey:ref, reason, locationId:row.siteId || "",
+          subject:{ key:ref, kind:row.kind, patientId:row.patientId || "", requestId:row.requestId || "",
+                    summary:(row.kind === "PATIENT" ? "Product order request for " : "Stock request ") + row.id +
+                            " to " + locName(row.siteId) } });
+      }
+    }catch(e){ btn.disabled = false; return showWhy("cr-err", e.message || "The server refused it."); }
+    closeModal();
+    toast("Sent for approval to a Manager or another App Admin.", "good");
+    render();
+  };
+}
+/* Standalone mirror of the server's applyRequestCancel. */
+function applyRequestCancelHere(r){
+  const [kind, id] = String(r.subjectKey || "").split(/:(.+)/);
+  if(kind === "stock"){
+    const q = (S.db.shipmentRequests || []).find(x => x.requestId === id);
+    if(q) Object.assign(q, { status:"CANCELLED", cancelledBy:r.requestedBy, cancelledAt:nowISO(),
+      cancelReason:r.reason, cancelApprovedBy:myEmailLc(), cancelRequestId:r.requestId });
+  }else{
+    const p = patient(id);
+    if(p) p.orderCancel = { at:nowISO(), by:r.requestedBy, byName:r.requestedByName || r.requestedBy, reason:r.reason,
+      approvedBy:myEmailLc(), approvedByName:S.me.name, requestId:r.requestId,
+      updates:((((p.anat || {}).order || {}).updates) || []).length };
+  }
 }
 /* CANCELLED, NOT DELETED, and it asks why. A request that was raised and then answered
    another way is part of the record of what people were short of; a queue that can be
@@ -21833,12 +21928,13 @@ function allocateForm(patientId){
    handler written three times and forgotten on the fourth. */
 document.addEventListener("click", e => {
   const t = e.target && e.target.closest &&
-            e.target.closest("[data-newreq],[data-fulfil],[data-withdrawreq],[data-allocate]");
+            e.target.closest("[data-newreq],[data-fulfil],[data-withdrawreq],[data-cancelreq],[data-allocate]");
   if(!t) return;
   if(t.dataset.allocate) allocateForm(t.dataset.allocate);
   else if(t.hasAttribute("data-newreq")) askShipmentRequest();
   else if(t.dataset.fulfil) startShipmentFor(t.dataset.fulfil);
   else if(t.dataset.withdrawreq) askWithdrawRequest(t.dataset.withdrawreq);
+  else if(t.dataset.cancelreq) askCancelRequest(t.dataset.cancelreq);
 });
 
 /* Filter state for the three widgets. Kept on one object so a re-render preserves it. */
@@ -22357,6 +22453,7 @@ function shipmentRequestsWidget(opts){
               ? '<button class="btn btn-sm" data-withdrawreq="' + esc(r.requestId) +
                 '">Withdraw</button>'
               : '') +
+            cancelRequestCell(r) +
           '</div></td>' +
           '</tr>';
       }).join("") + '</tbody></table></div>'
@@ -23318,7 +23415,8 @@ const APPROVAL_KINDS = {
   SCREENING_OVERRIDE: { label:"Screening override", approvers:["ADMIN","MANAGER"] },
   STAGE_OVERRIDE:     { label:"Stage override",     approvers:["ADMIN","MANAGER","QA"] },
   SUBJECT_HOLD:       { label:"Subject on hold",    approvers:["ADMIN","MANAGER"] },
-  SUBJECT_CANCEL:     { label:"Cancel subject",     approvers:["ADMIN","MANAGER"] }
+  SUBJECT_CANCEL:     { label:"Cancel subject",     approvers:["ADMIN","MANAGER"] },
+  REQUEST_CANCEL:     { label:"Cancel shipment request", approvers:["ADMIN","MANAGER"] }
 };
 function approvals(){ return (S.db && Array.isArray(S.db.approvals)) ? S.db.approvals : []; }
 function myEmailLc(){ return String((S.me && S.me.email) || "").trim().toLowerCase(); }
@@ -23394,6 +23492,7 @@ async function decideApproval(r, approve, note){
     r.status = "USED";
     await afterStopApplied(sst, kind);
   }
+  if(approve && r.kind === "REQUEST_CANCEL"){ applyRequestCancelHere(r); r.status = "USED"; }
   const so = approve && r.kind === "STAGE_OVERRIDE" ? patient((r.subject || {}).patientId) : null;
   if(so){
     applyStageOverrideHere(so, { stageKey:(r.subject || {}).stageKey, reason:r.reason, dueDate:(r.subject || {}).dueDate,
