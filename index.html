@@ -12130,20 +12130,23 @@ function orderCancelled(p){
 
 /* WHO A SUBJECT'S TASKS BELONG TO (10 Nov 2026, the owner). The site's Responsible CPM, as
    set in Administration -> Locations, and nobody else: not "the last CPM who held an earlier
-   stage", which is what decided until v3.12.0. A site with none falls to the clinic
-   manager, who is the Responsible CPM recorded on the Innoventric HQ location (Chen, at the
-   time of writing) - held there so an App Admin changes it in the app, not in the code.
+   stage", which is what decided until v3.12.0. A site with none falls to the CLINIC
+   MANAGER (Chen, at the time of writing).
+   Since v3.13.0 (10 Nov 2026, the owner: "it is a role, not a site") the clinic manager is a
+   PERSON ticked "Clinic manager" on Administration -> Users - one internal user at most -
+   and no longer the Responsible CPM of the HQ location.
    Returns the stored value (a user id, which in served mode is the email), or "".
    One function, read by the page, the server and the daily mail. */
-function clinicManagerOf(locations){
-  var list = locations || [];
+function clinicManagerOf(users){
+  var list = users || [];
   for(var i = 0; i < list.length; i++){
-    var l = list[i];
-    if(l && l.type === "HQ" && String(l.cpmUserId || "").trim()) return String(l.cpmUserId).trim();
+    var u = list[i];
+    if(u && u.clinicManager === true && String(u.accessType || "").toUpperCase() !== "EXTERNAL")
+      return String(u.id || u.email || "").trim();   // served mode: id IS the email
   }
   return "";
 }
-function responsibleCpm(locations, siteId){
+function responsibleCpm(locations, siteId, users){
   var list = locations || [];
   for(var i = 0; i < list.length; i++){
     var l = list[i];
@@ -12153,7 +12156,7 @@ function responsibleCpm(locations, siteId){
       break;
     }
   }
-  return clinicManagerOf(list);
+  return clinicManagerOf(users);
 }
 
 var api = {
@@ -17507,12 +17510,18 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.13.0", date: "10 November 2026", groups: [
+    { h:"The clinic manager is set on the person", items:[
+      "<b>Administration → Users</b> has a new tick, <b>Clinic manager</b>. The person ticked takes every task of a hospital site that has no Responsible CPM. One person at a time: ticking somebody else moves it to them. It is shown as a green <b>Clinic manager</b> label beside their role.",
+      "It is no longer set on the Innoventric HQ location, which has no Responsible CPM field any more."
+    ]}
+  ]},
   { version: "3.12.0", date: "10 November 2026", groups: [
     { h:"The menu", items:[
       "<b>Clinical workflow</b> comes first, under Home, starting with <b>Subject Overview</b>. Then <b>Study Data</b> (Study Status, Subjects in follow up, Screen Failure, Control arm, Site Accountability Log), then <b>Logistics</b>, starting with <b>Stock Overview</b>."
     ]},
     { h:"Every task has an owner", items:[
-      "A task is the <b>site’s Responsible CPM</b>’s, as set in Administration → Locations — no longer the last CPM who held an earlier stage. A site with none goes to the <b>clinic manager</b>, set as the Responsible CPM of the Innoventric HQ location.",
+      "A task is the <b>site’s Responsible CPM</b>’s, as set in Administration → Locations — no longer the last CPM who held an earlier stage. A site with none goes to the <b>clinic manager</b>.",
       "A stage nobody was given is now shown, mailed and counted as that CPM’s task, under their name — never as “unassigned”.",
       "An <b>App Admin or a Manager</b> can give any task to somebody else: a <b>Change</b> button in the <b>With</b> column, every stage including <b>3. Model Printing</b> after the print request, and the procedure summary."
     ]},
@@ -26404,17 +26413,17 @@ function openDisqualifyDialog(p, opts){
    done, passing over any stage already set aside as Not required.
 
    SINCE 10 Nov 2026 (the owner) "the CPM" is the site's Responsible CPM and nobody else; a
-   site with none goes to the clinic manager (the HQ location's Responsible CPM). */
+   site with none goes to the clinic manager (ticked on Administration -> Users, v3.13.0). */
 const AUTO_ASSIGN_STAGES = ANAT_STAGES.map(s => s.k);
 /* Since 10 Nov 2026 (the owner) the CPM of a task is ONLY the site's Responsible CPM, else
-   the clinic manager on the HQ location - window.AnatStages.responsibleCpm, shared with
+   the clinic manager ticked on Administration -> Users - window.AnatStages.responsibleCpm, shared with
    the server and the daily mail. It used to be the last CPM who held an earlier stage.
    beforeKey is kept in the signature; it no longer changes the answer. */
 function patientCpm(p, beforeKey){
   return p ? taskCpm(p.siteId) : "";
 }
 function taskCpm(siteId){
-  const id = window.AnatStages.responsibleCpm(S.db.locations, siteId);
+  const id = window.AnatStages.responsibleCpm(S.db.locations, siteId, S.db.users);
   if(!id) return "";
   const u = user(id);
   return (u && u.email) || id;
@@ -38613,7 +38622,9 @@ VIEWS.admin = {
           (userExtraRoles(u).length
             ? ' <span class="pill p-blue">+ ' +
               esc(userExtraRoles(u).map(r => (ROLES[r] || {}).label || r).join(", ")) + '</span>'
-            : '') + '</td>' +
+            : '') +
+          (u.clinicManager ? ' <span class="pill p-green" title="Takes every task of a site with no Responsible CPM">Clinic manager</span>' : '') +
+          '</td>' +
         '<td>' + esc([u.locationId, userExtraRoles(u).length ? u.extraLocationId : null]
                        .filter(Boolean).map(locName).join(" · ") || "All locations") +
           /* The territory is part of the answer to "what can this person see", so it
@@ -38975,7 +38986,8 @@ async function loadAdminUserRecords(){
       const u = (S.db.users || []).find(x => String(x.email || x.id).toLowerCase() === String(f.email).toLowerCase());
       if(u) Object.assign(u, { accessType:f.accessType, extraRoles:f.extraRoles || [], geography:f.geography || [],
                                extraLocationId:f.extraLocationId || null, screenUpdate:f.screenUpdate === true,
-                               stageUpdate:f.stageUpdate === true, stuckUpdate:f.stuckUpdate === true });
+                               stageUpdate:f.stageUpdate === true, stuckUpdate:f.stuckUpdate === true,
+                               clinicManager:f.clinicManager === true });
     }
   }catch(e){ /* the form still opens; it simply cannot show what it was not sent */ }
 }
@@ -39111,6 +39123,18 @@ function userForm(u){
       '" style="margin:0"><input type="checkbox" id="u-stu"' + (u.stuckUpdate ? " checked" : "") +
       '><span><b>Stuck Update</b> — send me the daily email with the subjects stuck in screening, at every site</span></label></div>' +
     '<div class="hint" style="margin:-6px 0 12px">App Admins, Managers and QA receive both whether or not these are ticked.</div>' +
+    /* "Clinic manager" (v3.13.0, 10 Nov 2026, the owner: a role on the person, not a site). Takes
+       every task of a hospital site that has no Responsible CPM - anatStages.responsibleCpm.
+       One person: ticking somebody moves it to them. Never a partner account. */
+    (function(){
+      const holder = (S.db.users || []).find(x => x.clinicManager === true && x.id !== u.id);
+      return '<div style="margin:0 0 12px"><label class="check' + (u.clinicManager ? " on" : "") +
+        '" style="margin:0"><input type="checkbox" id="u-cm"' + (u.clinicManager ? " checked" : "") +
+        '><span><b>Clinic manager</b> — takes every task of a hospital site that has no Responsible CPM</span></label>' +
+        '<div class="hint" style="margin-top:4px">' + (holder
+          ? 'Now: <b>' + esc(holder.name || holder.email || holder.id) + '</b>. Ticking this moves it to this person.'
+          : 'Nobody is the clinic manager yet.') + ' One person at a time; not for partner accounts.</div></div>';
+    })() +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
       '<div class="field"><label for="u-p">Phone</label><input type="tel" id="u-p" value="' + esc(u.phone||"") + '"></div></div>' +
@@ -39234,7 +39258,10 @@ function userForm(u){
       title:$("#u-t").value.trim(), phone:$("#u-p").value.trim(),
       screenUpdate: !!($("#u-su") || {}).checked,
       stageUpdate: !!($("#u-sgu") || {}).checked,
-      stuckUpdate: !!($("#u-stu") || {}).checked });
+      stuckUpdate: !!($("#u-stu") || {}).checked,
+      clinicManager: !!($("#u-cm") || {}).checked });
+    if(u.clinicManager && u.accessType === "EXTERNAL")
+      return showWhy("u-why", "A partner account cannot be the clinic manager.");
 
     if(S.backend){
       try{
@@ -39247,7 +39274,8 @@ function userForm(u){
                                 locationId:u.locationId, extraLocationId:u.extraLocationId,
                                 screenUpdate:u.screenUpdate === true,
                                 stageUpdate:u.stageUpdate === true,
-                                stuckUpdate:u.stuckUpdate === true }) });
+                                stuckUpdate:u.stuckUpdate === true,
+                                clinicManager:u.clinicManager === true }) });
         if(!r.ok){
           const e = await r.json().catch(() => ({}));
           return showWhy("u-why", (e.error && e.error.message) || "The server refused it.");
@@ -39255,6 +39283,8 @@ function userForm(u){
       }catch(e){ return showWhy("u-why", "Could not reach the server."); }
     }
     if(isNew) S.db.users.push(u);
+    // One clinic manager: the server cleared the previous holder; mirror it here.
+    if(u.clinicManager) for(const x of S.db.users) if(x !== u && x.clinicManager) x.clinicManager = false;
     const roleText = u.role + (extraRoles.length ? " + " + extraRoles.join(", ") : "") +
       (accessType === "EXTERNAL" ? " (external)" : "");
     logAction((isNew ? "Provisioned " : "Updated ") + u.email + " as " + roleText,
@@ -39369,21 +39399,17 @@ function locForm(l){
     /* THERE IS NO SITE WITHOUT A RESPONSIBLE CPM (20 Oct 2026, the owner). Any user may be it;
        an App Admin or a Manager chooses (setSiteCpm). Anybody else sees it read-only - and
        if the site has none yet, saving makes THEM its CPM, which the server does too. */
-    /* On the HQ location the same field names the CLINIC MANAGER (10 Nov 2026, the owner): the
-       person who takes every task of a site that has no Responsible CPM (responsibleCpm in
-       anatStages.js). Optional there; only an App Admin edits an HQ. */
-    '<div class="field" id="l-cpm-row"' + (l.type === "SITE" || l.type === "HQ" ? '' : ' hidden') + '>' +
-      '<label id="l-cpm-lbl" class="' + (l.type === "HQ" ? "" : "req") + '" for="l-cpm">' +
-        (l.type === "HQ" ? "Clinic manager" : "Responsible CPM") + '</label><select id="l-cpm"' +
+    /* The clinic manager, who takes the tasks of a site with no Responsible CPM, is a tick on
+       Administration -> Users since v3.13.0 (the owner: a role, not a place) - not on the HQ. */
+    '<div class="field" id="l-cpm-row"' + (l.type === "SITE" ? '' : ' hidden') + '>' +
+      '<label class="req" for="l-cpm">Responsible CPM</label><select id="l-cpm"' +
       (can("setSiteCpm") ? '' : ' disabled') + '>' +
       '<option value="">— choose —</option>' +
       S.db.users.slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))).map(u =>
         '<option value="' + esc(u.id) + '"' + (u.id === l.cpmUserId ? " selected" : "") + '>' +
         esc(u.name) + (u.role ? ' · ' + esc((ROLES[u.role] || {}).label || u.role) : '') +
         '</option>').join("") + '</select>' +
-      '<div class="hint">' + (l.type === "HQ"
-        ? 'Takes every task of a hospital site that has no Responsible CPM, as that site\x27s CPM.'
-        : can("setSiteCpm")
+      '<div class="hint">' + (can("setSiteCpm")
         ? 'Required for a hospital site. Any user may be it. Receives this site\'s alerts, ' +
           'its screening tasks and its stuck subjects in the daily mail.'
         : (l.cpmUserId
@@ -39399,9 +39425,7 @@ function locForm(l){
   const typeSel = $("#l-t"), openRow = $("#l-open-row");
   if(typeSel && openRow) typeSel.onchange = () => { openRow.hidden = typeSel.value !== "SITE";
     if($("#l-phys-row")) $("#l-phys-row").hidden = typeSel.value !== "SITE";
-    if($("#l-cpm-row")) $("#l-cpm-row").hidden = !["SITE","HQ"].includes(typeSel.value);
-    if($("#l-cpm-lbl")){ $("#l-cpm-lbl").textContent = typeSel.value === "HQ" ? "Clinic manager" : "Responsible CPM";
-      $("#l-cpm-lbl").className = typeSel.value === "HQ" ? "" : "req"; } };
+    if($("#l-cpm-row")) $("#l-cpm-row").hidden = typeSel.value !== "SITE"; };
   if(typeSel && openRow) openRow.hidden = typeSel.value !== "SITE";
 
   $("#l-save").onclick = async () => {
@@ -39410,8 +39434,8 @@ function locForm(l){
     /* No site without a Responsible CPM. Whoever may not choose keeps the site's own, or
        becomes it - the server applies the same rule and is the authority. */
     let cpmPick = can("setSiteCpm") ? ($("#l-cpm").value || null) : (l.cpmUserId || (S.me && S.me.id) || null);
-    /* Only a site (its CPM) and the HQ (the clinic manager) carry one. */
-    if(!["SITE","HQ"].includes($("#l-t").value)) cpmPick = null;
+    /* Only a hospital site carries one. */
+    if($("#l-t").value !== "SITE") cpmPick = null;
     if($("#l-t").value === "SITE" && !cpmPick)
       return showWhy("l-why", "Choose the Responsible CPM - a hospital site cannot be saved without one.");
     Object.assign(l, { name, type:$("#l-t").value, address:$("#l-a").value.trim(),
