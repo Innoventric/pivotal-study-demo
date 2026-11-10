@@ -432,6 +432,16 @@ table.stk-serials th{background:#f3e6ee; color:#5a0c3a; font-weight:600;}
 .stk-chip.f{background:var(--ok-bg); color:var(--ok-fg);}
 .stk-chip.r{background:var(--info-bg); color:var(--info-fg);}
 .stk-legend{display:flex; flex-wrap:wrap; align-items:center; gap:6px 18px; font-size:12px; color:var(--muted); margin:0 0 8px;}
+/* Implants OPS holds that are NOT released yet (10 Nov 2026): dashed and grey, so they can
+   never be read as stock. Sits at the right of each implant section's header. */
+.stk-head{display:flex; flex-wrap:wrap; align-items:center; gap:6px 10px;}
+.ops-strip{margin-left:auto; display:inline-flex; flex-wrap:wrap; align-items:center; gap:4px 10px;
+  border:1px dashed var(--faint); border-radius:8px; padding:2px 8px; font-size:11.5px; font-weight:400;
+  color:var(--muted); background:var(--bg);}
+.ops-strip b{color:var(--ink); font-weight:700;}
+.ops-tag{font-size:10.5px; font-weight:700; letter-spacing:.02em; text-transform:uppercase; color:var(--muted);}
+.ops-sep{width:1px; align-self:stretch; background:var(--line);}
+.ops-total{font-weight:600;}
 .stk-legend b{color:var(--ink);}
 .stk-scope{font-size:12px; color:var(--muted); margin:6px 0 0;}
 /* A cell that wants noticing without being an error: an expiry inside 90 days, a unit
@@ -12118,6 +12128,34 @@ function orderCancelled(p){
   return (c.updates | 0) === (Array.isArray(o.updates) ? o.updates.length : 0);
 }
 
+/* WHO A SUBJECT'S TASKS BELONG TO (10 Nov 2026, the owner). The site's Responsible CPM, as
+   set in Administration -> Locations, and nobody else: not "the last CPM who held an earlier
+   stage", which is what decided until v3.12.0. A site with none falls to the clinic
+   manager, who is the Responsible CPM recorded on the Innoventric HQ location (Chen, at the
+   time of writing) - held there so an App Admin changes it in the app, not in the code.
+   Returns the stored value (a user id, which in served mode is the email), or "".
+   One function, read by the page, the server and the daily mail. */
+function clinicManagerOf(locations){
+  var list = locations || [];
+  for(var i = 0; i < list.length; i++){
+    var l = list[i];
+    if(l && l.type === "HQ" && String(l.cpmUserId || "").trim()) return String(l.cpmUserId).trim();
+  }
+  return "";
+}
+function responsibleCpm(locations, siteId){
+  var list = locations || [];
+  for(var i = 0; i < list.length; i++){
+    var l = list[i];
+    if(l && l.id === siteId){
+      var own = String(l.cpmUserId || "").trim();
+      if(own) return own;
+      break;
+    }
+  }
+  return clinicManagerOf(list);
+}
+
 var api = {
   ANAT_STAGES: ANAT_STAGES,
   ANAT_MANDATORY: ANAT_MANDATORY,
@@ -12159,7 +12197,9 @@ var api = {
   STAGE_FILE_RULES: STAGE_FILE_RULES,
   anatFileKind: anatFileKind,
   stageFileCount: stageFileCount,
-  stageFileGap: stageFileGap
+  stageFileGap: stageFileGap,
+  responsibleCpm: responsibleCpm,
+  clinicManagerOf: clinicManagerOf
 };
 
 if(typeof module !== "undefined" && module.exports) module.exports = api;
@@ -12696,6 +12736,98 @@ function screeningDurationTiles(sd){
   ];
 }
 
+/* ---- THE PROCEDURE ITSELF (10 Nov 2026, the owner) ---------------------------------------
+   From the procedure report of every subject whose procedure was performed:
+   - SKIN TO SKIN: DS insertion -> DS extraction (dsIn -> dsOut), the report's own
+     "Skin to skin (computed)".
+   - DEVICE TIME: deployment initiation -> deployment end (deployStart -> deployEnd), the
+     report's "Deployment duration (computed)". the owner: device time is the deployment.
+   - IVC PRESSURE DROP: the PEAK (the V wave, the report's systolic field) after the implant
+     lower than before it. "Before" is the PRE closest to the implant - the additional PRE
+     (ivcPre2) when it was taken, else the first PRE (the owner). SVC is not measured (the owner: not
+     relevant). A subject without both peaks is not counted either way, and is said.
+   Times wrap past midnight like the report. Every protocol, as screening duration; the
+   control arm has no procedure and is never in it. Pure: no clock, no page. */
+function hhmm(s){
+  var m = /^(\d{1,2}):(\d{2})/.exec(String(s || "").trim());
+  return m ? (+m[1]) * 60 + (+m[2]) : null;
+}
+function minutesBetween(a, b){
+  var x = hhmm(a), y = hhmm(b);
+  if(x === null || y === null) return null;
+  var d = y - x; if(d < 0) d += 1440;
+  return d;
+}
+function peakOf(c, key){
+  var v = parseFloat(String((c || {})[key + "Sys"] == null ? "" : c[key + "Sys"]).replace(",", "."));
+  return isNaN(v) ? null : v;
+}
+function spanStats(list){
+  list.sort(function(a, b){ return a.min - b.min || a.code.localeCompare(b.code); });
+  var n = list.length;
+  return { n: n,
+    avg: n ? list.reduce(function(s, x){ return s + x.min; }, 0) / n : null,
+    shortest: n ? list[0] : null, longest: n ? list[n - 1] : null };
+}
+function procedureMeasures(patients){
+  var done = (patients || []).filter(function(p){
+    return p && (procedurePerformed(p) || isTreated(p)) && !wasStopped(p);
+  });
+  var sts = [], dev = [], ivc = [], ivcMissing = [];
+  done.forEach(function(p){
+    var c = p.caseFile || {};
+    var code = String(p.patientCode || p.id || "?");
+    var a = minutesBetween(c.dsIn, c.dsOut);
+    if(a !== null) sts.push({ min: a, code: code });
+    var b = minutesBetween(c.deployStart, c.deployEnd);
+    if(b !== null) dev.push({ min: b, code: code });
+    var pre2 = peakOf(c, "ivcPre2"), pre1 = peakOf(c, "ivcPre"), post = peakOf(c, "ivcPost");
+    var pre = pre2 !== null ? pre2 : pre1;
+    if(pre === null || post === null){ ivcMissing.push(code); return; }
+    ivc.push({ code: code, pre: pre, preFrom: pre2 !== null ? "PRE (additional)" : "PRE",
+               post: post, drop: post < pre, compassionate: isCompassionate(p) });
+  });
+  ivc.sort(function(x, y){ return x.code.localeCompare(y.code); });
+  return {
+    performed: done.length,
+    skinToSkin: spanStats(sts), skinToSkinMissing: done.length - sts.length,
+    deviceTime: spanStats(dev), deviceTimeMissing: done.length - dev.length,
+    ivc: { measured: ivc.length, dropped: ivc.filter(function(x){ return x.drop; }).length,
+           rows: ivc, missing: ivcMissing }
+  };
+}
+function fmtMinutes(m){
+  if(m === null || m === undefined) return "—";
+  m = Math.round(m);
+  return Math.floor(m / 60) + "h " + ("0" + (m % 60)).slice(-2) + "m";
+}
+/* The tiles, worded here like screeningDurationTiles so every reader says the same. */
+function procedureTiles(pm){
+  function three(st, missing, what, how){
+    var why = pm.performed ? "no procedure report has both times recorded" : "no procedure performed yet";
+    if(!st.n) return [
+      { value: "—", label: "Average " + what, sub: why },
+      { value: "—", label: "Longest " + what, sub: why },
+      { value: "—", label: "Shortest " + what, sub: why }];
+    return [
+      { value: fmtMinutes(st.avg), label: "Average " + what,
+        sub: how + " · " + st.n + " subject" + (st.n === 1 ? "" : "s") +
+             (missing ? " · " + missing + " without both times, left out" : "") },
+      { value: fmtMinutes(st.longest.min), label: "Longest " + what, sub: "subject " + st.longest.code },
+      { value: fmtMinutes(st.shortest.min), label: "Shortest " + what, sub: "subject " + st.shortest.code }];
+  }
+  return {
+    skinToSkin: three(pm.skinToSkin, pm.skinToSkinMissing, "skin to skin", "DS insertion to DS extraction"),
+    deviceTime: three(pm.deviceTime, pm.deviceTimeMissing, "device time", "deployment initiation to deployment end"),
+    ivc: { value: pm.ivc.measured ? pm.ivc.dropped + " of " + pm.ivc.measured : "—",
+           label: "IVC pressure dropped after the implant",
+           sub: pm.ivc.measured
+             ? "peak (V wave) POST lower than PRE · " + Math.round(100 * pm.ivc.dropped / pm.ivc.measured) + "% of subjects measured" +
+               (pm.ivc.missing.length ? " · " + pm.ivc.missing.length + " without both peaks, left out" : "")
+             : (pm.performed ? "no procedure report has both IVC peaks recorded" : "no procedure performed yet") }
+  };
+}
+
 /* ---- the three operational counts ------------------------------------------------
    These count WORK - every patient in front of the team, whichever protocol - while the
    four measures above count the STUDY. The two "implanted" numbers therefore differ the
@@ -12867,9 +12999,12 @@ function report(ctx){
   /* Screening duration (6 Nov 2026): every protocol, so it sits apart from `study` - the
      daily mail prints `study` as its tile list and was not asked to carry these. */
   var sd = screeningDuration(patients, logs);
+  /* The procedure itself (10 Nov 2026): kept apart from `study` for the same reason. */
+  var pm = procedureMeasures(patients);
   return { counts: counts, rate: rate, tte: tte, enr: enr, sf: sf,
            work: work, study: study, notes: notes, rereadCompassionate: reread,
-           screenDur: sd, screenDurTiles: screeningDurationTiles(sd) };
+           screenDur: sd, screenDurTiles: screeningDurationTiles(sd),
+           proc: pm, procTiles: procedureTiles(pm) };
 }
 
 /* ============================ 5. THE SITES =================================
@@ -13186,6 +13321,9 @@ var api = {
   timeToEligible: timeToEligible,
   enrolmentProgress: enrolmentProgress,
   screenFailure: screenFailure,
+  procedureMeasures: procedureMeasures,
+  procedureTiles: procedureTiles,
+  fmtMinutes: fmtMinutes,
   report: report
 };
 
@@ -14726,17 +14864,20 @@ function stuckWith(p){
   if(SM.isOnHold(p)) return null;            // paused on purpose (9 Nov 2026)
   const ctReady = p.screening && p.screening.ct && p.screening.ct.done;
   if(!ctReady){
-    const cpm = siteCpm(p.siteId);
-    return { who: cpm ? assigneeLabel(cpm) : "Unassigned CPM", email: cpm,
+    const cpm = taskCpm(p.siteId);
+    return { who: cpm ? assigneeLabel(cpm) : "No CPM for this site", email: cpm,
              stage: null, why: "screening", overdue: false };
   }
   for(const s of ANAT_STAGES){
     if(!stageOpen(p, s)) continue;
     if(!anatUnlocked(p, s.k)) continue;
     const a = p.anat[s.k] || {};
-    const email = String(a.assignedTo || "") || siteCpm(p.siteId);
-    return { who: email ? assigneeLabel(email) : "Nobody yet", email,
-             stage: s, why: a.assignedTo ? "assigned" : "unassigned",
+    /* A stage nobody was given IS the CPM's task (10 Nov 2026, the owner) - shown under
+       their name like any other, never as "unassigned". Only a site with no CPM and no
+       clinic manager set is a gap worth naming. */
+    const email = String(a.assignedTo || "") || taskCpm(p.siteId);
+    return { who: email ? assigneeLabel(email) : "No CPM for this site", email,
+             stage: s, why: email ? "assigned" : "nocpm",
              overdue: stageOverdue(p, s) };
   }
   return null;
@@ -14760,10 +14901,13 @@ function myTasks(){
       const a = p.anat[s.k] || {};
       const owner = String(a.assignedTo || "").toLowerCase();
       const mine = owner === me;
-      const orphanAtMySite = !owner && isCpm &&
-        (!siteCpm(p.siteId) || String(siteCpm(p.siteId)).toLowerCase() === me);
-      if(!mine && !orphanAtMySite) continue;
-      out.push({ p, s, a, unassigned: !owner, overdue: stageOverdue(p, s),
+      /* Nobody given it: it is the CPM's task (taskCpm - the site's Responsible CPM, else
+         the clinic manager), theirs exactly as if they had been assigned it. A site with
+         neither still shows it to every CPM and App Admin, so it is never nobody's. */
+      const fallsTo = owner ? "" : String(taskCpm(p.siteId) || "").toLowerCase();
+      const orphanMine = !owner && (fallsTo ? fallsTo === me : isCpm);
+      if(!mine && !orphanMine) continue;
+      out.push({ p, s, a, unassigned: !owner && !fallsTo, overdue: stageOverdue(p, s),
                  state: stageState(p, s) });
     }
   }
@@ -17363,6 +17507,29 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.12.0", date: "10 November 2026", groups: [
+    { h:"The menu", items:[
+      "<b>Clinical workflow</b> comes first, under Home, starting with <b>Subject Overview</b>. Then <b>Study Data</b> (Study Status, Subjects in follow up, Screen Failure, Control arm, Site Accountability Log), then <b>Logistics</b>, starting with <b>Stock Overview</b>."
+    ]},
+    { h:"Every task has an owner", items:[
+      "A task is the <b>site’s Responsible CPM</b>’s, as set in Administration → Locations — no longer the last CPM who held an earlier stage. A site with none goes to the <b>clinic manager</b>, set as the Responsible CPM of the Innoventric HQ location.",
+      "A stage nobody was given is now shown, mailed and counted as that CPM’s task, under their name — never as “unassigned”.",
+      "An <b>App Admin or a Manager</b> can give any task to somebody else: a <b>Change</b> button in the <b>With</b> column, every stage including <b>3. Model Printing</b> after the print request, and the procedure summary."
+    ]},
+    { h:"Missing procedure summaries", items:[
+      "Every implanted subject with no procedure summary now has one, opened as a task for the site’s CPM (or the clinic manager), due in 3 days, with a reminder and a line in the daily mail every day until it is closed."
+    ]},
+    { h:"Viewing a treated subject", items:[
+      "<b>View</b> on a subject after the procedure opens the <b>procedure report</b> written at the end of it, not the CT report from screening. <b>All files of this subject</b> is one button away."
+    ]},
+    { h:"Study Status: the procedure", items:[
+      "<b>Skin to skin</b> (DS insertion to extraction) and <b>device time</b> (deployment start to end): average, longest and shortest.",
+      "<b>IVC pressure dropped after the implant</b>: in how many subjects of how many the peak (V wave) after the implant was lower than before it — compared with the PRE taken closest to the implant — with every subject listed and marked."
+    ]},
+    { h:"Stock Overview: implants not released yet", items:[
+      "Beside each implant size, from OPS: how many are <b>not sterilized</b>, how many are <b>sterilized and waiting for release</b>, how many are released here, and the <b>total</b>. Marked <b>Not released · OPS</b> — they cannot be sent or reserved until QA releases them."
+    ]}
+  ]},
   { version: "3.11.0", date: "9 November 2026", groups: [
     { h:"Cancelling a shipment request", items:[
       "On <b>Requests &amp; Shipments</b>, an App Admin has a <b>Cancel request</b> button on every open request — a subject’s product order or a stock request. It asks for a reason and needs the approval of a <b>Manager or another App Admin</b>, on <b>QA Approval</b>; until then the row reads <b>Cancel awaiting approval</b>.",
@@ -20496,7 +20663,45 @@ function icon(k){
 const NAV = [
   { grp:"Start here" },
   { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], todo:true },
+  { grp:"Clinical workflow" },
+  /* First in the menu since 10 Nov 2026 (the owner: Clinical workflow first with Subject
+     Overview at its top, then Study Data, then Logistics with Stock Overview first). It
+     answers "where is everybody", the question every clinical screen starts from. */
+  { k:"overview", ic:"chart",   label:"Subject Overview",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"patients", ic:"personAdd", label:"Subject Register", roles:["ADMIN","CPM"] },
+  { k:"screening",ic:"funnel",  label:"Subject Screening",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"clinical", ic:"case",    label:"Procedure Report",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  /* The summary each submitted report opens (CLD-U-104, 20 Oct 2026). Same roles as the
+     report; the badge counts the open ones given to YOU. */
+  { k:"procsummary", ic:"case", label:"Procedure Summary", roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"], sumBadge:true },
+  /* The three screens that report on the study rather than move it forward. Grouped
+     together on the owner's instruction, 17 Aug 2026: they were sitting among the workflow
+     screens, which made the menu read as though they were steps in it. */
+  { grp:"Study Data" },
+  /* The dashboard half of what used to be Patient Overview (27 Sep 2026, the owner): the
+     counts, the measures, the chart and the TV mode. Same role list as the screen it came
+     from, so nobody lost a figure they could see before. */
+  { k:"studystatus", ic:"chart", label:"Study Status",    roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  /* Same reasoning as the control screen, and the same role list: a treated patient
+     leaves every other list, so the one screen where they remain must not be one that
+     somebody cannot open. Nothing here is identifying beyond the patient code. */
+  { k:"followup", ic:"stethoscope", label:"Subjects in follow up", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  /* Every patient stopped, and why (2 Oct 2026, the owner). The clinical roles that see Study
+     Status, because the rate on that screen is what this one explains. */
+  { k:"screenfail", ic:"funnel", label:"Screen Failure",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  /* Visible to every role: a control patient leaves every other list, so the one place
+     they still appear must not be the one place somebody cannot look. */
+  { k:"control",  ic:"people",  label:"Control arm", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  /* The same role list as In Transit, on the owner's instruction: the people who send boxes
+     are the people who need the paperwork back. It sits here rather than beside In
+     Transit because it reports on what has happened rather than moving anything - and
+     because a "Shipments" entry next to In Transit is exactly the arrangement that was
+     merged away once already for answering the same question twice. */
+  { k:"sitereport", ic:"history", label:"Site Accountability Log", roles:["ADMIN","CPM","WH_ADMIN"] },
   { grp:"Logistics" },
+  /* One row for every role. A warehouse manager still sees only their own warehouse,
+     because the contents are scoped by visibleDevices() -> inScope(), not by the label. */
+  { k:"stock",    ic:"stock",   label:"Stock Overview",     roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   { k:"register", ic:"factory", label:"New Device Registration", roles:["ADMIN","EMPLOYEE","QA","MANAGER"] },
   /* Producers see it too, read-only, so they can follow their own batch instead of
      wondering whether it arrived. The badge counts only what YOU can act on. */
@@ -20512,47 +20717,9 @@ const NAV = [
   /* v3.0.0 (the owner, items 7 and 8): requests and the shipments log on one screen, under
      Logistics. The shipments log used to sit under Study Data. */
   { k:"logistics", ic:"ship",   label:"Requests & Shipments", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  /* One row for every role. A warehouse manager still sees only their own warehouse,
-     because the contents are scoped by visibleDevices() -> inScope(), not by the label. */
-  { k:"stock",    ic:"stock",   label:"Stock Overview",     roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* What is reserved for whom, and from where - and the place to reserve it (24 Sep 2026,
      the owner). Everybody may look; only allocateUnits sees the buttons. */
   { k:"allocations", ic:"people", label:"Allocations",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  { grp:"Clinical workflow" },
-  { k:"patients", ic:"personAdd", label:"Subject Register", roles:["ADMIN","CPM"] },
-  { k:"screening",ic:"funnel",  label:"Subject Screening",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  { k:"clinical", ic:"case",    label:"Procedure Report",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  /* The summary each submitted report opens (CLD-U-104, 20 Oct 2026). Same roles as the
-     report; the badge counts the open ones given to YOU. */
-  { k:"procsummary", ic:"case", label:"Procedure Summary", roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"], sumBadge:true },
-  /* Sits directly under the Procedure Report because it answers the question that screen
-     raises and cannot: not "what is happening to THIS patient" but "where is everybody".
-     Same role list as the report it belongs to. */
-  { k:"overview", ic:"chart",   label:"Subject Overview",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  /* The three screens that report on the study rather than move it forward. Grouped
-     together on the owner's instruction, 17 Aug 2026: they were sitting among the workflow
-     screens, which made the menu read as though they were steps in it. */
-  { grp:"Study Data" },
-  /* The dashboard half of what used to be Patient Overview (27 Sep 2026, the owner): the
-     counts, the measures, the chart and the TV mode. Same role list as the screen it came
-     from, so nobody lost a figure they could see before. */
-  { k:"studystatus", ic:"chart", label:"Study Status",    roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  /* Every patient stopped, and why (2 Oct 2026, the owner). The clinical roles that see Study
-     Status, because the rate on that screen is what this one explains. */
-  { k:"screenfail", ic:"funnel", label:"Screen Failure",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  /* Visible to every role: a control patient leaves every other list, so the one place
-     they still appear must not be the one place somebody cannot look. */
-  { k:"control",  ic:"people",  label:"Control arm", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  /* Same reasoning as the control screen, and the same role list: a treated patient
-     leaves every other list, so the one screen where they remain must not be one that
-     somebody cannot open. Nothing here is identifying beyond the patient code. */
-  { k:"followup", ic:"stethoscope", label:"Subjects in follow up", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  /* The same role list as In Transit, on the owner's instruction: the people who send boxes
-     are the people who need the paperwork back. It sits here rather than beside In
-     Transit because it reports on what has happened rather than moving anything - and
-     because a "Shipments" entry next to In Transit is exactly the arrangement that was
-     merged away once already for answering the same question twice. */
-  { k:"sitereport", ic:"history", label:"Site Accountability Log", roles:["ADMIN","CPM","WH_ADMIN"] },
   { grp:"Records" },
   { k:"alerts",   ic:"alert",   label:"Alerts",             roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], badge:true },
   { k:"audit",    ic:"history", label:"Activity History",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
@@ -20946,7 +21113,7 @@ function todoItems(){
       sub: tasks.slice(0,3).map(t =>
              t.p.patientCode + " · " + t.s.n + ". " + t.s.label +
              (t.a.dueDate ? " (due " + fmtDate(t.a.dueDate) + ")" : "") +
-             (t.unassigned ? " · unassigned" : "")).join(" — ") +
+             (t.unassigned ? " · no CPM set for the site" : "")).join(" — ") +
            (tasks.length > 3 ? "…" : "") });
   }
 
@@ -22093,10 +22260,54 @@ function stuckWithCell(p){
   const name = '<b>' + esc(w.who) + '</b>';
   const where = w.stage ? '<small>' + esc(w.stage.n + ". " + w.stage.label) + '</small>'
                         : '<small>Screening material</small>';
-  return name + (w.overdue ? ' <span class="pill p-red">Overdue</span>' : "") +
-    (w.why === "unassigned" ? ' <span class="pill p-orange">unassigned</span>' : "") +
+  /* App Admin / Manager: hand the task to somebody else from the row (10 Nov 2026). */
+  const change = (w.stage && mayReassignTasks() && !p.fileLocked)
+    ? ' <button class="btn btn-sm" data-task-reassign="' + esc(p.id + "|" + w.stage.k) + '" ' +
+      'title="Give this task to somebody else">Change</button>' : "";
+  return name + change + (w.overdue ? ' <span class="pill p-red">Overdue</span>' : "") +
+    (w.why === "nocpm" ? ' <span class="pill p-red">no CPM</span>' : "") +
     '<br>' + where;
 }
+/* The same write the stage card makes when its "Assigned to" changes: the field, the
+   automatic marker dropped, both people told, the line in the log, the save. */
+function askTaskAssignee(p, s){
+  const a = (p.anat || {})[s.k];
+  if(!a) return;
+  const EVAL_ASSIGNABLE = ["CPM", "ADMIN", "EMPLOYEE", "QA", "MANAGER"];
+  const pick = (S.db.users || []).filter(u => u.email && (s.kind !== "eval" || EVAL_ASSIGNABLE.includes(u.role)))
+    .sort((x, y) => String(x.name || "").localeCompare(String(y.name || "")));
+  const now = String(a.assignedTo || "");
+  modal("Stage " + s.n + " of " + p.patientCode + " — who does it",
+    '<div class="field"><label for="ta-who">' + esc(s.n + ". " + s.label) + '</label><select id="ta-who">' +
+      pick.map(u => '<option value="' + esc(u.email) + '"' + (u.email === now ? " selected" : "") + '>' + esc(u.name || u.email) +
+        '</option>').join("") + '</select>' +
+      '<div class="hint">' + (now ? "Now: " + esc(assigneeLabel(now)) : "Nobody was given it, so it is the site’s CPM’s task.") +
+      ' Both people are told.</div></div>',
+    '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
+    '<button class="btn btn-primary" id="ta-save">Save</button></div>');
+  $("#ta-save").onclick = () => {
+    const to = $("#ta-who").value;
+    closeModal();
+    if(!to || to === now) return;
+    a.assignedTo = to;
+    if(a.autoAssignedAt){ delete a.autoAssignedAt; }
+    a.autoAssignChanged = true;
+    announceAssignment(p, s, now, to);
+    p.status = recomputeWorkflow(p);
+    logAction("Task reassigned", { locationId:p.siteId,
+      stateChanges: s.k + ".assignedTo = " + to + " (was " + (now || "nobody") + ")",
+      comments:"Subject " + p.patientCode });
+    commit(); schedulePatientSave(p); toast("Saved.", "good"); render();
+  };
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("[data-task-reassign]");
+  if(!b) return;
+  e.stopPropagation(); e.preventDefault();
+  const [pid, k] = b.dataset.taskReassign.split("|");
+  const p = patient(pid), s = ANAT_STAGES.find(x => x.k === k);
+  if(p && s) askTaskAssignee(p, s);
+}, true);
 
 function patientStatusWidget(){
   const sites = visiblePatientSites();
@@ -26190,29 +26401,34 @@ function openDisqualifyDialog(p, opts){
    the site's Responsible CPM the moment the CT is marked received (autoAssignFirst) -
    only the site's, the owner's answer when asked: a site with none leaves it empty with the
    hint to set one. Each later stage goes to the patient's CPM when the one before it is
-   done, passing over any stage already set aside as Not required. */
+   done, passing over any stage already set aside as Not required.
+
+   SINCE 10 Nov 2026 (the owner) "the CPM" is the site's Responsible CPM and nobody else; a
+   site with none goes to the clinic manager (the HQ location's Responsible CPM). */
 const AUTO_ASSIGN_STAGES = ANAT_STAGES.map(s => s.k);
-function isCpmUser(u){ return !!u && [u.role].concat(userExtraRoles(u)).includes("CPM"); }
+/* Since 10 Nov 2026 (the owner) the CPM of a task is ONLY the site's Responsible CPM, else
+   the clinic manager on the HQ location - window.AnatStages.responsibleCpm, shared with
+   the server and the daily mail. It used to be the last CPM who held an earlier stage.
+   beforeKey is kept in the signature; it no longer changes the answer. */
 function patientCpm(p, beforeKey){
-  const i = ANAT_STAGES.findIndex(s => s.k === beforeKey);
-  for(let j = i - 1; j >= 0; j--){
-    const e = String(((p.anat || {})[ANAT_STAGES[j].k] || {}).assignedTo || "").trim();
-    const u = e ? userByEmail(e) : null;
-    if(isCpmUser(u)) return u.email;
-  }
-  const site = siteCpm(p.siteId);
-  return site || "";
+  return p ? taskCpm(p.siteId) : "";
+}
+function taskCpm(siteId){
+  const id = window.AnatStages.responsibleCpm(S.db.locations, siteId);
+  if(!id) return "";
+  const u = user(id);
+  return (u && u.email) || id;
 }
 function autoAssignHint(p, s, a, assignedNow){
   let t = "";
   if(assignedNow && a.autoAssignedAt){
-    t = 'Assigned automatically to the subject’s Clinical PM · ' + esc(fmtTs(a.autoAssignedAt)) +
+    t = 'Assigned automatically to the site’s Responsible CPM · ' + esc(fmtTs(a.autoAssignedAt)) +
         '. Change it if somebody else takes it.';
   }else if(!assignedNow && (a.status || "Not started") === "Not started"){
     const cpm = patientCpm(p, s.k);
-    t = cpm ? 'Goes to <b>' + esc(assigneeLabel(cpm)) + '</b>, the subject’s Clinical PM, when this stage opens.'
-            : 'No Clinical PM found for this subject or site, so nobody will be assigned automatically. ' +
-              'Choose one, or set a Responsible CPM in Administration → Locations.';
+    t = cpm ? 'Goes to <b>' + esc(assigneeLabel(cpm)) + '</b>, the site’s Responsible CPM, when this stage opens.'
+            : 'This site has no Responsible CPM and no clinic manager is set, so nobody will be assigned automatically. ' +
+              'Choose one, or set them in Administration → Locations.';
   }
   return t ? '<div class="hint">' + t + '</div>' : "";
 }
@@ -27051,7 +27267,11 @@ function anatStageHtml(p, s, ctReady){
      the print gate may set it, and not once the request has gone. */
   const mayRequestPrint = s.needsApproval && myRoles().some(r => PRINT_GATE.includes(r)) &&
                           !p.fileLocked;
-  const assignDis = s.needsApproval ? ((mayRequestPrint && !a.printApproved) ? dis : " disabled") : dis;
+  /* An App Admin or a Manager may hand ANY task to somebody else (10 Nov 2026, the owner - he
+     could not change stage 3's printer once the request had gone). Everybody else keeps
+     the rule above. */
+  const assignDis = (mayReassignTasks() && !p.fileLocked) ? ""
+    : s.needsApproval ? ((mayRequestPrint && !a.printApproved) ? dis : " disabled") : dis;
   const assignSelect =
     '<div class="field"><label for="an-' + s.k + '-assignedTo">' +
       (s.needsApproval ? "Printed by" : "Assigned to") + '</label>' +
@@ -34139,6 +34359,85 @@ function stockTiles(pool, packedIds){
     { k:"rework",    label:"In rework",              cls:"p-orange", pick:d => d.status === "SENT_FOR_REWORK" || reworkInProgress(d) }
   ].map(t => Object.assign(t, { n:pool.filter(t.pick).length }));
 }
+/* ---- IMPLANTS NOT RELEASED YET, FROM OPS (10 Nov 2026, the owner) ----------------------------
+   Beside each implant size: how many OPS holds that are not sterilized yet, how many are
+   sterilized and waiting for release, what is released here, and the total - so one look
+   says how many of each size exist. OPS counts (GET /api/pivotal/stock-summary); the server
+   groups (opsLink.stockGroups) and caches 5 min. They are NEVER stock: dashed, grey, and
+   labelled "Not released · OPS". Shown only where the list is the whole picture - all
+   locations or an HQ, no tile, no status filter - because OPS's units are at the factory.
+   The demo has no OPS, so it shows fixed sample numbers and says so. */
+let OPS_STOCK = { at:0, data:null, loading:false };
+const OPS_STOCK_SAMPLE = { on:true, reachable:true, sample:true, asOf:"",
+  sizes:{ S:{ notSterilized:3, sterilized:2, held:0 }, M:{ notSterilized:1, sterilized:4, held:1 },
+          L:{ notSterilized:2, sterilized:1, held:0 }, XL:{ notSterilized:0, sterilized:1, held:0 } } };
+function ensureOpsStock(force){
+  if(isExternalUser()) return;
+  if(!S.backend){ OPS_STOCK = { at:Date.now(), data:OPS_STOCK_SAMPLE, loading:false }; return; }
+  if(OPS_STOCK.loading || (!force && OPS_STOCK.data && Date.now() - OPS_STOCK.at < 5 * 60 * 1000)) return;
+  OPS_STOCK.loading = true;
+  api("GET", "/api/ops/stock-summary" + (force ? "?refresh=1" : ""))
+    .then(d => { OPS_STOCK = { at:Date.now(), data:d, loading:false }; })
+    .catch(e => { OPS_STOCK = { at:Date.now(), data:{ on:true, reachable:false, why:e.message || "no connection" }, loading:false }; })
+    .then(() => { if(S.view === "stock") render(); });
+}
+function opsStockShown(){
+  const d = OPS_STOCK.data;
+  if(!d || !d.on || isExternalUser()) return false;
+  if(FL.tile || FL.status || FL.product === "DS") return false;
+  if(FL.locId){ const l = loc(FL.locId); if(!l || l.type !== "HQ") return false; }
+  return true;
+}
+function opsSizes(){
+  const d = OPS_STOCK.data || {};
+  return d.reachable ? (d.sizes || {}) : ((d.stale && d.stale.sizes) || null);
+}
+function opsStrip(size, list){
+  if(!opsStockShown()) return "";
+  const all = opsSizes();
+  if(!all) return '<span class="ops-strip"><span class="ops-tag">Not released · OPS</span><span>OPS not reachable</span></span>';
+  const g = all[size] || { notSterilized:0, sterilized:0, held:0 };
+  const released = (list || []).length;
+  return '<span class="ops-strip" title="Implants OPS holds that QA has not released yet. Not stock: they cannot be sent or reserved.">' +
+    '<span class="ops-tag">Not released · OPS</span>' +
+    '<span>Not sterilized <b>' + g.notSterilized + '</b></span>' +
+    '<span>Sterilized, awaiting release <b>' + g.sterilized + '</b></span>' +
+    (g.held ? '<span>On hold / MRB <b>' + g.held + '</b></span>' : '') +
+    '<span class="ops-sep"></span>' +
+    '<span>Released <b>' + released + '</b></span>' +
+    '<span class="ops-total">Total <b>' + (released + g.notSterilized + g.sterilized) + '</b></span></span>';
+}
+/* All four sizes at once, under the tiles - also the only place a size shows that has
+   nothing released here yet (the list has no section for it). */
+function opsStockCard(units){
+  if(!opsStockShown()) return "";
+  const d = OPS_STOCK.data, all = opsSizes();
+  const when = d.reachable ? (d.asOf ? "as of " + fmtTs(d.asOf) : "") : "OPS not reachable" + (d.why ? " (" + d.why + ")" : "") +
+    (all ? " — showing the last figures read" : "");
+  let body;
+  if(!all){
+    body = '<div class="hint">' + esc(when) + '</div>';
+  }else{
+    const rows = UNICA_SIZES.map(size => {
+      const g = all[size] || { notSterilized:0, sterilized:0, held:0 };
+      const rel = units.filter(x => x.productType === "UNICA" && x.size === size).length;
+      return '<tr><td><b>Unica ' + esc(size) + '</b></td><td>' + g.notSterilized + '</td><td>' + g.sterilized + '</td>' +
+        '<td>' + (g.held || '<span class="hint">0</span>') + '</td><td>' + rel + '</td><td><b>' + (rel + g.notSterilized + g.sterilized) + '</b></td></tr>';
+    }).join("");
+    body = '<div class="tbl-wrap"><table><thead><tr><th>Implant</th><th>Not sterilized (OPS)</th>' +
+      '<th>Sterilized, awaiting release (OPS)</th><th>On hold / MRB (OPS)</th><th>Released (here)</th><th>Total</th></tr></thead>' +
+      '<tbody>' + rows + '</tbody></table></div>';
+  }
+  return '<div class="card" style="border-style:dashed"><div class="card-hd"><h2>Implants not released yet — from OPS</h2>' +
+    '<span class="hint">' + (d.sample ? "Sample numbers — the demo has no OPS." : esc(when)) + '</span>' +
+    (S.backend ? '<button class="btn btn-sm" id="ops-refresh" style="margin-left:auto">Refresh</button>' : '') + '</div>' +
+    '<div class="card-bd">' + body +
+    '<div class="hint" style="margin-top:6px">Not stock: these cannot be sent, reserved or allocated until QA releases them here. ' +
+    'Not sterilized = QC approved, waiting for or in the steriliser. Sterilized = packaging, done, or waiting for QA release. ' +
+    'Total = released here + not sterilized + sterilized (on hold / MRB not counted). Released counts the units in the list below.</div>' +
+    '</div></div><div style="height:14px"></div>';
+}
+
 /* The one answer to "which units does the list show right now", read by the screen and by
    the unit CSV, so the file is exactly what is on screen. */
 function stockListState(){
@@ -34159,20 +34458,21 @@ function stockListState(){
 function stockSections(units){
   const out = [], seen = new Set();
   const prods = PRODUCTS.filter(p => !FL.product || p.key === FL.product);
-  const head = (label, list) => {
+  const head = (label, list, extra) => {
     /* A unit away for rework is neither free nor reserved - it cannot be promised. */
     const rw = list.filter(d => d.status === "SENT_FOR_REWORK" || reworkInProgress(d)).length;
     const r = list.filter(d => d.allocatedTo).length, f = list.length - r - rw;
-    return '<b>' + esc(label) + '</b> <span class="hint">· ' + list.length + ' unit' + (list.length === 1 ? '' : 's') + '</span>' +
+    return '<div class="stk-head"><span><b>' + esc(label) + '</b> <span class="hint">· ' + list.length + ' unit' + (list.length === 1 ? '' : 's') + '</span>' +
       ' <span class="stk-split" style="display:inline-flex;margin:0 0 0 6px">' +
       (rw ? '<span class="pill p-orange">' + rw + ' in rework</span>' : '') +
       (f ? '<span class="stk-chip f">' + f + ' free</span>' : '') +
-      (r ? '<span class="stk-chip r">' + r + ' reserved</span>' : '') + '</span>';
+      (r ? '<span class="stk-chip r">' + r + ' reserved</span>' : '') + '</span></span>' +
+      (extra || '') + '</div>';
   };
   for(const p of prods) for(const size of p.sizes){
     const list = units.filter(d => d.productType === p.key && d.size === size);
     list.forEach(d => seen.add(d.id));
-    if(list.length) out.push({ head:head(p.label + " " + size, list), units:list });
+    if(list.length) out.push({ head:head(p.label + " " + size, list, p.key === "UNICA" ? opsStrip(size, list) : ""), units:list });
   }
   const rest = units.filter(d => !seen.has(d.id));
   if(rest.length) out.push({ head:head("Other", rest), units:rest });
@@ -34318,7 +34618,7 @@ VIEWS.stock = {
   sub:"Every unit, grouped by product and size. Click a row to see where it has been.",
   /* The "Packed to go" tile and the packed units are derived from the shipment rows, which
      are not in the boot snapshot. See ensureShipments. */
-  async load(){ await ensureShipments(); },
+  async load(){ ensureOpsStock(); await ensureShipments(); },
   body(){
     const { cols, tiles, tile, units } = stockListState();
     if(FL.tile && !tile) FL.tile = "";
@@ -34347,6 +34647,7 @@ VIEWS.stock = {
       (FL.locId && !isMotionCol(FL.locId) ? ' (including units on their way there)' : '') +
       (FL.product ? ' · ' + esc((PRODUCTS.find(p => p.key === FL.product) || {}).label || FL.product) + ' only' : '') + '.</div>';
     h += '<div style="height:14px"></div>';
+    h += opsStockCard(units);
 
     /* ASK FOR IT FROM HERE. This is the screen where somebody SEES a hole - a size that is
        nought at a place that needs it. The same dialog as the one on the requests card,
@@ -34426,6 +34727,7 @@ VIEWS.stock = {
   },
   wire(){
     $("#f-p").onchange  = e => { FL.product = e.target.value; render(); };
+    const opr = $("#ops-refresh"); if(opr) opr.onclick = () => { opr.disabled = true; ensureOpsStock(true); };
     $("#f-s").onchange  = e => { FL.status  = e.target.value; render(); };
     $("#f-r").onchange  = e => { FL.resv    = e.target.value; render(); };
     /* A tile narrows the list; pressing the chosen one again shows everything. */
@@ -35940,13 +36242,89 @@ function summaryWho(emails){
   return (emails || []).map(e => { const u = userByEmail(e); return u ? u.name : e; }).join(", ");
 }
 
+/* WHO A SUMMARY IS GIVEN TO, changed by an App Admin or a Manager (10 Nov 2026, the owner).
+   Open summaries only. POST .../proc-summary/assignees is the authority. */
+function mayReassignTasks(){ return !isExternalUser() && myRoles().some(r => r === "ADMIN" || r === "MANAGER"); }
+function summaryReassignBtn(p){
+  const s = summaryOf(p);
+  if(!s || s.status !== "OPEN" || !mayReassignTasks()) return "";
+  return ' <button class="btn btn-sm" data-ps-reassign="' + esc(p.id) + '">Change</button>';
+}
+function askSummaryAssignees(p){
+  const s = summaryOf(p);
+  if(!s) return;
+  const have = (s.assignees || []).map(e => String(e).toLowerCase());
+  const users = (S.db.users || []).filter(u => u.email && !u.external)
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  modal("Who the summary of " + p.patientCode + " is given to",
+    '<p class="hint">Tick everybody it is given to. Whoever is added is told, in the app and by mail.</p>' +
+    '<div style="max-height:46vh;overflow:auto">' + users.map(u =>
+      '<label class="check" style="display:flex;margin:4px 0"><input type="checkbox" data-psa="' + esc(String(u.email).toLowerCase()) + '"' +
+        (have.includes(String(u.email).toLowerCase()) ? " checked" : "") + '><span>' + esc(u.name || u.email) +
+        ' <span class="hint">' + esc((ROLES[u.role] || {}).label || u.role || "") + '</span></span></label>').join("") + '</div>' +
+    whyBox("psa-why"),
+    '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
+    '<button class="btn btn-primary" id="psa-save">Save</button></div>');
+  $("#psa-save").onclick = async () => {
+    const want = $$("[data-psa]").filter(c => c.checked).map(c => c.dataset.psa);
+    if(!want.length) return showWhy("psa-why", "Give it to at least one person.");
+    if(!S.backend){
+      s.assignees = want;
+      if(!s.dueAt && s.legacy){ const now = nowISO(); s.dueAt = legacyDueLocal(now); s.openedAsTask = now; }
+      logAction("Procedure summary of " + p.patientCode + " given to " + want.join(", "), { locationId:p.siteId });
+      commit(); closeModal(); renderNav(); render(); return;
+    }
+    const b = $("#psa-save"); b.disabled = true;
+    try{
+      const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/proc-summary/assignees", { assignees: want });
+      if(r && r.patient) mergePatient(r.patient);
+      closeModal(); renderNav(); render(); toast("Saved.", "good");
+    }catch(e){ b.disabled = false; showWhy("psa-why", e.message || "Could not save."); }
+  };
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("[data-ps-reassign]");
+  if(!b) return;
+  e.stopPropagation(); e.preventDefault();
+  const p = patient(b.dataset.psReassign); if(p) askSummaryAssignees(p);
+}, true);
+
+/* A MISSING SUMMARY IS THE CPM'S TASK (10 Nov 2026) - the standalone (demo) mirror of the
+   server's openMissingSummaries: every implanted subject with none, and every one started
+   online and given to nobody, goes to the site's CPM (else the clinic manager), due in
+   LEGACY_DUE_DAYS. Served mode never runs this; the server does it. */
+const LEGACY_DUE_DAYS = 3;
+function legacyDueLocal(fromIso){ return new Date(Date.parse(fromIso) + LEGACY_DUE_DAYS * 86400000).toISOString(); }
+function openMissingSummariesLocal(){
+  if(S.backend || !S.db) return 0;
+  let n = 0;
+  (S.db.patients || []).forEach(p => {
+    const s = p.procSummary;
+    const missing = !s && summaryUploadable(p);
+    const unowned = !!s && s.status === "OPEN" && s.legacy && !(s.assignees || []).length;
+    if(!missing && !unowned) return;
+    const cpm = String(taskCpm(p.siteId) || "").toLowerCase();
+    if(!cpm) return;
+    const now = nowISO();
+    if(missing){
+      p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
+        openedBy:"system", procEndAt:"", dueAt:legacyDueLocal(now), assignees:[cpm], unmatched:[],
+        answers:PSF.prefill(p, PD.TRAINING_ITEMS || []), updatedAt:now, updatedBy:"", reminderSentAt:"",
+        closedAt:"", closedBy:"", filledBy:"", filedAt:"", editedAfterClose:[], legacy:true, openedAsTask:now };
+    }else Object.assign(s, { assignees:[cpm], dueAt:legacyDueLocal(now), openedAsTask:now });
+    n++;
+  });
+  if(n) commit();
+  return n;
+}
+
 /* Standalone (demo) mirror of what the server does at Submit. */
 function openSummaryLocal(p){
   if(p.procSummary || p.status !== "TREATED") return;
   const c = cf(p), now = nowISO();
   const emails = [];
   ["proctor","tech1","tech2","clinical"].forEach(k => { const u = teamUserByName(c[k]); if(u) emails.push(String(u.email).toLowerCase()); });
-  const cpm = patientCpm(p, "order") || siteCpm(p.siteId);
+  const cpm = patientCpm(p, "order");
   if(cpm) emails.push(String(cpm).toLowerCase());
   const end = PSF.procedureEnd(p, procEndLocal(p));
   p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
@@ -36015,10 +36393,15 @@ function summaryFormHtml(p){
       ? (s.closedVia === "UPLOAD" ? 'Uploaded as a file by ' : 'Closed by ') +
         '<b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
         (s.filedAt ? ' · filed in the subject’s folder and in Procedure_Summary' : ' · <b>not filed yet</b>')
-      : s.legacy ? 'Filled in online for a subject implanted before summaries existed. Nothing is due and it is ' +
-        'nobody’s task; anyone at Innoventric can fill it in, and whoever closes it is recorded as Filled by.'
+      : s.legacy && !(s.assignees || []).length
+      ? 'A subject implanted before summaries existed. Its site has no Responsible CPM and no clinic manager ' +
+        'is set, so it is nobody’s task yet; anyone at Innoventric can fill it in, and whoever closes it is recorded as Filled by.'
+      : s.legacy
+      ? 'Missing summary, opened as a task: this subject was implanted without one. Due by <b>' + esc(fmtTs(s.dueAt)) + '</b>. ' +
+        'Given to: <b>' + esc(summaryWho(s.assignees)) + '</b>' + summaryReassignBtn(p) + '. Anyone at Innoventric can fill it in; ' +
+        'whoever closes it is recorded as Filled by.'
       : 'Due by <b>' + esc(fmtTs(s.dueAt)) + '</b> — ' + PSF.DUE_HOURS + ' hours after the procedure. ' +
-        'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>. Anyone on it can fill it in; ' +
+        'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>' + summaryReassignBtn(p) + '. Anyone on it can fill it in; ' +
         'whoever closes it is recorded as Filled by.') +
     ((s.unmatched || []).length ? '<div class="hint">Not app users, so not given it: ' + esc(s.unmatched.join(", ")) + '</div>' : '') +
     ((s.editedAfterClose || []).length ? '<div class="hint">Changed after closing: ' +
@@ -36064,7 +36447,8 @@ function summaryListHtml(){
     : k === "closed" ? summaryOf(p).status === "CLOSED" : k === "open" ? summaryOf(p).status === "OPEN" : true).length;
   return '<div class="info">One summary per treated subject (form ' + esc(PSF.DOC.number) + ' Rev' + esc(PSF.DOC.revision) +
     '), opened when the procedure report is submitted, for the procedure team and the subject’s Clinical PM. ' +
-    'Due ' + PSF.DUE_HOURS + ' hours after the procedure.</div>' +
+    'Due ' + PSF.DUE_HOURS + ' hours after the procedure. A subject implanted without one is opened as a task for the ' +
+    'site’s Responsible CPM (or the clinic manager), due in ' + LEGACY_DUE_DAYS + ' days.</div>' +
     '<div class="filters">' + selField("ps-filter", "Show", PSUM.filter,
       [["open","Open (" + n("open") + ")"],["mine","Given to me (" + n("mine") + ")"],
        ["closed","Closed (" + n("closed") + ")"],["all","All (" + n("all") + ")"]]
@@ -36105,6 +36489,7 @@ VIEWS.procsummary = {
   sub(){ const p = PSUM.id && patient(PSUM.id);
     return p ? "Clinical procedure summary — " + p.patientCode : "The clinical procedure summary (" + PSF.DOC.number + ") of every treated subject."; },
   body(){
+    openMissingSummariesLocal();
     const p = PSUM.id && patient(PSUM.id);
     if(p && summaryOf(p)) return summaryFormHtml(p);
     PSUM.id = "";
@@ -36147,10 +36532,12 @@ async function startSummaryOnline(id, btn){
   if(!summaryUploadable(p)) return;
   if(!S.backend){
     const now = nowISO();
+    const cpm = String(taskCpm(p.siteId) || "").toLowerCase();
     p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
-      openedBy:myEmail(), procEndAt:"", dueAt:"", assignees:[], unmatched:[], answers:PSF.prefill(p, PD.TRAINING_ITEMS || []),
+      openedBy:myEmail(), procEndAt:"", dueAt:cpm ? legacyDueLocal(now) : "", assignees:cpm ? [cpm] : [], unmatched:[],
+      answers:PSF.prefill(p, PD.TRAINING_ITEMS || []),
       updatedAt:now, updatedBy:"", reminderSentAt:"", closedAt:"", closedBy:"", filledBy:"", filedAt:"",
-      editedAfterClose:[], legacy:true };
+      editedAfterClose:[], legacy:true, openedAsTask:cpm ? now : "" };
     logAction("Procedure summary started online for " + p.patientCode, { locationId:p.siteId });
     commit(); renderNav(); return openSummary(id);
   }
@@ -36171,7 +36558,8 @@ function chooseSummaryWay(id){
   if(summaryOf(p)) return openSummary(id);
   modal("Procedure summary — " + p.patientCode,
     '<p>' + esc(p.patientCode) + ' has no procedure summary. Fill in form ' + esc(PSF.DOC.number) +
-      ' here in the app, or upload it as a file. Nothing is due either way.</p>',
+      ' here in the app, or upload it as a file. Filled in online, it is the site’s CPM’s task, due in ' +
+      LEGACY_DUE_DAYS + ' days.</p>',
     '<div class="row"><button class="btn btn-primary" id="psw-online">Fill in online</button>' +
       '<button class="btn" id="psw-upload">Upload a file</button>' +
       '<button class="btn" data-close="1">Cancel</button></div>');
@@ -36527,6 +36915,24 @@ function screenDurNote(sd){
     out.map(t => '<div style="margin-bottom:3px">' + esc(t) + '</div>').join("") + '</div>';
 }
 
+/* Every subject whose IVC peaks were both recorded, the drop marked (10 Nov 2026). */
+function ivcDropTable(ivc){
+  if(!ivc || (!ivc.rows.length && !ivc.missing.length)) return "";
+  return '<div class="card" style="margin-bottom:14px"><div class="card-hd"><h2>IVC pressure, before and after the implant</h2>' +
+    '<span class="hint">Peak (V wave), mmHg. Before = the PRE closest to the implant: the additional PRE when it was taken.</span></div>' +
+    '<div class="card-bd">' + (ivc.rows.length
+      ? '<div class="tbl-wrap"><table><thead><tr><th>Subject</th><th>Protocol</th><th>Before</th><th>After</th><th>IVC pressure</th></tr></thead><tbody>' +
+        ivc.rows.map(r => '<tr><td><b>' + esc(r.code) + '</b></td><td>' + (r.compassionate ? "Compassionate use" : "Study") + '</td>' +
+          '<td>' + esc(String(r.pre)) + ' <span class="hint">' + esc(r.preFrom) + '</span></td><td>' + esc(String(r.post)) + '</td>' +
+          '<td>' + (r.drop ? '<span class="pill p-green">↓ Dropped (' + esc(String(Math.round((r.pre - r.post) * 10) / 10)) + ')</span>'
+                           : '<span class="pill p-grey">No drop</span>') + '</td></tr>').join("") +
+        '</tbody></table></div>'
+      : '<div class="hint">No procedure report has both IVC peaks recorded yet.</div>') +
+    (ivc.missing.length ? '<div class="hint" style="margin-top:6px">Not counted, both peaks not recorded: ' +
+      esc(ivc.missing.join(", ")) + '</div>' : '') +
+    '</div></div>';
+}
+
 VIEWS.studystatus = {
   title:"Study Status",
   sub:"How the study is going, and the numbers worth watching. " +
@@ -36546,6 +36952,13 @@ VIEWS.studystatus = {
       '<h3 class="dash-h">How long screening takes</h3>' +
       '<div class="dash">' + rep.screenDurTiles.map(t => dashTile(t.value, t.label, t.sub)).join("") + '</div>' +
       screenDurNote(rep.screenDur) +
+      /* The procedure itself (10 Nov 2026, the owner): skin to skin, device time, and in how
+         many subjects the IVC pressure dropped. Words and numbers from studyMeasures. */
+      '<h3 class="dash-h">The procedure</h3>' +
+      '<div class="dash">' + rep.procTiles.skinToSkin.map(t => dashTile(t.value, t.label, t.sub)).join("") + '</div>' +
+      '<div class="dash">' + rep.procTiles.deviceTime.map(t => dashTile(t.value, t.label, t.sub)).join("") + '</div>' +
+      '<div class="dash">' + dashTile(rep.procTiles.ivc.value, rep.procTiles.ivc.label, rep.procTiles.ivc.sub) + '</div>' +
+      '<div class="dash-hide">' + ivcDropTable(rep.proc.ivc) + '</div>' +
       '<div class="dash-hide">' + implantChart(rep) + '</div>' +
       '<div class="dash-hide">' + siteTable(sites) + '</div>' +
       '<div class="row dash-hide" style="margin-bottom:12px">' +
@@ -37390,8 +37803,18 @@ function wireReportEyes(){
   $$("[data-report-eye]").forEach(b => b.onclick = e => {
     e.stopPropagation();
     e.preventDefault();
-    openPatientFiles(patient(b.dataset.reportEye));
+    openEye(patient(b.dataset.reportEye));
   });
+}
+/* WHAT THE EYE OPENS (10 Nov 2026, the owner): after the procedure, the procedure report -
+   the document written at the end of it - and not the subject folder, whose first file
+   is the CT report from screening. That is what somebody pressing View on a treated
+   subject wants to read. The folder is one button away inside the report dialog. Before
+   the procedure there is no report, so the eye still opens the folder. */
+function openEye(p){
+  if(!p) return;
+  if(isPostProcedure(p) && canSeeReport()) openReportViewer(p);
+  else openPatientFiles(p);
 }
 
 /* Fetch one filed report. Returns the blob, or a reason it could not be shown. */
@@ -37413,9 +37836,15 @@ async function fetchFiledReport(id, locked){
 
 async function openReportViewer(p){
   if(!p) return;
+  /* Every other file of the subject - the CT report, models, Road Map, images - is one
+     press away (10 Nov 2026): the eye opens this dialog first on a treated subject. */
   const m = modal("Procedure report — " + p.patientCode,
+    '<div class="row" style="margin-bottom:8px"><button class="btn btn-sm" id="rv-files">' +
+      'All files of this subject</button></div>' +
     '<div id="rv-body"><div class="hint">Fetching the filed report…</div></div>');
   if(m) m.classList.add("modal-wide");
+  const rvf = $("#rv-files");
+  if(rvf) rvf.onclick = () => { closeModal(); openPatientFiles(p); };
   const paint = html => { const b = $("#rv-body"); if(b) b.innerHTML = html; };
 
   /* A locked record is filed as the locked document. If that is not there - a patient
@@ -38940,15 +39369,21 @@ function locForm(l){
     /* THERE IS NO SITE WITHOUT A RESPONSIBLE CPM (20 Oct 2026, the owner). Any user may be it;
        an App Admin or a Manager chooses (setSiteCpm). Anybody else sees it read-only - and
        if the site has none yet, saving makes THEM its CPM, which the server does too. */
-    '<div class="field" id="l-cpm-row"' + (l.type === "SITE" ? '' : ' hidden') + '>' +
-      '<label class="req" for="l-cpm">Responsible CPM</label><select id="l-cpm"' +
+    /* On the HQ location the same field names the CLINIC MANAGER (10 Nov 2026, the owner): the
+       person who takes every task of a site that has no Responsible CPM (responsibleCpm in
+       anatStages.js). Optional there; only an App Admin edits an HQ. */
+    '<div class="field" id="l-cpm-row"' + (l.type === "SITE" || l.type === "HQ" ? '' : ' hidden') + '>' +
+      '<label id="l-cpm-lbl" class="' + (l.type === "HQ" ? "" : "req") + '" for="l-cpm">' +
+        (l.type === "HQ" ? "Clinic manager" : "Responsible CPM") + '</label><select id="l-cpm"' +
       (can("setSiteCpm") ? '' : ' disabled') + '>' +
       '<option value="">— choose —</option>' +
       S.db.users.slice().sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))).map(u =>
         '<option value="' + esc(u.id) + '"' + (u.id === l.cpmUserId ? " selected" : "") + '>' +
         esc(u.name) + (u.role ? ' · ' + esc((ROLES[u.role] || {}).label || u.role) : '') +
         '</option>').join("") + '</select>' +
-      '<div class="hint">' + (can("setSiteCpm")
+      '<div class="hint">' + (l.type === "HQ"
+        ? 'Takes every task of a hospital site that has no Responsible CPM, as that site\x27s CPM.'
+        : can("setSiteCpm")
         ? 'Required for a hospital site. Any user may be it. Receives this site\'s alerts, ' +
           'its screening tasks and its stuck subjects in the daily mail.'
         : (l.cpmUserId
@@ -38964,7 +39399,9 @@ function locForm(l){
   const typeSel = $("#l-t"), openRow = $("#l-open-row");
   if(typeSel && openRow) typeSel.onchange = () => { openRow.hidden = typeSel.value !== "SITE";
     if($("#l-phys-row")) $("#l-phys-row").hidden = typeSel.value !== "SITE";
-    if($("#l-cpm-row")) $("#l-cpm-row").hidden = typeSel.value !== "SITE"; };
+    if($("#l-cpm-row")) $("#l-cpm-row").hidden = !["SITE","HQ"].includes(typeSel.value);
+    if($("#l-cpm-lbl")){ $("#l-cpm-lbl").textContent = typeSel.value === "HQ" ? "Clinic manager" : "Responsible CPM";
+      $("#l-cpm-lbl").className = typeSel.value === "HQ" ? "" : "req"; } };
   if(typeSel && openRow) openRow.hidden = typeSel.value !== "SITE";
 
   $("#l-save").onclick = async () => {
@@ -38973,6 +39410,8 @@ function locForm(l){
     /* No site without a Responsible CPM. Whoever may not choose keeps the site's own, or
        becomes it - the server applies the same rule and is the authority. */
     let cpmPick = can("setSiteCpm") ? ($("#l-cpm").value || null) : (l.cpmUserId || (S.me && S.me.id) || null);
+    /* Only a site (its CPM) and the HQ (the clinic manager) carry one. */
+    if(!["SITE","HQ"].includes($("#l-t").value)) cpmPick = null;
     if($("#l-t").value === "SITE" && !cpmPick)
       return showWhy("l-why", "Choose the Responsible CPM - a hospital site cannot be saved without one.");
     Object.assign(l, { name, type:$("#l-t").value, address:$("#l-a").value.trim(),
