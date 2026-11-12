@@ -14481,7 +14481,8 @@ const CAPABILITIES = {
   editSubmittedReport: ["ADMIN","MANAGER"],  // change a procedure report after Submit, with a reason; roleStore.js
   releaseRework:   ["QA"],  // QA releases a unit back from rework into stock; never the admin who brought it back
   approveLabelChange: ["ADMIN","QA"],  // apply a scanned label's dates to the unit; on the spot if they scanned it; roleStore.js
-  correctUnit:     ["ADMIN"]  // correct any field of a unit's record, with a reason; roleStore.js
+  correctUnit:     ["ADMIN"],  // correct any field of a unit's record, with a reason; roleStore.js
+  linkShipmentRequest: ["ADMIN","WH_ADMIN"]  // link a shipment that went out to its request (v3.14.0); never a partner account; roleStore.js
 };
 /* Every role the signed-in user holds, primary first. A user can carry a second role
    alongside their own - a site employee who also runs a warehouse - and capabilities are
@@ -17510,6 +17511,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.14.0", date: "12 November 2026", groups: [
+    { h:"A shipment that went out can be linked to its request", items:[
+      "A shipment packed straight from <b>Send Devices Out</b>, not from the request, used to leave a stock request reading <b>Missing</b> after its units arrived. Open the shipment in <b>In Transit</b>: it now says which request it answers, and an <b>App Admin or WH Admin</b> can press <b>Link to a request</b> (or <b>Change</b>), choose one of the open requests for that destination and say why. The request then counts the shipment’s units and closes when they are checked in. No unit moves; the change is kept on the shipment and in the activity log.",
+      "On <b>Send Devices Out</b>, choosing a destination that has an open request now shows it, with <b>Answer it with this shipment</b>. Nothing stops you sending without it."
+    ]}
+  ]},
   { version: "3.13.0", date: "10 November 2026", groups: [
     { h:"The clinic manager is set on the person", items:[
       "<b>Administration → Users</b> has a new tick, <b>Clinic manager</b>. The person ticked takes every task of a hospital site that has no Responsible CPM. One person at a time: ticking somebody else moves it to them. It is shown as a green <b>Clinic manager</b> label beside their role.",
@@ -21432,6 +21439,41 @@ function requestProgress(ref, lines, destinationId){
     }
   }
   return tally;
+}
+
+/* LINKING A SHIPMENT TO ITS REQUEST (12 Nov 2026, the owner; v3.14.0). A request reads a
+   shipment as its own only through `requestRef`, and until now that was set only when the
+   box was started from the request's row. These two answer "what can this box be linked
+   to" and "what is it linked to", for the shipment card and for Send Devices Out.
+
+   The open requests to one place: the same queue Home shows, so a request the queue has
+   already closed is not offered. */
+function openRequestsTo(destId, exceptRef){
+  if(!destId) return [];
+  /* A subject on the queue only because the procedure is close and the site is short has
+     no order behind it yet - nothing was asked, so there is nothing to answer (the server
+     refuses it as NO_ORDER). */
+  const ordered = r => {
+    const o = (((patient(r.patientId) || {}).anat || {}).order) || {};
+    return !!(o.requestedBy || o.productsConfirmed);
+  };
+  return allShipmentRequests().filter(r => r.siteId === destId && r.ref !== exceptRef &&
+    (r.kind !== "PATIENT" || ordered(r)));
+}
+/* A request named in words, open or not - a shipment linked months ago still says what it
+   answered after the request has left the queue. */
+function requestRefLabel(ref){
+  const m = /^(patient|stock):(.+)$/.exec(String(ref || ""));
+  if(!m) return "";
+  if(m[1] === "patient"){
+    const p = patient(m[2]);
+    return "Product order for " + (p ? (p.patientCode || p.id) : m[2]);
+  }
+  return "Stock request " + m[2];
+}
+function requestRowText(r){
+  return (r.kind === "PATIENT" ? "Product order for " : "Stock request ") + r.id +
+    (r.devices ? " · " + r.devices : "");
 }
 
 /* A procedure inside a fortnight, at a site that does not hold everything it needs. The
@@ -30117,6 +30159,22 @@ VIEWS.shipment = {
         ' <button class="btn btn-sm" id="sh-unlink">Not this one</button>' +
         '<div class="hint">The units scanned below are counted against that request, so it ' +
         'closes itself when they are checked in.</div></div>';
+    }else if(SH.destId){
+      /* AN OPEN REQUEST FOR THIS PLACE, AND THIS BOX IS NOT LINKED TO IT (12 Nov 2026,
+         the owner: warn with a button, never block). A box packed here without the link left a
+         stock request reading "Missing" after its units arrived. Nothing stops the send - a
+         box can go to a site for reasons that have nothing to do with the request. */
+      const open = openRequestsTo(SH.destId);
+      if(open.length){
+        h += '<div class="warn" style="margin-bottom:12px"><b>' +
+          (open.length === 1 ? 'There is an open request' : 'There are ' + open.length + ' open requests') +
+          ' for ' + esc(locName(SH.destId)) + '.</b> If this box answers one, link it, so the ' +
+          'request counts these units and closes when they are checked in.' +
+          open.map(r => '<div class="row" style="margin-top:7px;align-items:center">' +
+            '<span>' + esc(requestRowText(r)) + '</span>' +
+            '<button class="btn btn-sm" data-shlink="' + esc(r.ref) + '">Answer it with this shipment</button>' +
+            '</div>').join("") + '</div>';
+      }
     }
 
     /* Step 1 — where it is going */
@@ -30326,6 +30384,10 @@ VIEWS.shipment = {
   wire(){
     const unlink = $("#sh-unlink");
     if(unlink) unlink.onclick = () => { SH.requestRef = ""; saveDrafts(); render(); };
+    $$("[data-shlink]").forEach(b => b.onclick = () => {
+      SH.requestRef = b.dataset.shlink; saveDrafts(); render();
+      toast("This shipment now answers " + requestRefLabel(SH.requestRef) + ".", "good");
+    });
     const pv = $("#sh-preview"); if(pv) pv.onclick = () => previewShipmentDocs();
     const b = (id, f) => { const e = $(id); if(e) e.onchange = ev => { f(ev); saveDrafts(); }; };
     b("#sh-o", e => { SH.originId = e.target.value; clearWhy("sh-why"); render(); });
@@ -32315,6 +32377,24 @@ function shipmentCard(sh){
         .filter(Boolean).join(", ") || "—") + '</div>' +
     '</div>';
 
+  /* WHICH REQUEST THIS BOX ANSWERED (12 Nov 2026, the owner; v3.14.0). Always said, so a box
+     sent without the link can be seen to have none; App Admin and WH Admin may link it, or
+     change the link with a reason, once it has left - arrived included. Never a partner
+     account. The last change is named under it; the rest is in the audit log. */
+  if(!sh.reconstructed){
+    const mayLink = can("linkShipmentRequest") && !isExternalUser() && shipmentDispatched(sh);
+    const last = (sh.requestLinks || []).slice(-1)[0];
+    h += '<div class="row" style="margin-top:8px;align-items:center">' +
+      '<div class="kv"><b>Answers request</b> ' +
+        (sh.requestRef ? esc(requestRefLabel(sh.requestRef)) : '<span class="hint">none</span>') + '</div>' +
+      (mayLink ? '<button class="btn btn-sm" data-shreq="' + esc(sh.shipmentId) + '">' +
+        (sh.requestRef ? 'Change' : 'Link to a request') + '</button>' : '') +
+      '</div>' +
+      (last ? '<div class="hint">' + (last.to ? 'Linked' : 'Unlinked') + ' after it left by ' +
+        esc(last.by || "—") + ' on ' + esc(fmtTs(last.at)) + ' — ' + esc(last.reason || "") +
+        (last.from ? ' (was: ' + esc(requestRefLabel(last.from)) + ')' : '') + '</div>' : '');
+  }
+
   /* What actually left. Two ways a unit can be on this list and they are not the same
      event: REFUSED means the dispatch itself would not move it, seconds after the button
      was pressed. WITHDRAWN means it dispatched fine and an admin later recorded that it
@@ -32472,7 +32552,76 @@ function shipmentCard(sh){
   return h + '</div></div>';
 }
 
+/* Link a shipment that has left to the request it answered, or change / remove the link.
+   The server checks it all again (open request, same destination, dispatched, App Admin or
+   WH Admin, not a partner) and writes the audit line; standalone mirrors it. */
+function askLinkRequest(shipmentId){
+  const sh = (S.db.shipments || []).find(x => x.shipmentId === shipmentId);
+  if(!sh) return toast("That shipment is no longer here.", "bad");
+  const open = openRequestsTo(sh.destinationId, sh.requestRef);
+  if(!open.length && !sh.requestRef){
+    return toast("There is no open request for " + locName(sh.destinationId) + ".", "warn");
+  }
+  const carried = {};
+  for(const u of (sh.units || [])){
+    const k = (u.productType === "UNICA" ? "Unica " : "DS ") + (u.size || "");
+    carried[k] = (carried[k] || 0) + 1;
+  }
+  const opt = (val, text, on) => '<label class="check" style="margin:4px 0;display:flex">' +
+    '<input type="radio" name="lr-pick" value="' + esc(val) + '"' + (on ? ' checked' : '') + '>' +
+    '<span>' + text + '</span></label>';
+  modal(sh.requestRef ? "Change the request this shipment answers" : "Link this shipment to a request",
+    '<p>Shipment <b>' + esc(invoiceNo(sh) ? "Invoice " + invoiceNo(sh) : sh.shipmentId) + '</b> to <b>' +
+      esc(locName(sh.destinationId)) + '</b> carried ' +
+      esc(Object.keys(carried).map(k => carried[k] + " × " + k).join(", ") || "no tracked units") + '.</p>' +
+    (sh.requestRef ? '<div class="note">Now linked to <b>' + esc(requestRefLabel(sh.requestRef)) +
+      '</b>.</div>' : '') +
+    '<div class="field"><label class="req">Which request did it answer</label>' +
+      open.map((r, i) => opt(r.ref, esc(requestRowText(r)), i === 0)).join("") +
+      (sh.requestRef ? opt("", "<i>None — it did not answer a request</i>", !open.length) : '') +
+    '</div>' +
+    '<div class="hint">Only open requests for ' + esc(locName(sh.destinationId)) + ' are offered. ' +
+      'The request then counts this shipment’s units and closes when they are checked in there. ' +
+      'No unit moves.</div>' +
+    '<div class="field" style="margin-top:8px"><label class="req" for="lr-why">Why</label>' +
+      '<input type="text" id="lr-why" maxlength="400" autocomplete="off" ' +
+      'placeholder="e.g. packed from Send Devices Out, not from the request"></div>' + whyBox("lr-err"),
+    '<div class="row"><button class="btn btn-primary" id="lr-go">Save</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#lr-go").onclick = async () => {
+    const picked = $$('input[name="lr-pick"]').find(x => x.checked);
+    if(!picked) return showWhy("lr-err", "Choose the request.");
+    const to = picked.value;
+    const reason = ($("#lr-why").value || "").trim();
+    if(reason.length < 3) return showWhy("lr-err", "Say why. It goes on the shipment and in the log.");
+    const btn = $("#lr-go"); btn.disabled = true;
+    if(S.backend){
+      try{
+        const out = await api("POST", "/api/shipments/" + encodeURIComponent(shipmentId) + "/request-link",
+          { requestRef: to, reason });
+        const i = (S.db.shipments || []).findIndex(x => x.shipmentId === shipmentId);
+        if(i >= 0 && out.shipment) S.db.shipments[i] = out.shipment;
+        if(out.auditLine) S.db.logs.unshift(out.auditLine);
+        if(out.auditFailed) toast("Linked — but the log line could not be written. Record it by hand.", "warn");
+      }catch(e){ btn.disabled = false; return showWhy("lr-err", e.message || "The server refused it."); }
+    }else{
+      const from = sh.requestRef || "";
+      sh.requestLinks = (sh.requestLinks || []).concat([{ from, to, reason, at:nowISO(),
+        by:(S.me && S.me.email) || "" }]);
+      sh.requestRef = to;
+      logAction((to ? "Shipment linked to a request: " : "Shipment unlinked from its request: ") + sh.shipmentId, {
+        stateChanges:(from ? requestRefLabel(from) : "no request") + " → " + (to ? requestRefLabel(to) : "no request"),
+        comments:"Reason: " + reason + " | Set after the shipment left; no unit moved.",
+        locationId:sh.destinationId || null, highPriority:true });
+    }
+    closeModal();
+    toast(to ? "Linked to " + requestRefLabel(to) + "." : "The link was removed.", "good");
+    render();
+  };
+}
+
 function wireShipmentCard(){
+  $$("[data-shreq]").forEach(b => b.onclick = () => askLinkRequest(b.dataset.shreq));
   const save = $("#sh-e-save");
   if(save) save.onclick = async () => {
     /* What the server filed under SHIPMENTS with this save, if anything. Declared out
