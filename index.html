@@ -14388,10 +14388,55 @@ function state(sum, nowMs){
   return { kind: "open", hoursLeft: isNaN(due) ? null : Math.max(0, Math.ceil((due - now) / 3600000)) };
 }
 
+/* ONLINE ONLY FROM 13 NOV 2026 (the owner, 15 Nov 2026: "every procedure performed from the day
+   before yesterday - fill in online, not upload a file"). A procedure on or after this date
+   has its summary filled in the app; the upload stays only for older ones. The date is the
+   report's procedure date, else the scheduled one; a subject with neither keeps the upload. */
+var ONLINE_ONLY_FROM = "2026-11-13";
+function procDateOf(p){
+  var c = (p && p.caseFile) || {};
+  return str(c.procDate || (p && p.procedureDate)).slice(0, 10);
+}
+function uploadAllowed(p){
+  var d = procDateOf(p);
+  return !/^\d{4}-\d{2}-\d{2}$/.test(d) || d < ONLINE_ONLY_FROM;
+}
+
+/* THE PROCEDURE HAPPENED AND NO REPORT CAME (15 Nov 2026, the owner). The scheduled procedure
+   date has passed - `today` is a later day - and the report has not been submitted. Not for
+   a subject who is cancelled, stopped, on hold or locked, and not for the control arm, which
+   has no procedure. The date is the SCHEDULE's (p.procedureDate), the one the order and the
+   warehouse work to; the report's own date is a fallback. `arm` is passed in because only
+   anatStages knows how to read it. One rule, read by the server's sweep, the page and the
+   daily mail. Returns the procedure date when it is a gap, else "". */
+var REPORT_DUE_DAYS = 1;
+var BOOKED = ["SCHEDULED", "ORDER_REQUESTED", "IN_TRANSIT", "DELIVERED"];
+function reportGapDate(p, today, arm){
+  if(!p || p.submitted || p.fileLocked) return "";
+  /* Only a booked procedure - scheduling done (stage 9), the order perhaps out, the units
+     perhaps at the site. A subject still in screening with a date typed in somewhere has had
+     no procedure to report on. TREATED and CANCELLED are out by the same test. */
+  if(BOOKED.indexOf(p.status) < 0) return "";
+  if(p.cancelled && p.cancelled.is) return "";
+  if(p.hold && p.hold.is) return "";
+  if(arm === "CONTROL") return "";
+  var d = str(p.procedureDate || ((p.caseFile || {}).procDate)).slice(0, 10);
+  var t = str(today).slice(0, 10);
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(d) || !/^\d{4}-\d{2}-\d{2}$/.test(t)) return "";
+  return d < t ? d : "";
+}
+/* The open gap record, or null. */
+function openGap(p){
+  var g = p && p.reportGap;
+  return g && g.status === "OPEN" ? g : null;
+}
+
 var api = { DOC: DOC, DUE_HOURS: DUE_HOURS, REMIND_AFTER_HOURS: REMIND_AFTER_HOURS, YN: YN, PERF: PERF, TEAM: TEAM,
             SECTIONS: SECTIONS, allItems: allItems, specifyKey: specifyKey, missing: missing,
             sanitize: sanitize, prefill: prefill, header: header, procedureEnd: procedureEnd,
-            dueFrom: dueFrom, state: state };
+            dueFrom: dueFrom, state: state,
+            ONLINE_ONLY_FROM: ONLINE_ONLY_FROM, procDateOf: procDateOf, uploadAllowed: uploadAllowed,
+            REPORT_DUE_DAYS: REPORT_DUE_DAYS, reportGapDate: reportGapDate, openGap: openGap };
 if(typeof module !== "undefined" && module.exports) module.exports = api;
 if(typeof window !== "undefined") window.ProcSummaryForm = api;
 })();
@@ -14425,7 +14470,7 @@ const SESSION_KEY = DEMO ? "pivotal.demo.session"    : "pivotal.localsession";
    any other value (or none) is replaced by a fresh seed, once. Raise this whenever seed()
    changes in a way an old copy would show wrongly. Demo only: in the live app the local
    copy is a cache of the server and is never reseeded. */
-const DEMO_SEED_VERSION = 2;
+const DEMO_SEED_VERSION = 3;   // 3 (15 Nov 2026): a seeded procedure two days ago with no report
 /* Half-finished inspections and shipments. The case file has autosaved from the
    start; these two screens did not, so a phone locking mid-inspection threw the
    work away silently. Two adjacent screens behaving oppositely is its own bug. */
@@ -15297,7 +15342,13 @@ function seed(){
     /* Still collecting material: the CT has not arrived, so the evaluation cannot open. */
     mkPatient({ id:"pat-6", patientCode:"NGM-016", siteId:"loc-site-a", procedureDate:"",
       unicaSize:"", dsSize:"", status:"SCREENING", notes:"New referral",
-      registeredAt:daysFromNow(-6), screening:screened(3, -4) })
+      registeredAt:daysFromNow(-6), screening:screened(3, -4) }),
+    /* The procedure was two days ago and nobody submitted the report (15 Nov 2026): the
+       missing-report task, the early summary and the confirm dialog have something to show. */
+    mkPatient({ id:"pat-7", patientCode:"RVS-012", siteId:"loc-site-b", procedureDate:daysFromNow(-2),
+      unicaSize:"M", dsSize:"Short", status:"DELIVERED", notes:"Procedure done, report not submitted",
+      registeredAt:daysFromNow(-80), screening:screened(6, -78),
+      anat:evaluated(8, "M", -20, booked(daysFromNow(-2), "loc-site-b", true)) })
   ];
   const G = [
     { id:uid("log"), timestamp:nowISO(), action:"Store seeded with demonstration data", locationId:null, userName:"system", role:"SYSTEM", stateChanges:"schema v"+SCHEMA_VERSION, comments:"", highPriority:false }
@@ -15558,6 +15609,9 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               /* the procedure summary (20 Oct 2026): written only by its
                                  own routes, so the server's copy is always the newer one */
                               "procSummary",
+                              /* the missing-report gap (15 Nov 2026): opened, confirmed and
+                                 closed only by the server */
+                              "reportGap", "reportGapHistory",
                               /* stage overrides (26 Oct 2026): written only by their
                                  route and the approval route */
                               "stageOverrides",
@@ -17511,6 +17565,20 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.15.0", date: "15 November 2026", groups: [
+    { h:"A procedure with no report no longer goes unnoticed", items:[
+      "From the morning after a procedure’s scheduled date, if its procedure report has not been submitted, the site’s <b>Responsible CPM</b> and the <b>clinic manager</b> are told once by mail, and the subject is listed at the top of the daily mail every day until the report is submitted.",
+      "The procedure report shows it, with <b>Confirm the team and who completes it</b>: the site’s CPM, the clinic manager, a Manager or an App Admin confirms who the clinical team was (it goes into the report’s team fields) and chooses who completes the report and who completes the procedure summary. The report becomes that person’s task, due one day later, and they are told by mail.",
+      "The procedure summary opens at the same time and can be filled in online before the report exists. Whoever the CPM chose to complete it stays on it when the report is submitted.",
+      "<b>The procedure did not take place</b>: set the new date (stage 9, Update order) or cancel the subject. Either ends the task."
+    ]},
+    { h:"Report and summary completed are mailed", items:[
+      "Submitting a procedure report and closing a procedure summary each send a mail to the same people as a completed stage, with the PDF attached (for a summary uploaded as a file, that file)."
+    ]},
+    { h:"The summary is filled in online", items:[
+      "For a procedure on or after <b>13 November 2026</b> the procedure summary is filled in online. Uploading it as a file remains only for earlier procedures."
+    ]}
+  ]},
   { version: "3.14.0", date: "12 November 2026", groups: [
     { h:"A shipment that went out can be linked to its request", items:[
       "A shipment packed straight from <b>Send Devices Out</b>, not from the request, used to leave a stock request reading <b>Missing</b> after its units arrived. Open the shipment in <b>In Transit</b>: it now says which request it answers, and an <b>App Admin or WH Admin</b> can press <b>Link to a request</b> (or <b>Change</b>), choose one of the open requests for that destination and say why. The request then counts the shipment’s units and closes when they are checked in. No unit moves; the change is kept on the shipment and in the activity log.",
@@ -21131,6 +21199,21 @@ function todoItems(){
              (t.a.dueDate ? " (due " + fmtDate(t.a.dueDate) + ")" : "") +
              (t.unassigned ? " · no CPM set for the site" : "")).join(" — ") +
            (tasks.length > 3 ? "…" : "") });
+  }
+
+  /* 0a — THE PROCEDURE HAPPENED AND NO REPORT CAME (15 Nov 2026): the gaps this person
+     was alerted to and has to confirm, and the reports they were made responsible for. */
+  openReportGapsLocal();
+  for(const p of gapsToConfirm()) out.push({ ic:"case", tone:"t-red", view:"clinical", patientId:p.id,
+    title: p.patientCode + " — procedure report not submitted",
+    sub: "Procedure " + fmtDate(gapOf(p).procDate) + " · " + locName(p.siteId) +
+         " · confirm the clinical team and who completes the report and the summary" });
+  for(const p of myGapReports()){
+    const g = gapOf(p), late = g.reportDueAt && Date.now() > Date.parse(g.reportDueAt);
+    out.push({ ic:"case", tone: late ? "t-red" : "t-amber", view:"clinical", patientId:p.id,
+      title: p.patientCode + " — procedure report to complete" + (late ? " (overdue)" : ""),
+      sub: "Procedure " + fmtDate(g.procDate) + " · due " + fmtTs(g.reportDueAt) + " · you were made responsible by " +
+           (g.confirmed.byName || g.confirmed.by) });
   }
 
   /* 0b — procedure summaries given to this person and still open (20 Oct 2026). */
@@ -28458,8 +28541,12 @@ VIEWS.clinical = {
     migrateContrast(p);
     /* v3.0.0 (items 17, 24): the team from stage 9, the physicians from the site. */
     if(applyReportDefaults(p)){ commit(); setTimeout(() => scheduleCaseFileSave(p), 0); }
+    /* The team the CPM confirmed for a missing report (15 Nov 2026), once per confirmation. */
+    openReportGapsLocal();
+    if(applyConfirmedTeam(p)){ commit(); setTimeout(() => scheduleCaseFileSave(p), 0); }
     migrateInjectionAngles(p);
     const c = cf(p);
+    h += reportGapBanner(p);
 
     /* ---- the briefing: what is known about this patient, before any data entry ---- */
     const stockHere = S.db.devices.filter(d => d.locationId === p.siteId &&
@@ -29467,7 +29554,7 @@ async function submitCase(p){
   else if(c.procDate || p.procedureDate) p.status = "TREATED";
   /* Standalone opens the summary itself; offline, the server opens it when the queued
      submit lands. */
-  if(!S.backend) openSummaryLocal(p);
+  if(!S.backend){ afterSubmitGapLocal(p); openSummaryLocal(p); }
   logSubmit();
   commit();
   toast(offline ? "Procedure report submitted on this device. It reaches the server when the network returns."
@@ -36447,6 +36534,212 @@ document.addEventListener("click", e => {
   const p = patient(b.dataset.psReassign); if(p) askSummaryAssignees(p);
 }, true);
 
+/* ==== THE PROCEDURE HAPPENED AND NO REPORT CAME (15 Nov 2026, the owner) ===================
+   The rule is PSF.reportGapDate (procSummaryForm.js); the server is the authority: its
+   sweep opens p.reportGap from the morning after the procedure date, alerts the site's CPM
+   and the clinic manager once, opens the summary early, and closes the gap at Submit, at a
+   new date or at a cancel. Here: the banner on the report, the Home cards, the confirm
+   dialog (POST .../report-gap/confirm), "the procedure did not take place" (Update order or
+   Cancel, the existing ways), and the standalone mirror. A gap whose condition no longer
+   holds - a new date set a minute ago - is not shown, though the sweep closes it later. */
+function localTodayISO(){
+  const t = new Date();
+  return t.getFullYear() + "-" + ("0" + (t.getMonth() + 1)).slice(-2) + "-" + ("0" + t.getDate()).slice(-2);
+}
+function gapOf(p){
+  const g = PSF.openGap(p);
+  return g && PSF.reportGapDate(p, localTodayISO(), studyArmOf(p)) ? g : null;
+}
+function gapPeopleLocal(p){
+  const l = loc(p.siteId);
+  const ids = [l && l.cpmUserId, window.AnatStages.clinicManagerOf(S.db.users || [])];
+  return [...new Set(ids.filter(Boolean).map(id => { const u = user(id); return String((u && u.email) || id).toLowerCase(); }))];
+}
+function mayConfirmGap(p){
+  if(!p || isExternalUser()) return false;
+  if(myRoles().some(r => r === "ADMIN" || r === "MANAGER")) return true;
+  return gapPeopleLocal(p).includes(myEmail());
+}
+/* Home: the gaps waiting on this person to confirm (they were alerted), and the reports
+   they were made responsible for. */
+function gapsToConfirm(){
+  return (S.db.patients || []).filter(p => { const g = gapOf(p);
+    return g && !g.confirmed && inPatientScope(p.siteId) && (g.alertTo || []).map(e => String(e).toLowerCase()).includes(myEmail()); });
+}
+function myGapReports(){
+  return (S.db.patients || []).filter(p => { const g = gapOf(p);
+    return g && g.confirmed && String(g.confirmed.reportOwner || "").toLowerCase() === myEmail(); });
+}
+function reportGapBanner(p){
+  const g = gapOf(p);
+  if(!g) return "";
+  const c = g.confirmed;
+  const nm = e => { const u = userByEmail(e); return u ? u.name : e; };
+  const late = c && g.reportDueAt && Date.now() > Date.parse(g.reportDueAt);
+  return '<div class="warn" style="margin:0 0 12px"><b>The procedure report was not submitted.</b> The procedure was scheduled for <b>' +
+    esc(fmtDate(g.procDate)) + '</b>. ' +
+    (c ? 'Team confirmed by ' + esc(c.byName || c.by) + ' · ' + esc(fmtTs(c.at)) + ': ' +
+         esc(TEAM_LISTS.map(t => c.team[t.field] ? t.label + " " + c.team[t.field] : "").filter(Boolean).join(", ")) +
+         '. Report: <b>' + esc(nm(c.reportOwner)) + '</b>, due <b>' + esc(fmtTs(g.reportDueAt)) + '</b>' + (late ? ' <span class="pill p-red">overdue</span>' : '') +
+         '. Summary: <b>' + esc(summaryWho(c.summaryAssignees)) + '</b>.'
+       : 'The site’s CPM and the clinic manager (' + esc(summaryWho(g.alertTo) || "none set") + ') confirm who the clinical team was, ' +
+         'and who completes the report and the procedure summary.') +
+    '<div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">' +
+      (mayConfirmGap(p) ? '<button class="btn btn-sm btn-primary" data-gapconfirm="' + esc(p.id) + '">' +
+        (c ? "Change the team or who completes it" : "Confirm the team and who completes it") + '</button>' : '') +
+      (summaryOf(p) ? '<button class="btn btn-sm" data-gapsum="' + esc(p.id) + '">Procedure summary</button>' : '') +
+      (!isExternalUser() ? '<button class="btn btn-sm" data-gapnot="' + esc(p.id) + '">The procedure did not take place</button>' : '') +
+    '</div></div>';
+}
+function askGapConfirm(p){
+  const g = gapOf(p);
+  if(!g || !mayConfirmGap(p)) return;
+  const c = g.confirmed || {};
+  const sched = (p.anat && p.anat.scheduling) || {};
+  const names = teamPickableUsers().filter(isTeamUser);
+  const people = (S.db.users || []).filter(u => u.email && !u.external)
+    .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  const sumHave = (c.summaryAssignees || []).map(e => String(e).toLowerCase());
+  const teamSel = t => {
+    const v = (c.team && c.team[t.field]) || cf(p)[t.field] || sched["team_" + t.field] || "";
+    return '<div class="field"><label for="gc-' + t.field + '">' + esc(t.label) + '</label><select id="gc-' + t.field + '">' +
+      '<option value="">— nobody —</option>' + names.map(n => '<option' + (n === v ? " selected" : "") + '>' + esc(n) + '</option>').join("") +
+      (v && !names.includes(v) ? '<option selected>' + esc(v) + '</option>' : '') + '</select></div>';
+  };
+  modal("Missing procedure report — " + p.patientCode,
+    '<p>The procedure was scheduled for <b>' + esc(fmtDate(g.procDate)) + '</b> and no report has been submitted. ' +
+      'Confirm who the clinical team was, and choose who completes the report and who completes the summary.</p>' +
+    '<h3 style="margin:10px 0 4px">The clinical team</h3><div class="grid g2">' + TEAM_LISTS.map(teamSel).join("") + '</div>' +
+    '<div class="field"><label class="req" for="gc-owner">Who completes and submits the procedure report</label><select id="gc-owner">' +
+      '<option value="">— choose —</option>' + people.map(u => '<option value="' + esc(String(u.email).toLowerCase()) + '"' +
+        (String(u.email).toLowerCase() === String(c.reportOwner || "").toLowerCase() ? " selected" : "") + '>' + esc(u.name || u.email) + '</option>').join("") +
+    '</select><div class="hint">It becomes their task, due one day from now, and they are told by mail.</div></div>' +
+    '<div class="field"><label class="req">Who completes the procedure summary</label>' +
+      '<div style="max-height:30vh;overflow:auto">' + people.map(u =>
+        '<label class="check" style="display:flex;margin:4px 0"><input type="checkbox" data-gcs="' + esc(String(u.email).toLowerCase()) + '"' +
+        (sumHave.includes(String(u.email).toLowerCase()) ? " checked" : "") + '><span>' + esc(u.name || u.email) + '</span></label>').join("") +
+    '</div></div>' + whyBox("gc-why"),
+    '<div class="row"><button class="btn" data-close="1">Cancel</button><button class="btn btn-primary" id="gc-save">Confirm</button></div>');
+  $$("[data-gcs]").forEach(x => x.onchange = () => x.closest(".check").classList.toggle("on", x.checked));
+  $("#gc-save").onclick = async () => {
+    const team = {};
+    TEAM_LISTS.forEach(t => { team[t.field] = $("#gc-" + t.field).value; });
+    const reportOwner = $("#gc-owner").value;
+    const summaryAssignees = $$("[data-gcs]").filter(x => x.checked).map(x => x.dataset.gcs);
+    if(!TEAM_LISTS.some(t => team[t.field])) return showWhy("gc-why", "Name at least one member of the clinical team.");
+    if(!reportOwner) return showWhy("gc-why", "Choose who completes the procedure report.");
+    if(!summaryAssignees.length) return showWhy("gc-why", "Choose who completes the procedure summary.");
+    if(!S.backend){
+      const now = nowISO();
+      g.confirmed = { at:now, by:myEmail(), byName:S.me.name, team, reportOwner, summaryAssignees };
+      g.reportDueAt = new Date(Date.parse(now) + PSF.REPORT_DUE_DAYS * 86400000).toISOString();
+      if(summaryOf(p) && summaryOf(p).status === "OPEN") Object.assign(p.procSummary, { assignees:summaryAssignees, assignedByCpm:true });
+      logAction("Clinical team confirmed for the missing report of " + p.patientCode, { locationId:p.siteId });
+      commit(); closeModal(); renderNav(); renderKeepingPlace(); toast("Confirmed.", "good"); return;
+    }
+    const b = $("#gc-save"); b.disabled = true;
+    try{
+      const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/report-gap/confirm", { team, reportOwner, summaryAssignees });
+      if(r && r.patient) mergePatient(r.patient);
+      closeModal(); renderNav(); renderKeepingPlace();
+      toast("Confirmed. " + (userByEmail(reportOwner) || {}).name + " is told the report is theirs.", "good");
+    }catch(e){ b.disabled = false; showWhy("gc-why", e.message || "Could not save."); }
+  };
+}
+function askGapNotPerformed(p){
+  modal("The procedure did not take place — " + p.patientCode,
+    '<p>If the procedure was <b>postponed</b>, set the new date: the product order is updated and the warehouse is told, ' +
+      'as with any change of date. If it <b>will not take place</b>, cancel the subject (a Manager or App Admin decides).</p>' +
+    '<p class="hint">Either way the missing-report task closes, and the procedure summary opened for it is withdrawn.</p>',
+    '<div class="row" style="flex-wrap:wrap;gap:6px"><button class="btn btn-primary" id="gn-date">Postponed — set the new date</button>' +
+      '<button class="btn btn-danger" id="gn-cancel">It will not take place — cancel</button>' +
+      '<button class="btn" data-close="1">Back</button></div>');
+  $("#gn-date").onclick = () => {
+    closeModal();
+    if(can("orderProducts") && p.anat && p.anat.order && !p.fileLocked){ openOrderDialog(p); return; }
+    /* No order on this record (one written before stage 10 existed), or a role that may not
+       order: the date is changed where it always is - stage 9 of the subject's screening. */
+    toast(can("orderProducts") ? "Set the new date in stage 9 of the subject’s screening (Change date / update order)."
+      : "Changing the procedure date needs a role that may order products — a Clinical PM, Manager or App Admin.", "warn");
+    SCR.patientId = p.id; go("screening");
+  };
+  $("#gn-cancel").onclick = () => {
+    closeModal();
+    if(mayAskStop(p, "CANCEL")) openStopDialog(p, "CANCEL");
+    else toast(openApproval(STOP_APPROVAL.CANCEL, p.id) ? "A cancel request for this subject is already waiting." :
+      ((SM.stopProblem(p, "CANCEL") || {}).message || "You cannot cancel this subject."), "warn");
+  };
+}
+document.addEventListener("click", e => {
+  const b = e.target.closest && e.target.closest("[data-gapconfirm],[data-gapnot],[data-gapsum]");
+  if(!b) return;
+  e.stopPropagation(); e.preventDefault();
+  const p = patient(b.dataset.gapconfirm || b.dataset.gapnot || b.dataset.gapsum);
+  if(!p) return;
+  if(b.dataset.gapconfirm) askGapConfirm(p);
+  else if(b.dataset.gapnot) askGapNotPerformed(p);
+  else openSummary(p.id);
+}, true);
+/* The confirmed team into the report, once per confirmation (stamped), into the fields as
+   confirmed - the CPM's word on who was there. Only while the report can be edited. */
+function applyConfirmedTeam(p){
+  const g = PSF.openGap(p);
+  if(!g || !g.confirmed || !g.confirmed.team || cfReadOnly(p)) return false;
+  const c = cf(p);
+  if(c.teamConfirmedAt === g.confirmed.at) return false;
+  TEAM_LISTS.forEach(t => { if(g.confirmed.team[t.field]) c[t.field] = g.confirmed.team[t.field]; });
+  c.teamConfirmedAt = g.confirmed.at;
+  return true;
+}
+/* Standalone (demo) mirror of the server's sweep: open and close gaps by the same rule. */
+function openReportGapsLocal(){
+  if(S.backend || !S.db) return;
+  const today = localTodayISO(), now = nowISO();
+  let n = 0;
+  (S.db.patients || []).forEach(p => {
+    const due = PSF.reportGapDate(p, today, studyArmOf(p));
+    const g = PSF.openGap(p);
+    if(g && !due){
+      const how = p.submitted || p.status === "TREATED" ? "SUBMITTED"
+        : p.status === "CANCELLED" || (p.cancelled && p.cancelled.is) ? "CANCELLED" : "RESCHEDULED";
+      Object.assign(g, { status:"CLOSED", closedAt:now, closedBy:"system", closedHow:how });
+      const s = p.procSummary;
+      if(how !== "SUBMITTED" && s && s.early && s.status === "OPEN"){ g.droppedSummary = { at:now, answers:s.answers || {} }; p.procSummary = null; }
+      n++;
+    }else if(!g && due){
+      const people = gapPeopleLocal(p);
+      if(p.reportGap) p.reportGapHistory = (p.reportGapHistory || []).concat([p.reportGap]).slice(-20);
+      p.reportGap = { status:"OPEN", procDate:due, openedAt:now, alertTo:people, alertedAt:now, confirmed:null, reportDueAt:"" };
+      if(!p.procSummary) p.procSummary = { status:"OPEN", form:PSF.DOC.number + " Rev" + PSF.DOC.revision, openedAt:now,
+        openedBy:"system", procEndAt:"", dueAt:legacyDueLocal(now), assignees:people, unmatched:[],
+        answers:PSF.prefill(p, PD.TRAINING_ITEMS || []), updatedAt:now, updatedBy:"", reminderSentAt:"", closedAt:"",
+        closedBy:"", filledBy:"", filedAt:"", editedAfterClose:[], early:true, openedAsTask:now };
+      n++;
+    }
+  });
+  if(n) commit();
+}
+/* Standalone mirror of the server's afterReportSubmitted. */
+function afterSubmitGapLocal(p){
+  const g = PSF.openGap(p), now = nowISO();
+  if(g) Object.assign(g, { status:"CLOSED", closedAt:now, closedBy:myEmail(), closedHow:p.status === "CANCELLED" ? "CANCELLED" : "SUBMITTED" });
+  const s = p.procSummary;
+  if(!s || !s.early || s.status !== "OPEN") return;
+  if(p.status !== "TREATED"){ p.procSummary = null; return; }
+  const fresh = PSF.prefill(p, PD.TRAINING_ITEMS || []);
+  const blank = v => v == null || v === "" || (Array.isArray(v) && !v.length);
+  s.answers = s.answers || {};
+  Object.keys(fresh).forEach(k => { if(blank(s.answers[k]) && !blank(fresh[k])) s.answers[k] = fresh[k]; });
+  if(!s.assignedByCpm){
+    const emails = [];
+    ["proctor","tech1","tech2","clinical"].forEach(k => { const u = teamUserByName(cf(p)[k]); if(u) emails.push(String(u.email).toLowerCase()); });
+    const cpm = patientCpm(p, "order"); if(cpm) emails.push(String(cpm).toLowerCase());
+    if(emails.length) s.assignees = [...new Set(emails)];
+  }
+}
+/* The upload is only for a procedure before 13 Nov 2026 (the owner, 15 Nov 2026). */
+function summaryUploadOk(p){ return summaryUploadable(p) && PSF.uploadAllowed(p); }
+
 /* A MISSING SUMMARY IS THE CPM'S TASK (10 Nov 2026) - the standalone (demo) mirror of the
    server's openMissingSummaries: every implanted subject with none, and every one started
    online and given to nobody, goes to the site's CPM (else the clinic manager), due in
@@ -36551,6 +36844,10 @@ function summaryFormHtml(p){
       ? (s.closedVia === "UPLOAD" ? 'Uploaded as a file by ' : 'Closed by ') +
         '<b>' + esc(s.filledBy || s.closedBy) + '</b> · ' + esc(fmtTs(s.closedAt)) +
         (s.filedAt ? ' · filed in the subject’s folder and in Procedure_Summary' : ' · <b>not filed yet</b>')
+      : s.early
+      ? 'Opened because the procedure report was not submitted the day after the procedure. Due by <b>' + esc(fmtTs(s.dueAt)) + '</b>. ' +
+        'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>' + summaryReassignBtn(p) + '. It can be filled in now, before the report; ' +
+        'what the report holds is added when it is submitted. Whoever closes it is recorded as Filled by.'
       : s.legacy && !(s.assignees || []).length
       ? 'A subject implanted before summaries existed. Its site has no Responsible CPM and no clinic manager ' +
         'is set, so it is nobody’s task yet; anyone at Innoventric can fill it in, and whoever closes it is recorded as Filled by.'
@@ -36606,7 +36903,9 @@ function summaryListHtml(){
   return '<div class="info">One summary per treated subject (form ' + esc(PSF.DOC.number) + ' Rev' + esc(PSF.DOC.revision) +
     '), opened when the procedure report is submitted, for the procedure team and the subject’s Clinical PM. ' +
     'Due ' + PSF.DUE_HOURS + ' hours after the procedure. A subject implanted without one is opened as a task for the ' +
-    'site’s Responsible CPM (or the clinic manager), due in ' + LEGACY_DUE_DAYS + ' days.</div>' +
+    'site’s Responsible CPM (or the clinic manager), due in ' + LEGACY_DUE_DAYS + ' days. When the report has not been submitted ' +
+    'the morning after the procedure, the summary is opened then, and can be filled in before the report. A procedure on or after ' +
+    esc(fmtDate(PSF.ONLINE_ONLY_FROM)) + ' has its summary filled in online, not uploaded.</div>' +
     '<div class="filters">' + selField("ps-filter", "Show", PSUM.filter,
       [["open","Open (" + n("open") + ")"],["mine","Given to me (" + n("mine") + ")"],
        ["closed","Closed (" + n("closed") + ")"],["all","All (" + n("all") + ")"]]
@@ -36637,7 +36936,8 @@ function noSummaryListHtml(){
           '<td>' + esc(fmtDate(cf(p).procDate || p.procedureDate)) + '</td>' +
           '<td><div class="row" style="gap:6px;flex-wrap:wrap">' +
             '<button class="btn btn-sm btn-primary" data-ps-start="' + esc(p.id) + '">Fill in online</button>' +
-            '<button class="btn btn-sm" data-ps-upload="' + esc(p.id) + '">Upload summary file</button></div></td></tr>').join("") +
+            (summaryUploadOk(p) ? '<button class="btn btn-sm" data-ps-upload="' + esc(p.id) + '">Upload summary file</button>' : '') +
+            '</div></td></tr>').join("") +
         '</tbody></table></div>'
       : '<div class="empty">Every implanted subject has a summary.</div>');
 }
@@ -36714,6 +37014,7 @@ function chooseSummaryWay(id){
   const p = patient(id);
   if(!p) return;
   if(summaryOf(p)) return openSummary(id);
+  if(!summaryUploadOk(p)) return startSummaryOnline(id);
   modal("Procedure summary — " + p.patientCode,
     '<p>' + esc(p.patientCode) + ' has no procedure summary. Fill in form ' + esc(PSF.DOC.number) +
       ' here in the app, or upload it as a file. Filled in online, it is the site’s CPM’s task, due in ' +
@@ -36816,10 +37117,12 @@ function summaryFilesHtml(p){
             (f.ext === "pdf" ? "Open" : "Download") + '</a>' : '') + '</td></tr>').join("") +
         '</tbody></table></div>'
       : '<div class="hint">No file uploaded.</div>') +
-    (summaryUploadable(p) ? '<div class="row" style="margin-top:10px"><button class="btn" data-ps-upload="' + esc(p.id) + '">' +
+    (summaryUploadOk(p) ? '<div class="row" style="margin-top:10px"><button class="btn" data-ps-upload="' + esc(p.id) + '">' +
       (summaryOf(p) && summaryOf(p).status === "OPEN" ? "Upload the summary as a file instead" : "Upload a summary file") +
       '</button></div><div class="hint">PDF, Word (.doc, .docx) or a saved email (.eml, .msg), up to 4 MB.' +
-      (summaryOf(p) && summaryOf(p).status === "OPEN" ? ' Uploading closes this summary, with you as Filled by.' : '') + '</div>' : '') +
+      (summaryOf(p) && summaryOf(p).status === "OPEN" ? ' Uploading closes this summary, with you as Filled by.' : '') + '</div>'
+      : summaryUploadable(p) ? '<div class="hint" style="margin-top:8px">A procedure on or after ' + esc(fmtDate(PSF.ONLINE_ONLY_FROM)) +
+        ' has its summary filled in online; it is not uploaded as a file.</div>' : '') +
     '</div></div>';
 }
 function confirmSummaryFile(file, p, closes){
@@ -36846,7 +37149,7 @@ function confirmSummaryFile(file, p, closes){
 }
 function uploadSummaryFile(id){
   const p = patient(id);
-  if(!summaryUploadable(p)) return;
+  if(!summaryUploadOk(p)) return toast("A procedure on or after " + fmtDate(PSF.ONLINE_ONLY_FROM) + " has its summary filled in online.", "warn");
   const inp = document.createElement("input");
   inp.type = "file";
   inp.accept = SUMMARY_UPLOAD_EXT.map(e => "." + e).join(",");
