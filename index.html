@@ -21170,7 +21170,10 @@ function render(){
      full table reads on every page load, and a sixth for one screen would slow every
      other screen down. The body() above has already drawn with whatever is in hand,
      so a slow fetch shows an empty table for a moment rather than a blank app. */
-  if(v.load && !LOADED_VIEWS.has(S.view)){
+  /* `fresh` (16 Nov 2026): a view whose data other people change - QA Approval's requests -
+     loads again on every ENTRY, not once a session. The re-render after the load is the
+     same view, so it does not load again. */
+  if(v.load && (!LOADED_VIEWS.has(S.view) || (v.fresh && changedView))){
     const forView = S.view;
     LOADED_VIEWS.add(forView);
     Promise.resolve(v.load())
@@ -26697,7 +26700,12 @@ window.addEventListener("hashchange", () => {
   if(!location.hash.startsWith("#review=")) return;
   try{ sessionStorage.setItem(REVIEW_KEY, decodeURIComponent(location.hash.slice(8))); }catch(e){}
   try{ history.replaceState(null, "", location.pathname + location.search); }catch(e){}
-  if(S.me && !$("#app").hidden) openReviewLink();
+  /* The app was already open, so its list of requests is as old as the sign-in and the
+     one in the mail is very likely not in it: read it first (16 Nov 2026). */
+  if(S.me && !$("#app").hidden){
+    (S.backend ? loadApprovalRequests().then(a => { S.db.approvals = a; }) : Promise.resolve())
+      .then(() => openReviewLink());
+  }
 });
 function openReviewLink(){
   let id = "";
@@ -35648,6 +35656,15 @@ function iProducedBatch(b){
 
 VIEWS.batches = {
   title:"QA Approval",
+  /* The requests waiting for a decision were read at sign-in only, so one asked while the
+     app was open never appeared here until a reload (the owner, 16 Nov 2026). Read on every
+     entry; a failed read keeps what is in hand (loadApprovalRequests). */
+  fresh:true,
+  async load(){
+    if(!S.backend) return;
+    S.db.approvals = await loadApprovalRequests();
+    renderNav();
+  },
   sub:"Produced batches waiting for their second signature. Nothing is stock until somebody other than the producer approves it.",
   body(){
     const all = (S.db && Array.isArray(S.db.batches)) ? S.db.batches : [];
@@ -38295,15 +38312,13 @@ function folderLinkBtn(p){
     'title="Open the subject’s folder in SharePoint" ' +
     'aria-label="Open the SharePoint folder for ' + esc(p.patientCode) + '">' + icon("folder") + '<span>Folder</span></button>';
 }
-async function openSharePointFolder(p, btn){
-  if(btn) btn.disabled = true;
-  const w = window.open("about:blank", "_blank");
-  try{
-    const r = await api("GET", "/api/patients/" + encodeURIComponent(p.id) + "/folder-link");
-    if(r && r.webUrl){ if(w){ w.opener = null; w.location.href = r.webUrl; } else window.open(r.webUrl, "_blank", "noopener"); }
-    else { if(w) w.close(); toast("The folder has no address yet.", "bad"); }
-  }catch(e){ if(w) w.close(); toast(e.message || "The folder could not be opened.", "bad"); }
-  if(btn) btn.disabled = false;
+/* 16 Nov 2026 (the owner: the window stayed BLANK): no longer about:blank steered after an
+   await - this page's Cross-Origin-Opener-Policy cuts that window loose. The window opens
+   straight on /folder-open, which redirects to SharePoint (or explains in the tab). */
+function openSharePointFolder(p, btn){
+  if(!p) return;
+  window.open("/api/patients/" + encodeURIComponent(p.id) + "/folder-open", "_blank", "noopener");
+  if(btn){ btn.disabled = true; setTimeout(() => { btn.disabled = false; }, 1500); }
 }
 document.addEventListener("click", e => {
   const b = e.target.closest && e.target.closest("[data-sp-folder]");
