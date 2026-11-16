@@ -17567,6 +17567,11 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.16.1", date: "16 November 2026", groups: [
+    { h:"Approvals: a second role counts", items:[
+      "Somebody whose <b>Manager</b> or <b>App Admin</b> role is a second role (for example <b>Clinical PM + Manager</b>) was mailed requests but could neither see nor decide them, in the app or from the mail. They now see them on the subject and on QA Approval, and can approve or decline them from the mail."
+    ]}
+  ]},
   { version: "3.16.0", date: "16 November 2026", groups: [
     { h:"Hold: a third reason", items:[
       "Putting a subject on hold now offers <b>Other</b> beside the two categories, for a reason that fits neither. The explanation in words is still required."
