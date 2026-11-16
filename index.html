@@ -150,6 +150,25 @@ textarea{min-height:70px; resize:vertical;}
 .btn .fic{display:inline-flex; vertical-align:-3px; margin-right:4px;}
 .btn .fic svg{width:15px; height:15px; display:block;}
 .ftiles{display:flex; flex-wrap:wrap; gap:8px;}
+/* The Digital Model's drop area (16 Nov 2026). */
+.af-drop{border:1.5px dashed var(--line); border-radius:8px; padding:8px;}
+.af-drop.on{border-color:var(--brand); background:var(--line-2);}
+/* The subject chat (16 Nov 2026). */
+.chat-item{border:1px solid var(--line); border-left:3px solid var(--line); border-radius:8px; padding:8px 10px; margin:0 0 8px; background:var(--card);}
+.chat-item.crit{border-left-color:var(--brand);}
+.chat-item.solved{opacity:.75;}
+.chat-text{white-space:pre-wrap; margin:4px 0;}
+.chat-sig{font-size:12px; color:var(--muted);}
+.chat-reply{margin:6px 0 0 14px; padding:4px 0 0 8px; border-left:2px solid var(--line-2);}
+.chat-rem{margin:6px 0 0; font-size:13px;}
+.chat-rem.done{color:var(--muted);}
+.chat-hist{margin-top:6px; font-size:12px; color:var(--muted);}
+.chat-acts{gap:5px; margin-top:6px;}
+.chat-form{margin:8px 0;}
+.chat-new{padding:8px; border:1px dashed var(--line); border-radius:8px;}
+.chat-tags summary{cursor:pointer; font-size:13px; margin:4px 0;}
+.chat-tag-list{max-height:160px; overflow:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:2px 8px;}
+.btn-link{background:none; border:none; color:var(--brand-dk); padding:2px 0; text-decoration:underline;}
 .ftile{display:flex; flex-direction:column; align-items:center; gap:3px; padding:4px; width:96px;
   border:1px solid var(--line); border-radius:6px; background:var(--card); cursor:pointer; font:inherit;}
 .ftile:hover{border-color:var(--brand);}
@@ -11584,7 +11603,10 @@ var ANAT_STAGES = [
   /* No angle on the CT report (6 Oct 2026, the owner): the four angle fields were not needed
      there. An angle recorded on it before then stays in the record, unshown. */
   { k:"ct",        n:1,  label:"CT Measurements Report",             kind:"eval", noAngle:true },
-  { k:"model3d",   n:2,  label:"3D Model Evaluation",                kind:"eval", pm:true, sim:true },
+  /* Digital Model Evaluation since 16 Nov 2026 (the owner; key unchanged). No simulator angle any
+     more, a full scoring every time, and a recommendation whether a physical model is needed -
+     which the Clinical Manager decides on before anything is printed (PRINT GATE below). */
+  { k:"model3d",   n:2,  label:"Digital Model Evaluation",           kind:"eval", pm:true, scoring:true, modelGate:true },
   /* Printing cannot begin on somebody's say-so alone: a physical model gets made from
      it. Two parts on one card since 24 Sep 2026 (the owner): 3.1 PRINT REQUEST - a CPM,
      Manager or App Admin orders the print and names who does it, which is what stops a
@@ -11595,9 +11617,8 @@ var ANAT_STAGES = [
   { k:"printing",  n:3,  label:"Pliable Model Printing",            kind:"ops",  needsApproval:true },
   { k:"casting",   n:4,  label:"Pliable Model Casting",             kind:"ops"  },
   { k:"pmins",     n:5,  label:"Pacemaker Lead Insertion",           kind:"ops",  needsPm:true },
-  /* The pliable model is where a borderline anatomy gets argued out, so this is the one
-     evaluation stage that can open a scoring matrix. It carries no angle: the angle is
-     decided later, on fluoroscopy. */
+  /* The pliable model is scored in full every time since 16 Nov 2026 (the owner), like the
+     digital model. It carries no angle: the angle is decided later, on fluoroscopy. */
   { k:"flexible",  n:6,  label:"Pliable Model Evaluation",           kind:"eval", noAngle:true, scoring:true },
   { k:"fluoro",    n:7,  label:"Training Session & Road Map", kind:"eval", final:true, strategy:true },
   /* Replaces the old "Road Map" stage, which was folded into 7. This is where the
@@ -11645,6 +11666,54 @@ var SCORING_CRITERIA = [
 
 /* What the person scoring concludes. The system totals the scores and puts a size
    forward; this decision stays theirs, and is recorded as theirs. */
+/* ANATOMICAL SUITABILITY (16 Nov 2026, the owner), the same four at every evaluation stage.
+   "Size to be confirmed" needs two sizes and is not offered at the final stage (Road Map).
+   Records written before then hold "Borderline" and "Not suitable"; they are READ as the
+   new words (suitabilityOf) and take them on the next save - no migration run. */
+var SUIT = { OK:"Suitable", SIZE_TBC:"Suitable – size to be confirmed",
+             CHALLENGING:"Challenging anatomy", UNSUITABLE:"Anatomically unsuitable" };
+var SUIT_LEGACY = { "Borderline": SUIT.CHALLENGING, "Not suitable": SUIT.UNSUITABLE };
+function suitabilityOf(v){
+  var s = String(v == null ? "" : v);
+  return SUIT_LEGACY[s] || s;
+}
+function suitabilityOptions(s){
+  var o = ["", SUIT.OK];
+  if(!(s && s.final)) o.push(SUIT.SIZE_TBC);
+  o.push(SUIT.CHALLENGING, SUIT.UNSUITABLE);
+  return o;
+}
+/* What a stage's scoring still lacks, as words. Option A is always scored; option B too
+   when the size is to be confirmed (two candidate sizes). Not asked of an anatomically
+   unsuitable finding - there is no size to choose. */
+function scoringGaps(a){
+  var suit = suitabilityOf(a && a.suitability);
+  if(suit === SUIT.UNSUITABLE) return [];
+  var sc = (a && a.scoring) || {};
+  var sizes = sc.sizes || [], scores = sc.scores || [];
+  var out = [];
+  var opts = suit === SUIT.SIZE_TBC ? [0, 1] : [0];
+  opts.forEach(function(i){
+    var name = i ? "option B" : "option A";
+    if(!String(sizes[i] || "").trim()) out.push("Scoring: the size of " + name);
+    var row = scores[i] || {};
+    var missing = SCORING_CRITERIA.filter(function(c){ return !String(row[c.k] || "").trim(); }).length;
+    if(missing) out.push("Scoring: " + missing + " criteria not scored for " + name);
+  });
+  if(!sc.decision) out.push("Scoring: the conclusion");
+  else if(sc.decision === "ELIGIBLE" && !String(sc.chosenSize || "").trim()) out.push("Scoring: the recommended implant size");
+  return out;
+}
+/* The Digital Model's recommendation (16 Nov 2026). */
+var MODEL_NEED = [
+  { k:"NEEDED",     label:"Physical model needed" },
+  { k:"NOT_NEEDED", label:"No physical model needed" }
+];
+function modelNeedLabel(k){
+  for(var i = 0; i < MODEL_NEED.length; i++) if(MODEL_NEED[i].k === k) return MODEL_NEED[i].label;
+  return "";
+}
+
 var SCORING_DECISIONS = [
   { k:"ELIGIBLE",   label:"Subject eligible by Innoventric" },
   { k:"DISCUSSION", label:"Internal discussion required" },
@@ -11819,9 +11888,21 @@ function stageMissing(p, s){
      stage 7 would read Incomplete overnight and the workflow status of each would fall back
      to Anatomical Evaluation. Confirming, and confirming again after a reopen, both ask. */
   if(s.kind === "eval" && a.status !== "Completed"){
-    if(a.suitability === "Not suitable"){
+    var suit = suitabilityOf(a.suitability);
+    if(suit === SUIT.UNSUITABLE){
       if(empty(a.unsuitableReason)) out.push("Why the subject is not suitable");
       if(!anatFilesOf(p, s.k).length) out.push("An image or PDF showing why");
+    }
+    /* 16 Nov 2026 (the owner): unsure of the size = two sizes, and they must differ. */
+    if(suit === SUIT.SIZE_TBC){
+      if(empty(a.altSize)) out.push("Alternative size");
+      else if(String(a.altSize) === String(a.size || "")) out.push("An alternative size different from the recommended one");
+    }
+    if(suit === SUIT.CHALLENGING && empty(a.challengeReason)) out.push("What makes the anatomy challenging");
+    if(s.scoring) out = out.concat(scoringGaps(a));
+    if(s.modelGate && suit !== SUIT.UNSUITABLE){
+      if(empty(a.modelNeed)) out.push("Physical model needed or not");
+      else if(empty(a.modelNeedWhy)) out.push("Why (physical model)");
     }
     if(s.final && ANAT_FILE_FOLDER[s.k] && !anatFilesOf(p, s.k).length) out.push("The Road Map file (image or PDF)");
   }
@@ -11844,7 +11925,7 @@ function anatFilesOf(p, k){
    count, `min` how many. The Road Map (stage 7) keeps its own rule above. */
 var STAGE_FILE_RULES = {
   ct:        { kinds:["pdf"],        min:1, need:"The CT report (PDF)" },
-  model3d:   { kinds:["image"],      min:2, need:"At least 2 images of the 3D model" },
+  model3d:   { kinds:["image"],      min:2, need:"At least 2 images of the digital model" },
   flexible:  { kinds:["image"],      min:2, need:"At least 2 images of the pliable model" },
   approvals: { kinds:["ppt", "pdf"], min:1, need:"The patient presentation (PPT or PDF)" }
 };
@@ -11906,7 +11987,7 @@ function latestSuitability(p){
     var s = ANAT_STAGES[i];
     if(s.k === TRAINING_KEY) break;
     var a = (p.anat || {})[s.k] || {};
-    if(s.kind === "eval" && stageComplete(p, s) && a.suitability) out = a.suitability;
+    if(s.kind === "eval" && stageComplete(p, s) && a.suitability) out = suitabilityOf(a.suitability);
   }
   return out;
 }
@@ -12070,6 +12151,32 @@ function applyStageOverride(p, o){
    to, so naming somebody on a later stage by hand skipped the sequence with no override
    and no record of why. Every automatic assignment happens as a stage opens
    (autoAssignStage in the page, applyStageOverride here), so none of them needs it. */
+/* ---- THE PRINT GATE (16 Nov 2026, the owner) ---------------------------------------------
+   Completing the Digital Model Evaluation alerts the Clinical Manager, who decides:
+   clinically feasible -> printing opens at once with the printer the manager names (a
+   physical model needed), or stages 3-6 are set Not required and remain completable (no
+   physical model needed); not clinically feasible -> the subject goes on hold. Stored in
+   p.printGate, written only by POST /api/patients/:id/print-gate (server-owned). */
+var PRINT_GATE_STAGES = ["printing", "casting", "pmins", "flexible"];
+function stageIndex(k){
+  for(var n = 0; n < ANAT_STAGES.length; n++) if(ANAT_STAGES[n].k === k) return n;
+  return -1;
+}
+function printGateApplies(p){
+  var a = (p && p.anat && p.anat.model3d) || {};
+  return a.status === "Completed" && !!String(a.modelNeed || "").trim() &&
+         suitabilityOf(a.suitability) !== SUIT.UNSUITABLE;
+}
+function printGateDecision(p){ return (p && p.printGate && p.printGate.decision) || ""; }
+/* Waiting on the Clinical Manager: the gate applies and nothing is decided (or a "not
+   feasible" whose hold has since been released - the manager decides again). */
+function printGatePending(p){
+  if(!printGateApplies(p)) return false;
+  var d = printGateDecision(p);
+  if(!d) return true;
+  return d === "NOT_FEASIBLE" && !(p.hold && p.hold.is);
+}
+
 function anatUnlocked(p, key){
   var i = -1;
   for(var n = 0; n < ANAT_STAGES.length; n++) if(ANAT_STAGES[n].k === key){ i = n; break; }
@@ -12100,6 +12207,12 @@ function anatUnlocked(p, key){
     var held = (p.anat || {})[key] || {};
     if(!(key === "scheduling" && stageTouched(p, s)) && !(key === "order" && held.requestedBy)) return false;
   }
+  /* THE PRINT GATE (16 Nov 2026, the owner): once the Digital Model Evaluation is completed with a
+     recommendation, nothing after it opens until the Clinical Manager has said the subject is
+     clinically feasible - "no approval, no printing". Before any override or assignment, and
+     before "a stage that holds work": that is the point of asking. A subject whose stage 2
+     was completed before this existed has no recommendation, and keeps the old rule. */
+  if(i > stageIndex("model3d") && printGateApplies(p) && printGateDecision(p) !== "FEASIBLE") return false;
   /* Once a stage holds work it stays reachable - data already entered must never become
      unreachable. */
   if(stageTouched(p, s)) return true;
@@ -12202,7 +12315,11 @@ var api = {
   stageFileCount: stageFileCount,
   stageFileGap: stageFileGap,
   responsibleCpm: responsibleCpm,
-  clinicManagerOf: clinicManagerOf
+  clinicManagerOf: clinicManagerOf,
+  SUIT: SUIT, suitabilityOf: suitabilityOf, suitabilityOptions: suitabilityOptions,
+  scoringGaps: scoringGaps, MODEL_NEED: MODEL_NEED, modelNeedLabel: modelNeedLabel,
+  PRINT_GATE_STAGES: PRINT_GATE_STAGES, printGateApplies: printGateApplies,
+  printGateDecision: printGateDecision, printGatePending: printGatePending
 };
 
 if(typeof module !== "undefined" && module.exports) module.exports = api;
@@ -12351,7 +12468,10 @@ var HOLD_CATEGORIES = [
   { k: "NON_COMPLIANCE", label: "Subject not complying" },
   { k: "OPERATIONAL",    label: "Operational reason preventing screening" },
   /* 16 Nov 2026 (the owner): a reason that fits neither - the words below carry it. */
-  { k: "OTHER",          label: "Other" }
+  { k: "OTHER",          label: "Other" },
+  /* 16 Nov 2026 (the owner): the Clinical Manager found the subject not clinically feasible after
+     the Digital Model Evaluation (POST /api/patients/:id/print-gate). */
+  { k: "NOT_FEASIBLE",   label: "Not clinically feasible" }
 ];
 function holdCategoryLabel(k){
   for(var i = 0; i < HOLD_CATEGORIES.length; i++) if(HOLD_CATEGORIES[i].k === k) return HOLD_CATEGORIES[i].label;
@@ -14444,6 +14564,318 @@ if(typeof window !== "undefined") window.ProcSummaryForm = api;
 })();
 
 </script>
+<!-- The subject chat (16 Nov 2026): questions, comments, tasks and reminders on a subject.
+     Read at the top level (const SC = window.SubjectChat), so it is in STATIC_FILES, sw.js
+     SHELL and build-demo OWN_MODULES too, or the application goes blank. -->
+<script>
+/* ---------------------------------------------------------------------------
+   subjectChat.js - inlined by build-demo.js. The live app loads it from subjectChat.js.
+   --------------------------------------------------------------------------- */
+"use strict";
+/* =============================================================================
+   THE SUBJECT CHAT — one definition, two readers (16 Nov 2026, the owner)
+
+   Replaces three things on the subject: the free-text Notes, "To discuss with the PI",
+   and the list of medical questions (p.customQuestions). Every user may open a question
+   or a comment on a subject, reply, tag people, mark an item Critical or Solved, reopen
+   it, bump it, and set a reminder for a user. Everything that is not Solved is an open
+   task for the people tagged in it (the site's CPM when nobody is), and the open items
+   are what the team goes over with the PI.
+
+   EVERY ACTION IS SIGNED - who, date and time (the owner). The signature is the server's: the
+   route stamps the caller and the clock, so a signature cannot be typed.
+
+   Loaded the same way anatStages.js is:
+     · browser  a same-origin script tag  ->  window.SubjectChat
+     · Node     require("./subjectChat")
+
+   THE OLD FIELDS ARE READ, NOT MIGRATED. chatOf(p) returns p.chat when the subject has
+   one, and otherwise builds it from p.notes, p.piNotes and p.customQuestions with fixed
+   ids - so the first action on a subject stores exactly what everybody was already
+   looking at, and there is no migration run to forget on a release. The old fields stay
+   in the record, unshown.
+   ============================================================================= */
+(function(){
+
+var KINDS = { QUESTION: "Question", COMMENT: "Comment" };
+var TEXT_MAX = 2000;
+var ITEMS_MAX = 300;
+/* Who may mark an item Critical or Solved, or reopen it (the owner): the writer, the people
+   tagged in it, the site's CPM, an App Admin or a Manager. */
+var DECIDE_ROLES = ["ADMIN", "MANAGER"];
+
+function lc(v){ return String(v || "").trim().toLowerCase(); }
+function clean(v){ return String(v == null ? "" : v).replace(/\r\n/g, "\n").trim(); }
+function uniq(list){
+  var out = [];
+  (list || []).forEach(function(x){ x = lc(x); if(x && out.indexOf(x) < 0) out.push(x); });
+  return out;
+}
+
+/* What the old registration form held, as chat items. Fixed ids, so the view before the
+   first action and the record after it are the same items. Signed "Imported" with the
+   registration time when the subject has one: the old fields recorded no author.
+   An ANSWERED question imports as Solved (it was closed in the old list); plain Notes
+   import as Solved too - they were a record, not a request - and so does everything on a
+   subject whose procedure has happened. What stays open is an unanswered question and
+   "To discuss with the PI" on a subject still in screening. */
+function legacyItems(p, closedAlready){
+  var at = (p && p.registeredAt) || "";
+  var sig = { by: "", byName: "Imported from the registration form", at: at };
+  var items = [];
+  function item(id, kind, text, solved, imported){
+    var it = { id: id, kind: kind, text: text, by: sig.by, byName: sig.byName, at: sig.at,
+      imported: imported, tags: [], tagNames: {}, critical: false, solved: !!solved,
+      replies: [], events: [], reminders: [], edits: [] };
+    if(solved) it.events.push({ type: "SOLVED", by: "", byName: sig.byName, at: at });
+    return it;
+  }
+  var pi = clean(p && p.piNotes);
+  if(pi) items.push(item("imp-pi", "COMMENT", pi, closedAlready, "PI"));
+  var qs = Array.isArray(p && p.customQuestions) ? p.customQuestions : [];
+  qs.forEach(function(q, i){
+    var text = clean(q && q.q);
+    if(!text) return;
+    var ans = clean(q && q.a);
+    var it = item("imp-q" + i, "QUESTION", text, closedAlready || !!ans, "QUESTION");
+    if(ans) it.replies.push({ id: "imp-q" + i + "-a", text: ans, by: "", byName: sig.byName, at: at, edits: [] });
+    items.push(it);
+  });
+  var notes = clean(p && p.notes);
+  if(notes) items.push(item("imp-notes", "COMMENT", notes, true, "NOTES"));
+  return items;
+}
+/* The subject's chat. `closedAlready` - the procedure has happened, or the record is
+   locked - is passed in by the caller, which knows how to judge that. */
+function chatOf(p, closedAlready){
+  if(p && p.chat && Array.isArray(p.chat.items)) return p.chat;
+  return { items: legacyItems(p, !!closedAlready), v: 1 };
+}
+
+function findItem(chat, id){
+  for(var i = 0; i < chat.items.length; i++) if(chat.items[i].id === id) return chat.items[i];
+  return null;
+}
+function isOpen(it){ return !!it && !it.solved; }
+/* Open first, critical first among them, then the most recently bumped or written. */
+function lastTouch(it){ return String(it.bumpedAt || it.at || ""); }
+function sorted(items){
+  return (items || []).slice().sort(function(a, b){
+    if(isOpen(a) !== isOpen(b)) return isOpen(a) ? -1 : 1;
+    if(!!a.critical !== !!b.critical) return a.critical ? -1 : 1;
+    return lastTouch(b).localeCompare(lastTouch(a));
+  });
+}
+function openItems(chat){ return sorted((chat && chat.items || []).filter(isOpen)); }
+/* Whose task an open item is: the people tagged in it, else the site's CPM. */
+function ownersOf(it, siteCpmEmail){
+  var t = uniq(it && it.tags);
+  if(t.length) return t;
+  return siteCpmEmail ? [lc(siteCpmEmail)] : [];
+}
+function mayDecide(it, actor, ctx){
+  var me = lc(actor && actor.email);
+  if(!me) return false;
+  var roles = (actor && actor.roles) || [];
+  if(roles.some(function(r){ return DECIDE_ROLES.indexOf(r) >= 0; })) return true;
+  if(lc(it.by) === me) return true;
+  if(uniq(it.tags).indexOf(me) >= 0) return true;
+  if(ctx && lc(ctx.siteCpmEmail) === me) return true;
+  return false;
+}
+/* Reminders that have come due for this person: date on or before today, not done. */
+function dueReminders(chat, email, today){
+  var me = lc(email), out = [];
+  (chat && chat.items || []).forEach(function(it){
+    (it.reminders || []).forEach(function(r){
+      if(!r.done && lc(r.forEmail) === me && r.date && String(r.date).slice(0, 10) <= String(today).slice(0, 10)){
+        out.push({ item: it, reminder: r });
+      }
+    });
+  });
+  return out;
+}
+
+function err(code, message){ return { error: { code: code, message: message } }; }
+function normTags(tags, names){
+  var out = { emails: [], names: {} };
+  (Array.isArray(tags) ? tags : []).forEach(function(t){
+    var e = lc(t && typeof t === "object" ? t.email : t);
+    if(!e || e.indexOf("@") < 0 || out.emails.indexOf(e) >= 0) return;
+    out.emails.push(e);
+    out.names[e] = String((t && typeof t === "object" && t.name) || (names && names[e]) || e).slice(0, 120);
+  });
+  return out;
+}
+
+/* APPLY ONE ACTION. Pure: takes the chat, returns { chat, event, item, notify } or
+   { error }. `actor` = { email, name, roles }; `at` = ISO time stamped by the caller;
+   `ctx` = { siteCpmEmail, newId }. The chat passed in is copied, never changed.
+   `notify` = the addresses to tell (a tag, a bump) - the caller decides how. */
+function apply(chatIn, action, actor, at, ctx){
+  ctx = ctx || {};
+  var chat = JSON.parse(JSON.stringify(chatIn || { items: [] }));
+  if(!Array.isArray(chat.items)) chat.items = [];
+  var a = action || {};
+  var me = lc(actor && actor.email);
+  if(!me) return err("NO_ACTOR", "Who is writing is not known.");
+  var sig = { by: me, byName: String((actor && actor.name) || me), at: at };
+  var newId = ctx.newId || function(){ return "ch-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); };
+  function textOf(){
+    var t = clean(a.text);
+    if(!t) return null;
+    return t.slice(0, TEXT_MAX);
+  }
+  function event(it, type, detail){
+    var e = { type: type, by: sig.by, byName: sig.byName, at: sig.at };
+    if(detail) e.detail = detail;
+    it.events = (it.events || []).concat([e]);
+    return e;
+  }
+  function addTags(it, tags){
+    var t = normTags(tags, a.tagNames);
+    var added = t.emails.filter(function(e){ return uniq(it.tags).indexOf(e) < 0; });
+    it.tags = uniq((it.tags || []).concat(added));
+    it.tagNames = it.tagNames || {};
+    added.forEach(function(e){ it.tagNames[e] = t.names[e]; });
+    return added;
+  }
+
+  if(a.type === "POST"){
+    var kind = a.kind === "QUESTION" ? "QUESTION" : a.kind === "COMMENT" ? "COMMENT" : "";
+    if(!kind) return err("NO_KIND", "Choose a question or a comment.");
+    var text = textOf();
+    if(!text) return err("NO_TEXT", "Write something first.");
+    if(chat.items.length >= ITEMS_MAX) return err("TOO_MANY", "This subject's chat is full.");
+    var it = { id: newId(), kind: kind, text: text, by: sig.by, byName: sig.byName, at: sig.at,
+      tags: [], tagNames: {}, critical: !!a.critical, solved: false,
+      replies: [], events: [], reminders: [], edits: [] };
+    var added = addTags(it, a.tags);
+    if(it.critical) event(it, "CRITICAL_ON");
+    chat.items.push(it);
+    return { chat: chat, item: it, event: { type: "POST", by: sig.by, byName: sig.byName, at: sig.at },
+             notify: added.filter(function(e){ return e !== me; }) };
+  }
+
+  var item = findItem(chat, a.itemId);
+  if(!item) return err("NOT_FOUND", "That item is no longer in the chat.");
+
+  if(a.type === "REPLY"){
+    var rt = textOf();
+    if(!rt) return err("NO_TEXT", "Write the reply first.");
+    var r = { id: newId(), text: rt, by: sig.by, byName: sig.byName, at: sig.at, edits: [] };
+    item.replies = (item.replies || []).concat([r]);
+    var addedR = addTags(item, a.tags);
+    if(addedR.length) event(item, "TAGGED", addedR.map(function(e){ return item.tagNames[e] || e; }).join(", "));
+    return { chat: chat, item: item, event: { type: "REPLY", by: sig.by, byName: sig.byName, at: sig.at },
+             notify: addedR.filter(function(e){ return e !== me; }) };
+  }
+  if(a.type === "TAG"){
+    var addedT = addTags(item, a.tags);
+    if(!addedT.length) return err("NO_TAGS", "Choose somebody who is not tagged yet.");
+    var eT = event(item, "TAGGED", addedT.map(function(e){ return item.tagNames[e] || e; }).join(", "));
+    return { chat: chat, item: item, event: eT, notify: addedT.filter(function(e){ return e !== me; }) };
+  }
+  if(a.type === "CRITICAL" || a.type === "SOLVE" || a.type === "REOPEN"){
+    if(!mayDecide(item, actor, ctx)){
+      return err("FORBIDDEN", "Only the writer, the people tagged, the site's CPM, an App Admin or a Manager may do that.");
+    }
+    var e2;
+    if(a.type === "CRITICAL"){
+      var on = !!a.on;
+      if(!!item.critical === on) return err("NO_CHANGE", on ? "It is already critical." : "It is not critical.");
+      item.critical = on;
+      e2 = event(item, on ? "CRITICAL_ON" : "CRITICAL_OFF");
+    }else if(a.type === "SOLVE"){
+      if(item.solved) return err("NO_CHANGE", "It is already solved.");
+      item.solved = true;
+      e2 = event(item, "SOLVED");
+    }else{
+      if(!item.solved) return err("NO_CHANGE", "It is not solved.");
+      item.solved = false;
+      e2 = event(item, "REOPENED");
+    }
+    return { chat: chat, item: item, event: e2, notify: [] };
+  }
+  if(a.type === "BUMP"){
+    if(item.solved) return err("SOLVED", "A solved item is reopened, not bumped.");
+    item.bumpedAt = sig.at;
+    var eB = event(item, "BUMPED");
+    return { chat: chat, item: item, event: eB,
+             notify: ownersOf(item, ctx.siteCpmEmail).filter(function(e){ return e !== me; }) };
+  }
+  if(a.type === "EDIT"){
+    var nt = textOf();
+    if(!nt) return err("NO_TEXT", "A message cannot be emptied - write the new wording.");
+    var target = item;
+    if(a.replyId){
+      target = null;
+      (item.replies || []).forEach(function(x){ if(x.id === a.replyId) target = x; });
+      if(!target) return err("NOT_FOUND", "That reply is no longer in the chat.");
+    }
+    if(lc(target.by) !== me) return err("FORBIDDEN", "Only the writer may edit a message.");
+    if(target.text === nt) return err("NO_CHANGE", "Nothing was changed.");
+    var prev = target.text;
+    target.edits = (target.edits || []).concat([{ by: sig.by, byName: sig.byName, at: sig.at, prev: prev }]);
+    target.text = nt;
+    target.editedAt = sig.at;
+    return { chat: chat, item: item, event: { type: "EDITED", by: sig.by, byName: sig.byName, at: sig.at, prev: prev, next: nt },
+             notify: [] };
+  }
+  if(a.type === "REMIND"){
+    var forT = normTags([a.forEmail], a.tagNames);
+    if(!forT.emails.length) return err("NO_USER", "Choose who the reminder is for.");
+    var date = String(a.date || "").slice(0, 10);
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(date)) return err("NO_DATE", "Choose the date of the reminder.");
+    var note = clean(a.text).slice(0, 500);
+    var rem = { id: newId(), forEmail: forT.emails[0], forName: forT.names[forT.emails[0]], date: date, text: note,
+                by: sig.by, byName: sig.byName, at: sig.at, done: false };
+    item.reminders = (item.reminders || []).concat([rem]);
+    var eR = event(item, "REMINDER", rem.forName + " on " + date + (note ? " - " + note : ""));
+    return { chat: chat, item: item, event: eR, notify: [] };
+  }
+  if(a.type === "REMIND_DONE"){
+    var rr = null;
+    (item.reminders || []).forEach(function(x){ if(x.id === a.reminderId) rr = x; });
+    if(!rr) return err("NOT_FOUND", "That reminder is no longer there.");
+    if(rr.done) return err("NO_CHANGE", "It is already done.");
+    rr.done = true; rr.doneBy = sig.by; rr.doneByName = sig.byName; rr.doneAt = sig.at;
+    var eD = event(item, "REMINDER_DONE", rr.forName + " on " + rr.date);
+    return { chat: chat, item: item, event: eD, notify: [] };
+  }
+  return err("BAD_ACTION", "That is not something the chat can do.");
+}
+
+/* One line for the audit trail. An edit keeps the original wording here (the owner). */
+var EVENT_WORDS = {
+  POST: "wrote", REPLY: "replied", TAGGED: "tagged", CRITICAL_ON: "marked critical",
+  CRITICAL_OFF: "removed critical", SOLVED: "marked solved", REOPENED: "reopened",
+  BUMPED: "bumped", EDITED: "edited", REMINDER: "set a reminder", REMINDER_DONE: "closed a reminder"
+};
+function auditLine(res, code){
+  var it = res.item, e = res.event;
+  var what = (KINDS[it.kind] || "Item") + " on subject " + code;
+  var head = "Subject chat - " + (EVENT_WORDS[e.type] || e.type) + " - " + code;
+  var comments = "";
+  if(e.type === "POST") comments = KINDS[it.kind] + ": " + it.text + (it.tags.length ? " · tagged " + it.tags.map(function(x){ return it.tagNames[x] || x; }).join(", ") : "");
+  else if(e.type === "REPLY") comments = "On \"" + short(it.text) + "\": " + it.replies[it.replies.length - 1].text;
+  else if(e.type === "EDITED") comments = "Original: " + e.prev + " · New: " + e.next;
+  else comments = "On \"" + short(it.text) + "\"" + (e.detail ? ": " + e.detail : "");
+  return { action: head, stateChanges: what, comments: comments, highPriority: e.type === "CRITICAL_ON" };
+}
+function short(t){ t = String(t || "").replace(/\s+/g, " "); return t.length > 80 ? t.slice(0, 77) + "..." : t; }
+
+var api = {
+  KINDS: KINDS, TEXT_MAX: TEXT_MAX, EVENT_WORDS: EVENT_WORDS,
+  chatOf: chatOf, legacyItems: legacyItems, openItems: openItems, sorted: sorted, isOpen: isOpen,
+  ownersOf: ownersOf, mayDecide: mayDecide, dueReminders: dueReminders, apply: apply, auditLine: auditLine
+};
+if(typeof module !== "undefined" && module.exports) module.exports = api;
+if(typeof window !== "undefined") window.SubjectChat = api;
+
+})();
+
+</script>
 
 <script>
 /* Generated demo build: never contact a backend, and keep storage separate so a
@@ -14748,7 +15180,13 @@ const ANAT_STATE_CLS = {
   "Completed":            "p-green",
   "Not required":         "p-grey"
 };
-const SUITABILITY  = ["","Suitable","Borderline","Not suitable"];
+/* The four suitability words since 16 Nov 2026 (the owner) - anatStages.SUIT. Older records
+   hold "Borderline" / "Not suitable"; every reader goes through suitabilityOf. */
+const SUIT           = window.AnatStages.SUIT;
+const suitabilityOf  = window.AnatStages.suitabilityOf;
+function AnatStages_suitOptions(s){ return window.AnatStages.suitabilityOptions(s); }
+/* The subject chat (16 Nov 2026) - subjectChat.js, shared with the server. */
+const SC = window.SubjectChat;
 /* The workflow's shape lives in anatStages.js, because the server names these stages
    in the daily summary email and the tests exercise them - three copies of a list that
    gets renamed is three chances to disagree. What stays here is everything ABOUT A
@@ -15627,7 +16065,10 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               "hold", "holdHistory", "cancelHistory",
                               /* a cancelled product order request (9 Nov 2026): written
                                  only by the REQUEST_CANCEL approval */
-                              "orderCancel"];
+                              "orderCancel",
+                              /* the subject chat and the print gate (16 Nov 2026): written
+                                 only by POST /api/patients/:id/chat and /print-gate */
+                              "chat", "printGate"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -17567,6 +18008,23 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.18.0", date: "16 November 2026", groups: [
+    { h:"Questions and discussion on every subject", items:[
+      "<b>Notes</b> and <b>To discuss with the PI</b> are gone from Subject Registration. In their place, and in place of the medical questions, each subject has a <b>chat</b>: ask a question or add a comment, reply, <b>tag</b> people, mark an item <b>Critical</b> or <b>Solved</b>, <b>Reopen</b> it, <b>Bump</b> it back to the top, and set a <b>reminder</b> for a user.",
+      "Every action is signed with the name, date and time. You can edit your own words (the item says it was edited and the original is kept in the Audit Trail); nothing is deleted.",
+      "Everything not yet solved is a task — for the people tagged, or the site’s CPM when nobody is — and shows on Home. A reminder shows on Home on its day and in your 08:00 mail.",
+      "Open items appear in <b>Clinical Questions</b> on Screening &amp; Evaluation and under <b>To discuss with the PI</b> in the procedure report, critical first, with <b>Open full chat</b> for the whole thread.",
+      "What was already written in Notes, To discuss with the PI and the medical questions is in the chat."
+    ]},
+    { h:"Evaluation stages", items:[
+      "Anatomical suitability is now <b>Suitable</b>, <b>Suitable – size to be confirmed</b>, <b>Challenging anatomy</b> or <b>Anatomically unsuitable</b> (Borderline reads as Challenging anatomy). Size to be confirmed needs both sizes; Challenging anatomy needs an explanation.",
+      "The CT report takes a <b>PDF only</b>, with no camera button.",
+      "<b>3D Model Evaluation</b> is now <b>Digital Model Evaluation</b>: images only (several at once, or drag them in), no simulator angle, a full scoring, and a recommendation whether a <b>physical model</b> is needed.",
+      "The Pliable Model Evaluation is scored in full every time too.",
+      "Angles are entered as <b>LAO or RAO</b> with the angle and <b>CRAN or CAUD</b> with the angle, everywhere, the procedure report included.",
+      "After the Digital Model Evaluation the <b>Clinical Manager</b> decides: clinically feasible — printing opens (or stages 3–6 are not required when no physical model is needed) — or not clinically feasible — the subject goes on hold. Nothing is printed before that."
+    ]}
+  ]},
   { version: "3.17.0", date: "16 November 2026", groups: [
     { h:"Clearer names in the menu", items:[
       "<b>Subject Overview</b> is now <b>Subjects in Screening</b>, <b>Subject Register</b> is <b>Subject Registration</b> and <b>Subject Screening</b> is <b>Screening &amp; Evaluation</b>.",
@@ -21250,6 +21708,28 @@ function todoItems(){
            (tasks.length > 3 ? "…" : "") });
   }
 
+  /* 0 (chat) — THE SUBJECT CHAT (16 Nov 2026): open questions and tasks this person is
+     tagged in, or holds as the site's CPM; reminders set for them that have come due; and,
+     for the Clinical Manager, the feasibility decisions waiting after the Digital Model. */
+  const pg = mayDecidePrintGate() ? activePatients().filter(p => inPatientScope(p.siteId) && AnatStages.printGatePending(p)) : [];
+  for(const p of pg) out.push({ ic:"alert", tone:"t-red", view:"screening", patientId:p.id,
+    title: p.patientCode + " — clinical feasibility to decide",
+    sub: "Digital Model Evaluation done · " + AnatStages.modelNeedLabel(p.anat.model3d.modelNeed) +
+         " · nothing is printed until you decide",
+    onOpen: () => { SCR.patientId = p.id; go("screening"); setTimeout(() => askPrintGate(p), 0); } });
+  const ct = myChatTasks();
+  if(ct.length){
+    const crit = ct.filter(x => x.it.critical).length;
+    out.push({ ic:"case", tone: crit ? "t-red" : "t-blue", view:"screening", patientId: ct[0].p.id,
+      title: ct.length + " open question(s) / task(s) on subjects" + (crit ? " — " + crit + " critical" : ""),
+      sub: ct.slice(0, 3).map(x => x.p.patientCode + ": " + String(x.it.text).slice(0, 60)).join(" — ") + (ct.length > 3 ? "…" : ""),
+      onOpen: () => openSubjectChat(ct[0].p) });
+  }
+  for(const x of myChatReminders().slice(0, 4)) out.push({ ic:"alert", tone:"t-amber", view:"screening", patientId:x.p.id,
+    title: "Reminder — " + x.p.patientCode,
+    sub: (x.r.text || String(x.it.text).slice(0, 80)) + " · " + fmtDate(x.r.date) + " · set by " + (x.r.byName || ""),
+    onOpen: () => openSubjectChat(x.p) });
+
   /* 0a — THE PROCEDURE HAPPENED AND NO REPORT CAME (15 Nov 2026): the gaps this person
      was alerted to and has to confirm, and the reports they were made responsible for. */
   openReportGapsLocal();
@@ -22923,6 +23403,7 @@ VIEWS.today = {
       if(!it) return;
       /* Carry the context across, so the target screen opens on the right thing
          instead of on its own chooser. */
+      if(typeof it.onOpen === "function") return it.onOpen();
       const p = it.patientId ? patient(it.patientId) : null;
       go(it.view, p ? { SITEID:p.siteId, PID:p.id } : null);
     });
@@ -25623,27 +26104,9 @@ function contrastTotal(c){ return PD.contrastTotal(c); }
    a projection cannot be both RAO and LAO. */
 function cfAngleGroup(p, base, label, hint){
   const c = cf(p);
-  const filled = {};
-  for(const f of ANGLE_FIELDS){
-    if(String(c[angleKey(base, f)] || "").trim() !== "") filled[f.pair] = f.k;
-  }
-  return '<div class="field"><label>' + esc(label) + '</label>' +
-    '<div class="grid g4" style="margin:0">' +
-      ANGLE_FIELDS.map(f => {
-        const key = angleKey(base, f);
-        const locked = filled[f.pair] && filled[f.pair] !== f.k;
-        const id = "cf-" + key;
-        return '<div class="field" style="margin:0">' +
-          '<label for="' + id + '" class="hint" style="margin:0 0 2px">' + esc(f.label) + '</label>' +
-          '<input type="number" min="0" max="90" step="1" list="angle-0-90" inputmode="numeric" ' +
-            'id="' + id + '" data-cf="' + key + '" value="' + esc(c[key] == null ? "" : c[key]) + '"' +
-            (locked ? " disabled" : ro(p)) +
-            ' placeholder="' + (locked ? "—" : "0–90") + '">' +
-        '</div>';
-      }).join("") +
-    '</div>' +
-    (hint ? '<div class="hint" style="margin-top:4px">' + hint + '</div>' : "") +
-  '</div>';
+  /* The two-line control (16 Nov 2026) - see axisAngleHtml. */
+  return axisAngleHtml(f => c[angleKey(base, f)], f => 'data-cf="' + angleKey(base, f) + '"',
+    "cf-" + base, label, ro(p), hint || "");
 }
 /* Reads back as "RAO 10° / CRAN 15°". Empty when nothing is filled in, so an untouched
    injection prints nothing rather than a stray unit. */
@@ -26175,7 +26638,7 @@ VIEWS.screening = {
            patient is asked for nothing further, a study patient is asked for a date -
            and because it decides whether stage 10 can ever open. */
         if(stageState(p, stage) !== before.st ||
-           ["assignedTo","dueDate","pmPresent","completionDate","suitability","size",
+           ["assignedTo","dueDate","pmPresent","completionDate","suitability","size","altSize","modelNeed",
             "actualDate","studyArm","shippingDest","requestedDate"].includes(field)){
           renderKeepingPlace();
         }
@@ -26187,40 +26650,46 @@ VIEWS.screening = {
        Its own handlers rather than the [data-anat] path, because it writes into a
        nested structure rather than a flat field. Everything else - the save, the log,
        the re-render - goes through the same afterScoring so it behaves identically. */
-    const scoringStage = ANAT_STAGES.find(x => x.scoring);
+    /* Two scored stages since 16 Nov 2026 (digital and pliable model), so every control
+       carries its stage key first. */
     const afterScoring = (redraw) => {
       commit(); schedulePatientSave(p); flashSaved();
       if(redraw) renderKeepingPlace();
     };
-    if(scoringStage){
-      const sc = () => scoringOf(p, scoringStage);
-      $$("[data-scsize]").forEach(el => el.onchange = () => {
-        sc().sizes[+el.dataset.scsize] = el.value; afterScoring(true);
-      });
-      $$("[data-scv]").forEach(el => el.onchange = () => {
-        const [i, k] = el.dataset.scv.split("|");
-        const s0 = sc(); (s0.scores[+i] = s0.scores[+i] || {})[k] = el.value;
-        afterScoring(true);          // the totals and the "higher" pill have to follow
-      });
-      $$("[data-scn]").forEach(el => el.onchange = () => {
-        const [i, k] = el.dataset.scn.split("|");
-        const s0 = sc(); (s0.notes[+i] = s0.notes[+i] || {})[k] = el.value;
-        afterScoring(false);
-      });
-      $$("[data-scdec]").forEach(el => el.onchange = () => {
-        sc().decision = el.value; afterScoring(true);
-      });
-      $$("[data-scchosen]").forEach(el => el.onchange = () => {
-        const s0 = sc();
-        s0.chosenSize = el.value;
-        /* A borderline conclusion IS the size decision for this stage, so it feeds the
-           stage's own size field - which is what the recommendation reads. */
-        if(el.value) p.anat[scoringStage.k].size = el.value;
-        afterScoring(true);
-      });
-      $$("[data-scproc]").forEach(el => el.onchange = () => { sc().proctorNotes = el.value; afterScoring(false); });
-      $$("[data-scdisc]").forEach(el => el.onchange = () => { sc().discussBetween = el.value; afterScoring(false); });
-    }
+    const scOf = k => {
+      const st = ANAT_STAGES.find(x => x.k === k && x.scoring);
+      return st && anatUnlocked(p, k) ? scoringOf(p, st) : null;
+    };
+    $$("[data-scsize]").forEach(el => el.onchange = () => {
+      const [k, i] = el.dataset.scsize.split("|"); const s0 = scOf(k); if(!s0) return;
+      s0.sizes[+i] = el.value; afterScoring(true);
+    });
+    $$("[data-scv]").forEach(el => el.onchange = () => {
+      const [k, i, c] = el.dataset.scv.split("|"); const s0 = scOf(k); if(!s0) return;
+      (s0.scores[+i] = s0.scores[+i] || {})[c] = el.value;
+      afterScoring(true);          // the totals and the "higher" pill have to follow
+    });
+    $$("[data-scn]").forEach(el => el.onchange = () => {
+      const [k, i, c] = el.dataset.scn.split("|"); const s0 = scOf(k); if(!s0) return;
+      (s0.notes[+i] = s0.notes[+i] || {})[c] = el.value;
+      afterScoring(false);
+    });
+    $$("[data-scdec]").forEach(el => el.onchange = () => {
+      const s0 = scOf(el.dataset.scdec); if(!s0) return;
+      s0.decision = el.value; afterScoring(true);
+    });
+    $$("[data-scchosen]").forEach(el => el.onchange = () => {
+      const s0 = scOf(el.dataset.scchosen); if(!s0) return;
+      s0.chosenSize = el.value;
+      /* The conclusion IS the size decision for this stage, so it feeds the stage's own
+         size field - which is what the recommendation reads. */
+      if(el.value) p.anat[el.dataset.scchosen].size = el.value;
+      afterScoring(true);
+    });
+    $$("[data-scproc]").forEach(el => el.onchange = () => {
+      const s0 = scOf(el.dataset.scproc); if(!s0) return; s0.proctorNotes = el.value; afterScoring(false); });
+    $$("[data-scdisc]").forEach(el => el.onchange = () => {
+      const s0 = scOf(el.dataset.scdisc); if(!s0) return; s0.discussBetween = el.value; afterScoring(false); });
 
     /* ---- ordering the products ----
        One handler since 2 Oct 2026. The three it replaces - send the request, confirm the
@@ -26282,9 +26751,11 @@ VIEWS.screening = {
          a field could have been emptied in between. */
       if(gaps.length) return showWhy("stg-why-" + stage.k,
         "Still needed before this can be confirmed: " + gaps.join(", ") + ".");
-      /* A borderline anatomy must reach a conclusion before the stage can close, and
-         "we still need to talk about it" is not one - that is what the decision says. */
-      if(stage.scoring && a.suitability === "Borderline"){
+      /* A scored stage must reach a conclusion before it can close, and "we still need to
+         talk about it" is not one - that is what the decision says. Every digital and
+         pliable model evaluation is scored since 16 Nov 2026 (the owner); an anatomically
+         unsuitable finding has no size to score. */
+      if(stage.scoring && suitabilityOf(a.suitability) !== SUIT.UNSUITABLE){
         const sc = a.scoring || {};
         if(!sc.decision) return showWhy("stg-why-" + stage.k,
           "The borderline comparison needs a conclusion before this stage can be confirmed.");
@@ -26322,20 +26793,20 @@ VIEWS.screening = {
            disqualify dialog since 2 Oct 2026, so it carries a reason somebody wrote and is
            filed as a screen failure, not a fixed sentence. Cancel the dialog and the stage
            stays as it was: the conclusion and the cancellation are one act. */
-        if(stage.scoring && a.suitability === "Borderline" && sc.decision === "UNSUITABLE"){
+        if(stage.scoring && suitabilityOf(a.suitability) !== SUIT.UNSUITABLE && sc.decision === "UNSUITABLE"){
           if(!can("disqualifyPatient")){
             return toast("Only a Clinical PM, Manager or App Admin can confirm a conclusion " +
                          "that the subject is unsuitable.", "bad");
           }
           openDisqualifyDialog(p, { category:"ANATOMY", stage:stageName(stage),
-            reason:"Anatomically unsuitable on the pliable model evaluation. ",
+            reason:"Anatomically unsuitable on the " + stage.label.toLowerCase() + ". ",
             onConfirm: () => complete() });
           return;
         }
         complete();
         /* NOT SUITABLE opens the discussion (2 Oct 2026): the stage is confirmed - the finding
            is on record - and everything after it waits for a decision. */
-        if(stage.kind === "eval" && a.suitability === "Not suitable"){
+        if(stage.kind === "eval" && suitabilityOf(a.suitability) === SUIT.UNSUITABLE){
           openSuitabilityReview(p, stage);
           afterStageChange(p, stage, "Stage confirmed — subject NOT SUITABLE, discussion required", {
             highPriority:true,
@@ -26365,8 +26836,8 @@ VIEWS.screening = {
       modal("Mark stage " + stage.n + " not required",
         (pmAsk
           ? '<div class="warn"><b>Please note:</b> ' + (pmSaid
-              ? 'a pacemaker was recorded in the 3D model evaluation.'
-              : 'the 3D model evaluation does not say there is no pacemaker.') +
+              ? 'a pacemaker was recorded in the Digital Model Evaluation.'
+              : 'the Digital Model Evaluation does not say there is no pacemaker.') +
             ' By marking this stage not required you confirm that, as far as you are ' +
             'concerned, <b>the PM can be passed without a special angle</b>.</div>'
           : "") +
@@ -26772,7 +27243,7 @@ function openStopDialog(p, kind){
         'screen failure and is not counted in the screen-failure rate. Units held for the subject are released. ' +
         '(If screening found the subject unsuitable, use <b>Disqualify</b> instead.)</p>') +
     (hold ? '<div class="field"><label class="req" for="stp-cat">Why — category</label><select id="stp-cat">' +
-        '<option value="">— choose —</option>' + SM.HOLD_CATEGORIES.map(c => '<option value="' + c.k + '">' + esc(c.k === "OTHER" ? "Other — explain below" : c.label) + '</option>').join("") +
+        '<option value="">— choose —</option>' + SM.HOLD_CATEGORIES.filter(c => c.k !== "NOT_FEASIBLE").map(c => '<option value="' + c.k + '">' + esc(c.k === "OTHER" ? "Other — explain below" : c.label) + '</option>').join("") +
       '</select></div>' : '') +
     '<div class="field"><label class="req" for="stp-why">Why — in words</label>' +
       '<textarea id="stp-why" maxlength="1000"></textarea></div>' +
@@ -27079,9 +27550,9 @@ function anatFilesBlock(p, s){
   const need = rule ? ({ ct:"The CT report as a PDF is required to complete this stage.",
                          model3d:"At least 2 images are required to complete this stage (a PDF does not count).",
                          flexible:"At least 2 images are required to complete this stage (a PDF does not count)." })[s.k] +
-                      (a.suitability === "Not suitable" ? " The files must also show why the subject is not suitable." : "")
+                      (suitabilityOf(a.suitability) === SUIT.UNSUITABLE ? " The files must also show why the subject is not suitable." : "")
              : s.final ? "A Road Map file — image or PDF — is required to complete this stage."
-             : a.suitability === "Not suitable" ? "At least one image or PDF showing why the subject is not suitable is required."
+             : suitabilityOf(a.suitability) === SUIT.UNSUITABLE ? "At least one image or PDF showing why the subject is not suitable is required."
              : "";
   const short = rule ? !!AnatStages.stageFileGap(p, s) : !files.length;
   const may = mayAddAnatFile(p, s);
@@ -27093,10 +27564,15 @@ function anatFilesBlock(p, s){
                   : '<div class="hint">Nothing filed for this stage yet.</div>') +
     (need ? '<div class="' + (short && a.status !== "Completed" ? "warn" : "hint") + '" style="margin-top:4px">' +
       esc(need) + '</div>' : "") +
-    (may ? '<div class="row" style="margin-top:6px">' +
-      '<button type="button" class="btn btn-sm" data-afadd="' + esc(p.id) + '|' + s.k + '|cam"><span class="fic">' + icon("camera") + '</span>Take a photo</button>' +
-      '<button type="button" class="btn btn-sm" data-afadd="' + esc(p.id) + '|' + s.k + '|pc">Upload from computer</button>' +
-      '<span class="hint">Images and PDFs, up to about 3 MB. Filed in the subject’s folder.</span>' +
+    (may ? '<div class="row' + (ANAT_FILE_ONLY[s.k] === "image" ? ' af-drop" data-afdrop="' + esc(p.id) + '|' + s.k : '') +
+        '" style="margin-top:6px">' +
+      (ANAT_FILE_ONLY[s.k] ? "" :
+        '<button type="button" class="btn btn-sm" data-afadd="' + esc(p.id) + '|' + s.k + '|cam"><span class="fic">' + icon("camera") + '</span>Take a photo</button>') +
+      '<button type="button" class="btn btn-sm" data-afadd="' + esc(p.id) + '|' + s.k + '|pc">' +
+        (ANAT_FILE_ONLY[s.k] === "pdf" ? "Upload PDF" : ANAT_FILE_ONLY[s.k] === "image" ? "Upload images" : "Upload from computer") + '</button>' +
+      '<span class="hint">' + (ANAT_FILE_ONLY[s.k] === "pdf" ? "PDF only, up to about 4 MB."
+        : ANAT_FILE_ONLY[s.k] === "image" ? "Image files only — choose several at once, or drag them here."
+        : "Images and PDFs, up to about 3 MB.") + ' Filed in the subject’s folder.</span>' +
       '</div>' : "") +
     '</div>';
 }
@@ -27206,18 +27682,45 @@ function confirmPdfClean(file, label){
    since 8 Oct 2026 the server's body limit allows for that, so the 0.74 this used to apply
    (about 3 MB, which a CT report can exceed) is gone. */
 const ANAT_PDF_MAX = 4 * 1024 * 1024;
+/* WHAT A STAGE TAKES (16 Nov 2026, the owner): the CT report is a PDF and nothing else; the
+   Digital Model takes images only - several at once, or dragged onto the stage - and neither
+   offers Take a photo any more. Every other stage is as it was. */
+const ANAT_FILE_ONLY = { ct:"pdf", model3d:"image" };
+function anatFileFits(s, file){
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name || "");
+  const only = ANAT_FILE_ONLY[s.k];
+  if(only === "pdf") return isPdf;
+  if(only === "image") return !isPdf && /^image\//.test(file.type || "");
+  return true;
+}
 function addAnatFile(p, s, useCamera){
   if(!mayAddAnatFile(p, s)) return;
-  const label = stageName(s);
+  const only = ANAT_FILE_ONLY[s.k];
   const inp = document.createElement("input");
   inp.type = "file";
-  inp.accept = useCamera ? "image/*" : "image/*,application/pdf";
-  if(useCamera) inp.setAttribute("capture", "environment");
+  inp.accept = only === "pdf" ? "application/pdf,.pdf" : (useCamera || only === "image") ? "image/*" : "image/*,application/pdf";
+  if(only === "image") inp.multiple = true;
+  if(useCamera && !only) inp.setAttribute("capture", "environment");
   inp.style.display = "none";
   document.body.appendChild(inp);
-  inp.onchange = async () => {
-    const file = inp.files && inp.files[0];
+  inp.onchange = () => {
+    const files = Array.from(inp.files || []);
     inp.remove();
+    fileAnatFiles(p, s, files);
+  };
+  inp.click();
+}
+/* One after another: each image is reviewed for identifiers before it is filed. */
+async function fileAnatFiles(p, s, files){
+  if(!mayAddAnatFile(p, s)) return;
+  const bad = files.filter(f => !anatFileFits(s, f));
+  if(bad.length) toast(ANAT_FILE_ONLY[s.k] === "pdf" ? "The CT report is filed as a PDF only — " + bad.length + " file(s) skipped."
+                       : "Only image files are filed here — " + bad.length + " file(s) skipped.", "warn");
+  for(const f of files.filter(f => anatFileFits(s, f))) await fileOneAnat(p, s, f);
+}
+async function fileOneAnat(p, s, file){
+  const label = stageName(s);
+  {
     if(!file) return;
     try{
       const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
@@ -27278,9 +27781,28 @@ function addAnatFile(p, s, useCamera){
     }catch(e){
       toast("The file could not be filed: " + (e.message || e), "bad");
     }
-  };
-  inp.click();
+  }
 }
+/* Dragging images onto the Digital Model's drop area (16 Nov 2026). */
+document.addEventListener("dragover", e => {
+  const z = e.target && e.target.closest && e.target.closest("[data-afdrop]");
+  if(!z) return;
+  e.preventDefault();
+  z.classList.add("on");
+});
+document.addEventListener("dragleave", e => {
+  const z = e.target && e.target.closest && e.target.closest("[data-afdrop]");
+  if(z) z.classList.remove("on");
+});
+document.addEventListener("drop", e => {
+  const z = e.target && e.target.closest && e.target.closest("[data-afdrop]");
+  if(!z) return;
+  e.preventDefault();
+  z.classList.remove("on");
+  const [pid, k] = z.dataset.afdrop.split("|");
+  const p = patient(pid), s = ANAT_STAGES.find(x => x.k === k);
+  if(p && s) fileAnatFiles(p, s, Array.from((e.dataTransfer && e.dataTransfer.files) || []));
+});
 
 /* ---- THE PATIENT'S FOLDER, in the app (2 Oct 2026, the owner) -------------------------
    Opened from the eye on Patient Overview. Built from the RECORD, never from a folder
@@ -27459,7 +27981,10 @@ function anatStageHtml(p, s, ctReady){
        halves of stage 3 are open to different people at different times. */
     const dis = opts.locked ? " disabled" : dis0;
     const id = "an-" + s.k + "-" + field;
-    const v = a[field] == null ? "" : a[field];
+    /* Old "Borderline" / "Not suitable" are shown as their new words (16 Nov 2026) and are
+       stored that way only when somebody next changes the field - never rewritten behind
+       anybody's back (a held subject's save would be refused for it). */
+    const v = a[field] == null ? "" : field === "suitability" ? suitabilityOf(a[field]) : a[field];
     let ctl;
     if(type === "select"){
       ctl = '<select id="' + id + '" data-anat="' + s.k + '|' + field + '"' + dis + '>' +
@@ -27477,7 +28002,7 @@ function anatStageHtml(p, s, ctReady){
             (opts.min !== undefined ? ' min="' + esc(opts.min) + '"' : "") +
             (opts.max !== undefined ? ' max="' + esc(opts.max) + '"' : "") + dis + '>';
     }
-    const req = stageRequired(s).some(([k]) => k === field);
+    const req = opts.req || stageRequired(s).some(([k]) => k === field);
     return '<div class="field"><label class="' + (req ? "req" : "") + '" for="' + id + '">' +
       esc(label) + '</label>' + ctl + '</div>';
   };
@@ -27567,10 +28092,22 @@ function anatStageHtml(p, s, ctReady){
         : 'Opens once 3.1 is requested.') + '</div>';
   }
   else if(s.kind === "eval"){
-    inner += f("suitability","Anatomical suitability","select",{ options:SUITABILITY }) +
+    const suit = suitabilityOf(a.suitability);
+    inner += f("suitability","Anatomical suitability","select",{ options:AnatStages_suitOptions(s) }) +
       '</div>' +
+      /* CHALLENGING ANATOMY says what is challenging (16 Nov 2026, the owner); at the digital and
+         pliable model stages the full scoring below is where it is worked through. */
+      (suit === SUIT.CHALLENGING
+        ? '<div class="field"><label class="req" for="an-' + s.k + '-challengeReason">What makes the anatomy ' +
+            'challenging</label><textarea id="an-' + s.k + '-challengeReason" data-anat="' + s.k +
+            '|challengeReason"' + dis + '>' + esc(a.challengeReason || "") + '</textarea></div>'
+        : "") +
+      (suit === SUIT.SIZE_TBC
+        ? '<div class="note" style="margin:2px 0 8px">Not sure which size is better: enter <b>both</b> — ' +
+          'the recommended size and the alternative size. They must differ.</div>'
+        : "") +
       /* NOT SUITABLE IS A FINDING, and a finding has a reason and evidence (2 Oct 2026). */
-      (a.suitability === "Not suitable"
+      (suit === SUIT.UNSUITABLE
         ? '<div class="warn" style="margin:2px 0 8px"><b>Not suitable.</b> Say why, and file at ' +
           'least one image or PDF below. Confirming this stage opens a discussion: the site’s ' +
           'Clinical PM is told, the subject reads <b>Suspected unsuitable</b>, and the later stages ' +
@@ -27582,14 +28119,18 @@ function anatStageHtml(p, s, ctReady){
       '<div class="grid g3">' +
       f("size", s.final ? "Final recommended implant size" : "Recommended implant size",
         "select",{ options:[""].concat(UNICA_SIZES) }) +
-      (s.final ? "" : f("altSize","Alternative size (optional)","select",{ options:[""].concat(UNICA_SIZES) })) +
+      (s.final ? "" : f("altSize", suit === SUIT.SIZE_TBC
+          ? "Alternative size (where you are not sure which size is better)"
+          : "Alternative size (where you are not sure which size is better) — optional",
+        "select",{ options:[""].concat(UNICA_SIZES), req: suit === SUIT.SIZE_TBC })) +
       '</div>';
     /* The pliable model carries no angle - that is decided later, under fluoroscopy. */
     if(!s.noAngle){
       inner += angleGroup(p, s, "angle",
         s.final ? "Final recommended implantation angle" : "Recommended implantation angle", dis);
     }
-    if(s.sim) inner += angleGroup(p, s, "simAngle", "Implantation angle used in simulator", dis);
+    /* The simulator angle is gone (16 Nov 2026, the owner: not needed). A value recorded before
+       stays in the record, unshown. */
     if(s.pm){
       inner += '<div class="grid g3">' +
         f("pmPresent","PM present","select",{ options:["","Yes","No"] }) +
@@ -27597,6 +28138,7 @@ function anatStageHtml(p, s, ctReady){
         angleGroup(p, s, "pmCrossingAngle", "PM crossing angle", dis);
     }
     if(s.scoring) inner += scoringBlock(p, s, dis);
+    if(s.modelGate) inner += modelNeedBlock(p, s, dis);
     if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
     inner += anatFilesBlock(p, s);
   }
@@ -27609,11 +28151,11 @@ function anatStageHtml(p, s, ctReady){
        case that most needed an accurate record (24 Sep 2026). */
     if(s.needsPm && a.status === "Not required"){
       inner += pmDeemedNoPm(p)
-        ? '<div class="info">No pacemaker recorded in the 3D model evaluation, so this ' +
+        ? '<div class="info">No pacemaker recorded in the Digital Model Evaluation, so this ' +
           'stage is deemed <b>N/A (No PM)</b> automatically.</div>'
         : '<div class="info"><b>A pacemaker was ' +
           (p.anat.model3d && p.anat.model3d.pmPresent === "Yes" ? "recorded" : "not ruled out") +
-          ' in the 3D model evaluation.</b> This stage was marked not required on the ' +
+          ' in the Digital Model Evaluation.</b> This stage was marked not required on the ' +
           'confirmation that the PM can be passed without a special angle' +
           (a.pmPassConfirmedBy ? ' — confirmed by <b>' + esc(a.pmPassConfirmedBy) + '</b>' +
             (a.pmPassConfirmedAt ? ' · ' + esc(fmtTs(a.pmPassConfirmedAt)) : "") : "") +
@@ -28399,26 +28941,32 @@ function scoringLeader(sc){
 }
 function scoringBlock(p, s, dis){
   const a = p.anat[s.k];
-  if(a.suitability !== "Borderline"){
+  /* A FULL SCORING AT EVERY DIGITAL AND PLIABLE MODEL EVALUATION (16 Nov 2026, the owner). It
+     used to open only for a Borderline anatomy. An anatomically unsuitable finding has no
+     size to score; a recorded scoring stays in the record and comes back if that changes. */
+  const suit = suitabilityOf(a.suitability);
+  if(suit === SUIT.UNSUITABLE){
     return a.scoring && a.scoring.decision
-      ? '<div class="note" style="margin-top:8px">A borderline comparison was recorded ' +
-        'here earlier. Set suitability back to Borderline to see it.</div>'
+      ? '<div class="note" style="margin-top:8px">A scoring was recorded here earlier. It is ' +
+        'not asked of an anatomically unsuitable finding.</div>'
       : "";
   }
   const sc = scoringOf(p, s);
   const totals = [scoringTotal(sc, 0), scoringTotal(sc, 1)];
   const lead = scoringLeader(sc);
+  const twoSizes = suit === SUIT.SIZE_TBC;
   const sizeSel = i =>
-    '<select data-scsize="' + i + '"' + dis + '>' +
+    '<select data-scsize="' + s.k + '|' + i + '"' + dis + '>' +
       [""].concat(UNICA_SIZES).map(o => '<option' +
         (String(sc.sizes[i] || "") === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
     '</select>';
 
   let h = '<div class="card" style="margin:12px 0 0"><div class="card-hd">' +
-    '<h3 style="margin:0">Borderline comparison</h3>' +
-    '<span class="pill p-orange">Suitability is Borderline</span></div><div class="card-bd">' +
-    '<div class="note" style="margin-bottom:8px">Score up to two candidate sizes, 1 (poor) ' +
-      'to 5 (good). The totals are a prompt — the conclusion at the end is yours.</div>' +
+    '<h3 style="margin:0">Anatomical scoring</h3>' +
+    '<span class="pill ' + (twoSizes ? "p-orange" : "p-blue") + '">' +
+      (twoSizes ? "Two candidate sizes — score both" : "Required for this stage") + '</span></div><div class="card-bd">' +
+    '<div class="note" style="margin-bottom:8px">Score ' + (twoSizes ? "both candidate sizes" : "the candidate size (option A; a second is optional)") +
+      ', 1 (poor) to 5 (good). The totals are a prompt — the conclusion at the end is yours.</div>' +
     '<div class="tbl-wrap"><table><thead><tr>' +
       '<th style="min-width:220px">Criterion</th>' +
       '<th>Option A ' + sizeSel(0) + '</th>' +
@@ -28429,11 +28977,11 @@ function scoringBlock(p, s, dis){
         (c.hint ? '<br><small class="hint">' + esc(c.hint) + '</small>' : "") + '</td>' +
       [0,1].map(i =>
         '<td><div class="row" style="gap:6px;flex-wrap:nowrap">' +
-          '<select data-scv="' + i + '|' + c.k + '"' + dis + ' style="max-width:70px">' +
+          '<select data-scv="' + s.k + '|' + i + '|' + c.k + '"' + dis + ' style="max-width:70px">' +
             ["","1","2","3","4","5"].map(o => '<option' +
               (String((sc.scores[i] || {})[c.k] || "") === o ? " selected" : "") + '>' +
               esc(o) + '</option>').join("") + '</select>' +
-          '<input type="text" data-scn="' + i + '|' + c.k + '" placeholder="note"' +
+          '<input type="text" data-scn="' + s.k + '|' + i + '|' + c.k + '" placeholder="note"' +
             ' value="' + esc((sc.notes[i] || {})[c.k] || "") + '"' + dis + '>' +
         '</div></td>').join("") +
       '</tr>').join("") +
@@ -28454,7 +29002,7 @@ function scoringBlock(p, s, dis){
 
   h += '<h4 style="margin:14px 0 6px">Conclusion</h4>' +
     '<div class="field"><label class="req">Decision</label>' +
-      '<select data-scdec="1"' + dis + '>' +
+      '<select data-scdec="' + s.k + '"' + dis + '>' +
         '<option value="">— choose —</option>' +
         SCORING_DECISIONS.map(d => '<option value="' + d.k + '"' +
           (sc.decision === d.k ? " selected" : "") + '>' + esc(d.label) + '</option>').join("") +
@@ -28463,16 +29011,16 @@ function scoringBlock(p, s, dis){
   if(sc.decision === "ELIGIBLE"){
     h += '<div class="grid g2">' +
       '<div class="field"><label class="req">Recommended implant size</label>' +
-        '<select data-scchosen="1"' + dis + '>' +
+        '<select data-scchosen="' + s.k + '"' + dis + '>' +
           [""].concat(UNICA_SIZES).map(o => '<option' +
             (String(sc.chosenSize || "") === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
         '</select></div>' +
       '<div class="field"><label>Notes for the proctor</label>' +
-        '<input type="text" data-scproc="1" value="' + esc(sc.proctorNotes || "") + '"' + dis + '></div>' +
+        '<input type="text" data-scproc="' + s.k + '" value="' + esc(sc.proctorNotes || "") + '"' + dis + '></div>' +
       '</div>';
   }else if(sc.decision === "DISCUSSION"){
     h += '<div class="field"><label class="req">What has to be decided</label>' +
-      '<input type="text" data-scdisc="1" placeholder="e.g. M versus L — which, and why"' +
+      '<input type="text" data-scdisc="' + s.k + '" placeholder="e.g. M versus L — which, and why"' +
       ' value="' + esc(sc.discussBetween || "") + '"' + dis + '></div>' +
       '<div class="warn">Progress is held here until this is resolved and the decision changed.</div>';
   }else if(sc.decision === "UNSUITABLE"){
@@ -28481,6 +29029,147 @@ function scoringBlock(p, s, dis){
   }
   return h + '</div></div>';
 }
+
+/* THE DIGITAL MODEL'S RECOMMENDATION (16 Nov 2026, the owner): is a physical model needed? The
+   evaluator chooses, with a short why. Completing the stage then asks the Clinical Manager,
+   and nothing is printed until the manager has said the subject is clinically feasible -
+   printGateBlock below, anatStages PRINT GATE. */
+function modelNeedBlock(p, s, dis){
+  const a = p.anat[s.k];
+  if(suitabilityOf(a.suitability) === SUIT.UNSUITABLE) return "";
+  return '<h4 style="margin:14px 0 6px">Recommendation</h4>' +
+    '<div class="grid g2">' +
+      '<div class="field"><label class="req" for="an-' + s.k + '-modelNeed">Physical model</label>' +
+        '<select id="an-' + s.k + '-modelNeed" data-anat="' + s.k + '|modelNeed"' + dis + '>' +
+          '<option value="">— choose —</option>' +
+          AnatStages.MODEL_NEED.map(m => '<option value="' + m.k + '"' + (a.modelNeed === m.k ? " selected" : "") + '>' +
+            esc(m.label) + '</option>').join("") +
+        '</select></div>' +
+      '<div class="field"><label class="req" for="an-' + s.k + '-modelNeedWhy">Why</label>' +
+        '<input type="text" id="an-' + s.k + '-modelNeedWhy" data-anat="' + s.k + '|modelNeedWhy" maxlength="400" value="' +
+          esc(a.modelNeedWhy || "") + '"' + dis + '></div>' +
+    '</div>' +
+    '<div class="hint">Completing this stage asks the Clinical Manager to decide whether the subject is ' +
+      'clinically feasible. Nothing is printed before that.</div>' +
+    printGateBlock(p);
+}
+/* Who decides (the server is the authority - printGateDeciders in server.js): the person
+   ticked Clinic manager, else an App Admin or a Manager. */
+function mayDecidePrintGate(){
+  if(!S.me || isExternalUser()) return false;
+  const cm = String(AnatStages.clinicManagerOf(S.db.users || []) || "");
+  const cmEmail = cm ? (cm.includes("@") ? cm : ((user(cm) || {}).email || "")) : "";
+  if(cmEmail) return String(cmEmail).toLowerCase() === myEmailLc();
+  return hasRole("ADMIN") || hasRole("MANAGER");
+}
+function printGateBlock(p){
+  if(!AnatStages.printGateApplies(p)) return "";
+  const g = p.printGate || {};
+  const need = p.anat.model3d.modelNeed;
+  if(g.decision === "FEASIBLE"){
+    return '<div class="okbox" style="margin-top:8px"><b>Clinically feasible</b> — ' + esc(g.byName || g.by) + ', ' +
+      esc(fmtTs(g.at)) + '. ' + (g.modelNeed === "NEEDED"
+        ? 'Printing opened; printed by ' + esc(assigneeLabel(g.printer)) + '.'
+        : 'No physical model: stages 3–6 are not required (they can still be completed).') + '</div>';
+  }
+  if(g.decision === "NOT_FEASIBLE" && !AnatStages.printGatePending(p)){
+    return '<div class="warn" style="margin-top:8px"><b>Not clinically feasible</b> — ' + esc(g.byName || g.by) + ', ' +
+      esc(fmtTs(g.at)) + ': ' + esc(g.reason || "") + '. The subject is on hold; when the hold is released the ' +
+      'Clinical Manager decides again.</div>';
+  }
+  return '<div class="warn" style="margin-top:8px"><b>Waiting for the Clinical Manager</b> to decide whether ' +
+      esc(p.patientCode) + ' is clinically feasible (' + esc(AnatStages.modelNeedLabel(need)) + '). ' +
+      'Nothing after this stage opens until then.' +
+      (mayDecidePrintGate() ? '<div class="row" style="margin-top:8px">' +
+        '<button type="button" class="btn btn-primary btn-sm" data-pgate="' + esc(p.id) + '">Decide clinical feasibility</button></div>' : "") +
+    '</div>';
+}
+function askPrintGate(p){
+  if(!p || !AnatStages.printGatePending(p) || !mayDecidePrintGate()) return;
+  const a = p.anat.model3d, need = a.modelNeed;
+  const people = (S.db.users || []).filter(u => u && u.email && String(u.accessType || "").toUpperCase() !== "EXTERNAL");
+  modal("Clinical feasibility — " + p.patientCode,
+    '<div class="okbox" style="margin-bottom:10px">Digital Model Evaluation by ' + esc(a.completedBy || "") + ': <b>' +
+      esc(AnatStages.modelNeedLabel(need)) + '</b>' + (a.modelNeedWhy ? ' — ' + esc(a.modelNeedWhy) : '') + '<br>' +
+      'Suitability: ' + esc(suitabilityOf(a.suitability)) + (a.size ? ' · size ' + esc(a.size) : '') +
+      (a.altSize ? ' (alternative ' + esc(a.altSize) + ')' : '') + '</div>' +
+    '<div class="field"><label class="req">Decision</label>' +
+      '<label class="check"><input type="radio" name="pg-d" value="FEASIBLE"><span><b>Clinically feasible</b> — ' +
+        (need === "NEEDED" ? 'go ahead and print the physical model' : 'go on without a physical model (stages 3–6 not required)') + '</span></label>' +
+      '<label class="check"><input type="radio" name="pg-d" value="NOT_FEASIBLE"><span><b>Not clinically feasible</b> — ' +
+        'the subject goes on hold</span></label></div>' +
+    (need === "NEEDED" ? '<div class="field" id="pg-pr-f"><label class="req" for="pg-pr">Who prints the model</label>' +
+      '<select id="pg-pr"><option value="">— choose —</option>' +
+        people.map(u => '<option value="' + esc(u.email) + '">' + esc(u.name || u.email) + '</option>').join("") +
+      '</select></div>' : "") +
+    '<div class="field"><label for="pg-why">Reason <span class="hint">(required when not feasible)</span></label>' +
+      '<textarea id="pg-why" maxlength="1000"></textarea></div>' + whyBox("pg-err"),
+    '<div class="row"><button class="btn btn-primary" id="pg-go">Record the decision</button>' +
+      '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#pg-go").onclick = async () => {
+    const d = ($$('input[name="pg-d"]').find(x => x.checked) || {}).value || "";
+    const reason = $("#pg-why").value.replace(/\s+/g, " ").trim();
+    const printer = ($("#pg-pr") || {}).value || "";
+    if(!d) return showWhy("pg-err", "Choose feasible or not feasible.");
+    if(d === "NOT_FEASIBLE" && reason.length < 5) return showWhy("pg-err", "Say why the subject is not clinically feasible.");
+    if(d === "FEASIBLE" && need === "NEEDED" && !printer) return showWhy("pg-err", "Choose who prints the model.");
+    const go = $("#pg-go"); go.disabled = true;
+    try{
+      let gate;
+      if(S.backend){
+        const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/print-gate", { decision:d, reason, printer });
+        if(out.patient) mergePatient(out.patient);
+        [out.audit, out.holdAudit].filter(Boolean).forEach(x => S.db.logs.unshift(x));
+        takeReleasedUnits(out.released || []);
+        gate = out.printGate;
+      }else{
+        gate = { decision:d, modelNeed:need, printer, reason, by:myEmailLc(), byName:S.me.name, at:nowISO() };
+        p.printGate = gate;
+        logAction((d === "FEASIBLE" ? "Clinically feasible: " : "NOT clinically feasible: ") + p.patientCode,
+          { locationId:p.siteId, highPriority:true, comments: reason });
+        if(d === "NOT_FEASIBLE") SM.applyHold(p, { category:"NOT_FEASIBLE", reason, by:myEmailLc(), byName:S.me.name, at:nowISO() });
+      }
+      if(d === "FEASIBLE") applyPrintGateLocally(p, gate);
+      commit(); closeModal(); render();
+      toast(d === "FEASIBLE" ? "Recorded: clinically feasible." : "Recorded: not clinically feasible — the subject is on hold.", "good");
+    }catch(e){ go.disabled = false; showWhy("pg-err", e.message || "The server refused that."); }
+  };
+}
+/* What "feasible" does to the stages, in this browser's own save (the stages are the
+   page's to write): print requested (3.1) with the printer the manager named, or stages
+   3-6 set Not required - still completable with "Bring back into the workflow". */
+function applyPrintGateLocally(p, g){
+  const at = g.at || nowISO();
+  if(g.modelNeed === "NEEDED"){
+    /* The manager's choice of printer stands, even over an older 3.1 request - only a
+       model already confirmed printed is left as it is. */
+    const a = p.anat.printing;
+    if(a && a.status !== "Completed"){
+      const prev = String(a.assignedTo || "");
+      a.assignedTo = g.printer; a.printApproved = true;
+      a.printApprovedBy = g.byName || g.by; a.printApprovedAt = at;
+      if(prev && prev.toLowerCase() !== String(g.printer).toLowerCase()) announceAssignment(p, ANAT_STAGES.find(s => s.k === "printing"), prev, g.printer);
+      else if(!prev) announceAssignment(p, ANAT_STAGES.find(s => s.k === "printing"), "", g.printer);
+    }
+  }else{
+    for(const k of AnatStages.PRINT_GATE_STAGES){
+      const a = p.anat[k];
+      if(!a || a.status === "Completed" || a.status === "Not required") continue;
+      a.status = "Not required";
+      a.notRequiredBy = (g.byName || g.by) + " (no physical model needed)";
+      a.notRequiredAt = at;
+    }
+  }
+  p.status = recomputeWorkflow(p);
+  logAction(g.modelNeed === "NEEDED" ? "Model printing requested (3.1) on clinical feasibility"
+                                     : "Stages 3-6 not required - no physical model needed",
+    { locationId:p.siteId, comments:"Subject " + p.patientCode + " · decided by " + (g.byName || g.by) });
+  schedulePatientSave(p);
+}
+document.addEventListener("click", e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-pgate]");
+  if(t) askPrintGate(patient(t.dataset.pgate));
+});
 
 /* ---- angles -------------------------------------------------------------------
    An angle used to be one free-text box, which meant "30" and "LAO 30 / CRAN 20" and
@@ -28492,34 +29181,59 @@ function scoringBlock(p, s, dis){
 const ANGLE_FIELDS = window.AnatStages.ANGLE_FIELDS;
 function angleKey(base, f){ return base + f.k.charAt(0).toUpperCase() + f.k.slice(1); }
 function angleText(a, base){ return PD.angleTextOf(a, base, ANGLE_FIELDS); }
+/* TWO LINES, NOT FOUR BOXES (16 Nov 2026, the owner): wherever an angle is entered, choose LAO
+   or RAO and type the angle, then CRAN or CAUD and the angle. STORAGE IS UNCHANGED - the
+   number still lands in angleLao / angleRao / angleCran / angleCaud (and the opposite side
+   of the axis is emptied) - so every record, report, PDF and mail reads exactly as before.
+   The two visible controls drive two hidden inputs that carry the screen's own data
+   attribute, so each screen's existing save path does the writing. */
+function axisAngleHtml(get, attr, idBase, label, dis, hint){
+  const pairs = [["lr", "LAO / RAO"], ["cc", "CRAN / CAUD"]];
+  return '<div class="field"><label>' + esc(label) + '</label>' +
+    pairs.map(([pair, title]) => {
+      const fs = ANGLE_FIELDS.filter(f => f.pair === pair);
+      const side = fs.find(f => String(get(f) == null ? "" : get(f)).trim() !== "");
+      const val = side ? get(side) : "";
+      const id = idBase + "-" + pair;
+      return '<div class="row ang-axis" style="gap:6px;flex-wrap:nowrap;margin:0 0 6px">' +
+        '<select data-angax="1" id="' + id + '" aria-label="' + esc(title) + '" style="max-width:110px"' + dis + '>' +
+          '<option value="">' + esc(title) + '</option>' +
+          fs.map(f => '<option value="' + f.k + '"' + (side && side.k === f.k ? " selected" : "") + '>' +
+            esc(f.label) + '</option>').join("") +
+        '</select>' +
+        '<input type="number" min="0" max="90" step="1" list="angle-0-90" inputmode="numeric" data-angaxv="1"' +
+          ' aria-label="' + esc(title) + ' angle" value="' + esc(val == null ? "" : val) + '"' +
+          ' placeholder="0–90" style="max-width:110px"' + (side ? dis : " disabled") + '>' +
+        fs.map(f => '<input type="hidden" data-angside="' + f.k + '" ' + attr(f) +
+          ' value="' + esc(get(f) == null ? "" : get(f)) + '">').join("") +
+      '</div>';
+    }).join("") +
+    (hint ? '<div class="hint" style="margin-top:2px">' + hint + '</div>' : "") +
+  '</div>';
+}
+/* One handler for every two-line angle on every screen. */
+function axisAngleSync(row){
+  const side = row.querySelector("[data-angax]").value;
+  const num = row.querySelector("[data-angaxv]");
+  num.disabled = !side || row.querySelector("[data-angax]").disabled;
+  for(const h of row.querySelectorAll("[data-angside]")){
+    const want = h.dataset.angside === side ? String(num.value || "") : "";
+    if(h.value === want) continue;
+    h.value = want;
+    h.dispatchEvent(new Event("input", { bubbles:true }));
+    h.dispatchEvent(new Event("change", { bubbles:true }));
+  }
+}
+document.addEventListener("change", e => {
+  const t = e.target;
+  if(t && t.matches && t.matches("[data-angax],[data-angaxv]")) axisAngleSync(t.closest(".ang-axis"));
+});
 function angleGroup(p, s, base, label, dis){
   const a = p.anat[s.k];
-  /* Which side of each axis already has a value - the other is then locked. */
-  const filled = {};
-  for(const f of ANGLE_FIELDS){
-    if(String(a[angleKey(base, f)] || "").trim() !== "") filled[f.pair] = f.k;
-  }
   const legacy = String(a[base] || "").trim();
-  return '<div class="field"><label>' + esc(label) + '</label>' +
-    '<div class="grid g4" style="margin:0">' +
-      ANGLE_FIELDS.map(f => {
-        const key = angleKey(base, f);
-        const locked = filled[f.pair] && filled[f.pair] !== f.k;
-        const id = "an-" + s.k + "-" + key;
-        return '<div class="field" style="margin:0">' +
-          '<label for="' + id + '" class="hint" style="margin:0 0 2px">' + esc(f.label) + '</label>' +
-          '<input type="number" min="0" max="90" step="1" list="angle-0-90" id="' + id + '"' +
-            ' data-anat="' + s.k + '|' + key + '" value="' + esc(a[key] == null ? "" : a[key]) + '"' +
-            (locked ? " disabled" : dis) +
-            ' placeholder="' + (locked ? "—" : "0–90") + '">' +
-        '</div>';
-      }).join("") +
-    '</div>' +
-    (legacy
-      ? '<div class="hint" style="margin-top:4px">Previously recorded as free text: <b>' +
-        esc(legacy) + '</b> — re-enter it above to keep it readable.</div>'
-      : '<div class="hint" style="margin-top:4px">One of LAO/RAO and one of CRAN/CAUD.</div>') +
-  '</div>';
+  return axisAngleHtml(f => a[angleKey(base, f)], f => 'data-anat="' + s.k + '|' + angleKey(base, f) + '"',
+    "an-" + s.k + "-" + base, label, dis,
+    legacy ? 'Previously recorded as free text: <b>' + esc(legacy) + '</b> — re-enter it above to keep it readable.' : "");
 }
 
 /* The footer is where a stage is finished, set aside, or - by somebody else - reopened.
@@ -28647,7 +29361,7 @@ VIEWS.clinical = {
     /* ---- the briefing: what is known about this patient, before any data entry ---- */
     const stockHere = S.db.devices.filter(d => d.locationId === p.siteId &&
       (d.status === "IN_SITE" || d.status === "IN_WH"));
-    const openQs = (p.customQuestions || []).filter(q => !String(q.a || "").trim());
+
     const dueRem = (p.reminders || []).filter(r => !r.done);
 
     h += '<div class="card" style="border-left:3px solid var(--brand)">' +
@@ -28682,27 +29396,15 @@ VIEWS.clinical = {
           'record an override, or stock must be shipped in first.</div>') +
       (fifoU || fifoD ? "" : '<div class="hint">No recommended unit for this subject’s assigned sizes.</div>') +
 
-      '<h3 style="margin:14px 0 7px">Medical questions</h3>' +
-      ((p.customQuestions || []).length
-        ? (openQs.length ? '<div class="warn"><b>' + openQs.length + ' question(s) still unanswered.</b> ' +
-              'Answer them in stage 2 below.</div>' : '<div class="okbox">All answered.</div>') +
-          '<ul style="margin:0 0 4px;padding-left:18px">' +
-          p.customQuestions.map(q => '<li>' + esc(q.q) +
-            (String(q.a || "").trim() ? ' — <b>' + esc(q.a) + '</b>'
-                                      : ' <span class="pill p-orange">unanswered</span>') +
-            '</li>').join("") + '</ul>'
-        : '<div class="hint">None defined. A Clinical PM adds these in Add / Edit Subjects.</div>') +
-
+      /* TO DISCUSS WITH THE PI (16 Nov 2026, the owner): every question and task of the subject
+         chat that is not solved, critical first - this IS the report gone over with the PI.
+         Medical questions, Notes and the old free-text PI box are all in the chat now. */
       '<h3 style="margin:14px 0 7px">To discuss with the PI</h3>' +
-      (p.piNotes ? '<div class="note">' + esc(p.piNotes) + '</div>'
-                 : '<div class="hint">Nothing recorded.</div>') +
+      chatPanelHtml(p, "open") +
 
       (dueRem.length ? '<h3 style="margin:14px 0 7px">Open reminders</h3>' +
         dueRem.map(r => '<div class="warn" style="margin-bottom:6px"><b>' + esc(fmtDate(r.date)) +
           '</b> — ' + esc(r.text) + '</div>').join("") : "") +
-
-      (p.notes ? '<h3 style="margin:14px 0 7px">Notes</h3><div class="hint">' +
-        esc(p.notes) + '</div>' : "") +
     '</div></div>';
 
     /* WHO IS EDITING, above everything the report can be typed into. It is painted in
@@ -28827,13 +29529,10 @@ VIEWS.clinical = {
         (tr.filter(Boolean).length === TRAINING_ITEMS.length ? "Clear everything" : "Mark everything") +
         '</button></div>' +
       TRAINING_ITEMS.map((t,i) => cbox(p,"training",t,i)).join("") +
-      '<h3 style="margin:14px 0 7px">Custom clinical questions</h3>' +
-      (p.customQuestions && p.customQuestions.length
-        ? p.customQuestions.map((q,i) => '<div class="field"><label for="cq-' + i + '">' +
-            esc(q.q) + '</label>' +
-            '<input type="text" id="cq-' + i + '" data-cq="' + i + '" value="' + esc(q.a || "") + '"' +
-            ro(p) + '></div>').join("")
-        : '<div class="hint">None defined for this subject.</div>') +
+      /* The medical questions are the subject chat since 16 Nov 2026 (the owner): the open ones
+         here, the whole thread in "Open full chat". */
+      '<h3 style="margin:14px 0 7px">Open clinical questions</h3>' +
+      chatPanelHtml(p, "open") +
       '<h3 style="margin:14px 0 7px">Device verification</h3>' +
       '<div class="note" style="margin-bottom:8px">Scan each unit at the table and ' +
         'verify it on its own. Every unit must be complete before the report can be submitted.</div>' +
@@ -36246,7 +36945,7 @@ VIEWS.control = {
       '<span class="pill p-grey">' + list.length + '</span></div><div class="card-bd">' +
       '<div class="tbl-wrap"><table><thead><tr>' +
         '<th>Code</th><th>Site</th><th>Allocated</th><th>Decided by</th>' +
-        '<th>Evaluation</th><th>Notes</th></tr></thead><tbody>' +
+        '<th>Evaluation</th><th>Open questions</th></tr></thead><tbody>' +
       list.map(p => {
         const a = (p.anat && p.anat.approvals) || {};
         const open = anatIncomplete(p).length;
@@ -36256,7 +36955,7 @@ VIEWS.control = {
           '<td>' + esc(a.completedBy || "—") + '</td>' +
           '<td>' + (open ? '<span class="pill p-orange">' + open + ' open</span>'
                          : '<span class="pill p-green">complete</span>') + '</td>' +
-          '<td>' + esc(p.notes || "") + '</td></tr>';
+          '<td>' + (chatOpenItems(p).length || "—") + '</td></tr>';
       }).join("") +
       '</tbody></table></div>' +
       '<div class="hint" style="margin-top:8px">To move somebody back into the study, change ' +
@@ -37683,7 +38382,7 @@ document.addEventListener("click", e => {
    folder. A stage with files opens the viewer on its first one. A stage the subject has
    already passed with nothing filed is shown greyed and does nothing; a stage not yet
    reached is not shown at all. */
-const FILE_CHIPS = [["ct","CT","CT report"], ["model3d","3D","3D model images"],
+const FILE_CHIPS = [["ct","CT","CT report"], ["model3d","Digital","Digital model images"],
   ["flexible","Pliable","Pliable model images"], ["fluoro","Road map","Road Map"],
   ["approvals","PPT","Patient presentation"]];
 function stagePassed(p, k){
@@ -38649,8 +39348,268 @@ VIEWS.patients = {
     });
   }
 };
+/* =========================================================== THE SUBJECT CHAT =
+   16 Nov 2026 (the owner). Replaces Notes, "To discuss with the PI" and the medical questions
+   on the registration form. Any internal user asks a question or adds a comment, replies,
+   tags people, marks an item Critical or Solved, reopens it, bumps it, sets a reminder for
+   a user, and edits their own words. Everything not Solved is a task for the people tagged
+   (the site's CPM when nobody is) and is what goes to the PI. EVERY ACTION IS SIGNED -
+   who, date and time - by the server (POST /api/patients/:id/chat); the rule is
+   subjectChat.js, which the standalone/demo path runs here.
+
+   One component, drawn wherever it is needed - the registration popup, the Screening
+   screen's Clinical Questions card (open items + "Open full chat"), the full-chat window
+   and the procedure report briefing - into <div class="chat-panel" data-chatp=ID>, and
+   repainted in place, so it works inside a dialog as well as on a screen. */
+const CHATUI = { open:{}, showSolved:false };
+function chatClosedP(p){ return !!(p && (p.fileLocked || p.submitted || isPostProcedure(p))); }
+function chatOfP(p){ return SC.chatOf(p, chatClosedP(p)); }
+function chatSiteCpm(p){ return String(taskCpm(p.siteId) || "").toLowerCase(); }
+function chatActor(){ return { email: myEmailLc(), name: (S.me && S.me.name) || myEmailLc(), roles: myRoles() }; }
+function chatPeople(){
+  return (S.db.users || []).filter(u => u && u.email && String(u.accessType || "").toUpperCase() !== "EXTERNAL")
+    .slice().sort((a, b) => String(a.name || a.email).localeCompare(String(b.name || b.email)));
+}
+function chatMayWrite(p){
+  return !!p && !p.fileLocked && !isExternalUser() &&
+    myRoles().some(r => ["ADMIN","CPM","EMPLOYEE","QA","MANAGER"].includes(r));
+}
+function chatName(email){ return assigneeLabel(email) || email; }
+function chatSig(x, verb){
+  return '<span class="chat-sig">' + (verb ? esc(verb) + ' ' : '') + esc(x.byName || x.by || "") + ' · ' + esc(fmtTs(x.at)) + '</span>';
+}
+function chatTagPicker(name, already){
+  const have = (already || []).map(e => String(e).toLowerCase());
+  return '<details class="chat-tags"><summary>Tag people</summary><div class="chat-tag-list">' +
+    chatPeople().filter(u => !have.includes(String(u.email).toLowerCase())).map(u =>
+      '<label class="check"><input type="checkbox" data-chattag="' + name + '" value="' + esc(u.email) + '"><span>' +
+        esc(u.name || u.email) + '</span></label>').join("") + '</div></details>';
+}
+function chatTagsFrom(root, name){
+  return $$('[data-chattag="' + name + '"]', root).filter(x => x.checked).map(x => x.value);
+}
+/* The open items, critical first - what the Clinical Questions card and the PI section show. */
+function chatOpenItems(p){ return SC.openItems(chatOfP(p)); }
+function chatItemHtml(p, it, mode){
+  const may = chatMayWrite(p);
+  const me = myEmailLc();
+  const decide = SC.mayDecide(it, chatActor(), { siteCpmEmail: chatSiteCpm(p) });
+  const owners = SC.ownersOf(it, chatSiteCpm(p));
+  const form = CHATUI.open[it.id] || "";
+  const kindPill = '<span class="pill ' + (it.kind === "QUESTION" ? "p-blue" : "p-grey") + '">' + esc(SC.KINDS[it.kind] || it.kind) + '</span>';
+  let h = '<div class="chat-item' + (it.critical ? ' crit' : '') + (it.solved ? ' solved' : '') + '">' +
+    '<div class="spread" style="gap:6px"><div class="row" style="gap:5px;margin:0">' + kindPill +
+      (it.critical ? '<span class="pill p-pink">Critical</span>' : '') +
+      (it.solved ? '<span class="pill p-green">Solved</span>' : '<span class="pill p-orange">Open</span>') +
+      (it.bumpedAt && !it.solved ? '<span class="pill p-grey">Bumped ' + esc(fmtTs(it.bumpedAt)) + '</span>' : '') +
+    '</div>' + chatSig(it) + '</div>' +
+    '<div class="chat-text">' + esc(it.text) + '</div>' +
+    (it.editedAt ? '<div class="hint">edited ' + esc(fmtTs(it.editedAt)) + '</div>' : '') +
+    '<div class="hint">' + (it.tags && it.tags.length
+        ? 'Tagged: ' + it.tags.map(e => esc((it.tagNames || {})[e] || chatName(e))).join(", ")
+        : (owners.length ? 'Task for ' + esc(chatName(owners[0])) + ' (the site’s CPM)' : 'Nobody tagged and no CPM for the site')) +
+    '</div>';
+  if(mode === "open"){
+    const n = (it.replies || []).length;
+    return h + (n ? '<div class="hint">' + n + (n === 1 ? ' reply' : ' replies') + ' — last by ' +
+      esc(it.replies[n - 1].byName || "") + ', ' + esc(fmtTs(it.replies[n - 1].at)) + '</div>' : '') + '</div>';
+  }
+  (it.replies || []).forEach(r => {
+    const ef = form === "edit:" + r.id;
+    h += '<div class="chat-reply">' + chatSig(r) +
+      (ef ? '<textarea data-chatf="text" rows="2">' + esc(r.text) + '</textarea>' +
+            '<div class="row" style="margin-top:4px"><button class="btn btn-sm btn-primary" data-chat="edit" data-item="' + esc(it.id) + '" data-reply="' + esc(r.id) + '">Save</button>' +
+            '<button class="btn btn-sm" data-chat="cancel" data-item="' + esc(it.id) + '">Cancel</button></div>'
+          : '<div class="chat-text">' + esc(r.text) + '</div>' +
+            (r.editedAt ? '<div class="hint">edited ' + esc(fmtTs(r.editedAt)) + '</div>' : '') +
+            (may && String(r.by).toLowerCase() === me ? '<button class="btn btn-sm btn-link" data-chat="form" data-form="edit:' + esc(r.id) + '" data-item="' + esc(it.id) + '">Edit</button>' : '')) +
+    '</div>';
+  });
+  (it.reminders || []).forEach(r => {
+    h += '<div class="chat-rem' + (r.done ? ' done' : '') + '">⏰ Reminder for <b>' + esc(r.forName || chatName(r.forEmail)) + '</b> on ' +
+      esc(fmtDate(r.date)) + (r.text ? ' — ' + esc(r.text) : '') + ' · ' + chatSig(r, "set by") +
+      (r.done ? ' · <span class="hint">done — ' + esc(r.doneByName || "") + ', ' + esc(fmtTs(r.doneAt)) + '</span>'
+              : (may ? ' <button class="btn btn-sm" data-chat="remdone" data-item="' + esc(it.id) + '" data-rem="' + esc(r.id) + '">Done</button>' : '')) +
+    '</div>';
+  });
+  if((it.events || []).length){
+    h += '<details class="chat-hist"><summary>History (' + it.events.length + ')</summary>' +
+      it.events.map(e => '<div>' + esc(SC.EVENT_WORDS[e.type] || e.type) + (e.detail ? ': ' + esc(e.detail) : '') +
+        ' — ' + chatSig(e) + '</div>').join("") + '</details>';
+  }
+  if(!may) return h + '</div>';
+  if(form === "reply"){
+    h += '<div class="chat-form"><textarea data-chatf="text" rows="2" placeholder="Your reply"></textarea>' +
+      chatTagPicker("reply-" + it.id, it.tags) +
+      '<div class="row"><button class="btn btn-sm btn-primary" data-chat="reply" data-item="' + esc(it.id) + '">Send reply</button>' +
+      '<button class="btn btn-sm" data-chat="cancel" data-item="' + esc(it.id) + '">Cancel</button></div></div>';
+  }else if(form === "tag"){
+    h += '<div class="chat-form">' + chatTagPicker("tag-" + it.id, it.tags).replace("<details ", "<details open ") +
+      '<div class="row"><button class="btn btn-sm btn-primary" data-chat="tag" data-item="' + esc(it.id) + '">Tag</button>' +
+      '<button class="btn btn-sm" data-chat="cancel" data-item="' + esc(it.id) + '">Cancel</button></div></div>';
+  }else if(form === "remind"){
+    h += '<div class="chat-form grid g3">' +
+      '<div class="field"><label>For</label><select data-chatf="for"><option value="">— choose —</option>' +
+        chatPeople().map(u => '<option value="' + esc(u.email) + '">' + esc(u.name || u.email) + '</option>').join("") + '</select></div>' +
+      '<div class="field"><label>On</label><input type="date" data-chatf="date" min="' + esc(localDay()) + '"></div>' +
+      '<div class="field"><label>Note (optional)</label><input type="text" data-chatf="text" maxlength="500"></div></div>' +
+      '<div class="row"><button class="btn btn-sm btn-primary" data-chat="remind" data-item="' + esc(it.id) + '">Set reminder</button>' +
+      '<button class="btn btn-sm" data-chat="cancel" data-item="' + esc(it.id) + '">Cancel</button></div>';
+  }else if(form === "edit"){
+    h += '<div class="chat-form"><textarea data-chatf="text" rows="3">' + esc(it.text) + '</textarea>' +
+      '<div class="row"><button class="btn btn-sm btn-primary" data-chat="edit" data-item="' + esc(it.id) + '">Save</button>' +
+      '<button class="btn btn-sm" data-chat="cancel" data-item="' + esc(it.id) + '">Cancel</button></div></div>';
+  }else{
+    const b = (act, label, extra) => '<button class="btn btn-sm" data-chat="' + act + '" data-item="' + esc(it.id) + '"' + (extra || "") + '>' + label + '</button>';
+    h += '<div class="row chat-acts">' +
+      b("form", "Reply", ' data-form="reply"') + b("form", "Tag", ' data-form="tag"') +
+      (decide ? b("crit", it.critical ? "Not critical" : "Mark critical", ' data-on="' + (it.critical ? "0" : "1") + '"') : "") +
+      (decide ? (it.solved ? b("reopen", "Reopen") : b("solve", "Mark solved")) : "") +
+      (!it.solved ? b("bump", "Bump") : "") +
+      b("form", "Reminder", ' data-form="remind"') +
+      (String(it.by).toLowerCase() === me ? b("form", "Edit", ' data-form="edit"') : "") +
+    '</div>';
+  }
+  return h + '</div>';
+}
+function chatPanelInner(p, mode){
+  const chat = chatOfP(p);
+  const all = SC.sorted(chat.items);
+  const open = all.filter(SC.isOpen);
+  if(mode === "open"){
+    return (open.length ? open.map(it => chatItemHtml(p, it, "open")).join("")
+                        : '<div class="hint">No open questions or tasks.</div>') +
+      '<div class="row" style="margin-top:8px"><button class="btn btn-sm" data-chat="full">Open full chat' +
+        (all.length > open.length ? ' (' + (all.length - open.length) + ' solved)' : '') + '</button></div>';
+  }
+  const solved = all.length - open.length;
+  const shown = CHATUI.showSolved ? all : open;
+  let h = '';
+  if(chatMayWrite(p)){
+    h += '<div class="chat-form chat-new">' +
+      '<div class="row" style="gap:6px;margin:0 0 6px"><select data-chatf="kind" style="max-width:150px">' +
+        '<option value="QUESTION">Question</option><option value="COMMENT">Comment</option></select>' +
+        '<label class="check" style="margin:0"><input type="checkbox" data-chatf="critical"><span>Critical</span></label></div>' +
+      '<textarea data-chatf="text" rows="2" placeholder="Ask a question or add a comment about this subject"></textarea>' +
+      chatTagPicker("new") +
+      '<div class="row"><button class="btn btn-sm btn-primary" data-chat="post">Post</button>' +
+        '<span class="hint">Signed with your name and the time. Open items are tasks for the people tagged ' +
+        '(the site’s CPM when nobody is) until solved.</span></div></div>';
+  }else if(p.fileLocked){
+    h += '<div class="hint">The file is locked — the chat is read-only.</div>';
+  }
+  h += (shown.length ? shown.map(it => chatItemHtml(p, it, "full")).join("")
+                     : '<div class="hint">' + (all.length ? 'No open questions or tasks.' : 'Nothing yet.') + '</div>');
+  if(solved) h += '<div class="row" style="margin-top:6px"><button class="btn btn-sm btn-link" data-chat="solved">' +
+    (CHATUI.showSolved ? 'Hide solved (' + solved + ')' : 'Show solved (' + solved + ')') + '</button></div>';
+  return h;
+}
+function chatPanelHtml(p, mode){
+  return '<div class="chat-panel" data-chatp="' + esc(p.id) + '" data-chatmode="' + (mode || "full") + '">' +
+    chatPanelInner(p, mode || "full") + '</div>';
+}
+function chatRepaint(pid){
+  const p = patient(pid); if(!p) return;
+  $$('.chat-panel[data-chatp="' + pid + '"]').forEach(el => { el.innerHTML = chatPanelInner(p, el.dataset.chatmode); });
+}
+function openChatDialog(p){
+  if(!p) return;
+  const m = modal("Questions & discussion — " + p.patientCode, chatPanelHtml(p, "full"));
+  if(m) m.classList.add("modal-wide");
+  /* The cards behind it are redrawn when it closes, so their counts follow. */
+  MODAL_CLEANUP = () => { if(S.view) renderKeepingPlace(); };
+}
+async function chatAct(p, action){
+  if(S.backend){
+    const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/chat", action);
+    if(out.patient) mergePatient(out.patient);
+    if(out.audit) S.db.logs.unshift(out.audit);
+  }else{
+    const names = {};
+    chatPeople().forEach(u => { names[String(u.email).toLowerCase()] = u.name || u.email; });
+    const res = SC.apply(chatOfP(p), Object.assign({ tagNames: names }, action), chatActor(), nowISO(),
+      { siteCpmEmail: chatSiteCpm(p) });
+    if(res.error) throw new Error(res.error.message);
+    p.chat = res.chat;
+    const line = SC.auditLine(res, p.patientCode);
+    logAction(line.action, { locationId:p.siteId, highPriority:line.highPriority,
+      stateChanges:line.stateChanges, comments:line.comments });
+  }
+  commit();
+}
+document.addEventListener("click", async e => {
+  const t = e.target && e.target.closest && e.target.closest("[data-chat]");
+  if(!t) return;
+  const panel = t.closest(".chat-panel");
+  if(!panel) return;
+  e.preventDefault();
+  const p = patient(panel.dataset.chatp); if(!p) return;
+  const act = t.dataset.chat, itemId = t.dataset.item || "";
+  const box = t.closest(".chat-form") || t.closest(".chat-item") || panel;
+  const val = k => { const el = $('[data-chatf="' + k + '"]', box); return el ? (el.type === "checkbox" ? el.checked : el.value) : ""; };
+  if(act === "full") return openChatDialog(p);
+  if(act === "solved"){ CHATUI.showSolved = !CHATUI.showSolved; return chatRepaint(p.id); }
+  if(act === "form"){ CHATUI.open = { [itemId]: t.dataset.form }; return chatRepaint(p.id); }
+  if(act === "cancel"){ delete CHATUI.open[itemId]; return chatRepaint(p.id); }
+  let action = null;
+  if(act === "post") action = { type:"POST", kind:val("kind"), text:val("text"), critical:!!val("critical"), tags:chatTagsFrom(box, "new") };
+  else if(act === "reply") action = { type:"REPLY", itemId, text:val("text"), tags:chatTagsFrom(box, "reply-" + itemId) };
+  else if(act === "tag") action = { type:"TAG", itemId, tags:chatTagsFrom(box, "tag-" + itemId) };
+  else if(act === "crit") action = { type:"CRITICAL", itemId, on: t.dataset.on === "1" };
+  else if(act === "solve") action = { type:"SOLVE", itemId };
+  else if(act === "reopen") action = { type:"REOPEN", itemId };
+  else if(act === "bump") action = { type:"BUMP", itemId };
+  else if(act === "edit") action = { type:"EDIT", itemId, replyId:t.dataset.reply || "", text:val("text") };
+  else if(act === "remind") action = { type:"REMIND", itemId, forEmail:val("for"), date:val("date"), text:val("text") };
+  else if(act === "remdone") action = { type:"REMIND_DONE", itemId, reminderId:t.dataset.rem };
+  if(!action) return;
+  if(action.type === "POST" && !String(action.text).trim()) return toast("Write the question or comment first.", "bad");
+  if(action.type === "REPLY" && !String(action.text).trim()) return toast("Write the reply first.", "bad");
+  if(action.type === "TAG" && !action.tags.length) return toast("Choose somebody to tag.", "bad");
+  if(action.type === "REMIND" && (!action.forEmail || !action.date)) return toast("Choose who the reminder is for and the date.", "bad");
+  t.disabled = true;
+  try{
+    await chatAct(p, action);
+    delete CHATUI.open[itemId];
+    chatRepaint(p.id);
+    renderNav();
+    toast(act === "post" ? "Posted." : "Saved.", "good");
+  }catch(err){
+    t.disabled = false;
+    toast(err.message || "The server refused that.", "bad");
+  }
+});
+/* Tasks this person holds in the chat: every open item they are tagged in, or - nobody
+   tagged - that falls to them as the site's CPM. For Home. */
+function myChatTasks(){
+  if(!S.me || !S.db) return [];
+  const me = myEmailLc(), out = [];
+  for(const p of activePatients()){
+    if(!inPatientScope(p.siteId)) continue;
+    for(const it of chatOpenItems(p)){
+      if(SC.ownersOf(it, chatSiteCpm(p)).includes(me)) out.push({ p, it });
+    }
+  }
+  return out.sort((a, b) => (b.it.critical - a.it.critical) ||
+    String(b.it.bumpedAt || b.it.at || "").localeCompare(String(a.it.bumpedAt || a.it.at || "")));
+}
+function myChatReminders(){
+  if(!S.me || !S.db) return [];
+  const out = [];
+  for(const p of activePatients()){
+    if(!inPatientScope(p.siteId)) continue;
+    SC.dueReminders(chatOfP(p), myEmailLc(), localDay()).forEach(x => out.push({ p, it:x.item, r:x.reminder }));
+  }
+  return out;
+}
+function openSubjectChat(p){
+  SCR.patientId = p.id;
+  go("screening");
+  setTimeout(() => openChatDialog(p), 0);
+}
+
 /* Working copies, so Cancel really cancels rather than half-applying. */
-let PFQ = [], PFR = [];
+let PFR = [];
 
 function patientForm(p){
   const isNew = !p;
@@ -38662,76 +39621,23 @@ function patientForm(p){
      exists (older form-created patients may not have it). */
   if(!p.screening) p.screening = blankScreening();
   if(!p.anat) p.anat = blankAnat();
-  PFQ = (p.customQuestions || []).map(q => ({ q:q.q, a:q.a || "" }));
   PFR = (p.reminders || []).map(r => ({ date:r.date, text:r.text, done:!!r.done }));
   patientFormRender(p, isNew);
 }
 
-/* THE CLINICAL QUESTIONS ON SCREENING (v3.0.0, the owner item 13). The same list the
-   registration form writes and the procedure report answers - p.customQuestions - so a
-   question added or answered here is there too, and the other way round. Edited in place:
-   typing saves without redrawing, adding or removing a question redraws. */
+/* THE CLINICAL QUESTIONS ON SCREENING. Since 16 Nov 2026 (the owner) this card shows every OPEN
+   question and task of the subject chat - critical first, each signed - with "Open full chat"
+   for the whole thread, solved items included, where everything is done. */
 function screeningQuestionsCard(p){
-  const qs = Array.isArray(p.customQuestions) ? p.customQuestions : [];
-  const mayEdit = (can("managePatients") || can("editAnatomical")) && !p.fileLocked;
-  const dis = mayEdit ? "" : " disabled";
+  const open = chatOpenItems(p);
+  const crit = open.filter(it => it.critical).length;
   return '<div class="card"><div class="card-hd"><h2>Clinical Questions</h2>' +
-      '<span class="hint">' + qs.length + (qs.length === 1 ? ' question' : ' questions') + '</span></div><div class="card-bd">' +
-    '<div class="hint" style="margin:0 0 8px">Recorded at registration, answered during the evaluation, ' +
-      'and carried into stage 2 of the procedure report.</div>' +
-    (qs.length ? qs.map((q, i) => '<div class="q-item">' +
-      '<div class="row" style="flex-wrap:nowrap;gap:6px">' +
-        '<b class="q-n">' + (i + 1) + '</b>' +
-        '<input type="text" data-sq="' + i + '" value="' + esc(q.q || "") + '" placeholder="The question" style="flex:1"' + dis + '>' +
-        (mayEdit ? '<button type="button" class="btn btn-sm btn-danger" data-sqdel="' + i + '" style="flex:none">Remove</button>' : '') +
-      '</div>' +
-      '<textarea data-sqa="' + i + '" rows="2" placeholder="Answer / information" style="margin-top:6px"' + dis + '>' + esc(q.a || "") + '</textarea>' +
-    '</div>').join("") : '<div class="hint">No questions for this subject.</div>') +
-    (mayEdit ? '<button type="button" class="btn btn-sm" id="sq-add" style="margin-top:6px">Add a question</button>' : '') +
+      '<span class="hint">' + open.length + ' open' + (crit ? ' · ' + crit + ' critical' : "") + '</span></div><div class="card-bd">' +
+    chatPanelHtml(p, "open") +
   '</div></div>';
 }
-function wireScreeningQuestions(p){
-  const list = () => (p.customQuestions = Array.isArray(p.customQuestions) ? p.customQuestions : []);
-  const save = (what) => { commit(); schedulePatientSave(p);
-    if(what) logAction(what + " — " + p.patientCode, { locationId:p.siteId }); };
-  $$("[data-sq]").forEach(el => el.oninput = () => { list()[+el.dataset.sq].q = el.value; save(); });
-  $$("[data-sqa]").forEach(el => el.oninput = () => { list()[+el.dataset.sqa].a = el.value; save(); });
-  $$("[data-sq]").forEach(el => el.onchange = () => save("Clinical question edited on Screening"));
-  $$("[data-sqdel]").forEach(b => b.onclick = () => {
-    const i = +b.dataset.sqdel, q = list()[i] || {};
-    /* Asked, because the answer goes with it and this list is the report's too. */
-    modal("Remove this question?",
-      '<p><b>' + esc(q.q || "Untitled question") + '</b></p>' +
-      (q.a ? '<p class="hint">Its answer is removed with it: ' + esc(q.a) + '</p>' : ''),
-      '<div class="row"><button class="btn" data-close="1">Keep it</button>' +
-      '<button class="btn btn-danger" id="sq-del-go">Remove</button></div>');
-    $("#sq-del-go").onclick = () => { list().splice(i, 1); save("Clinical question removed on Screening");
-      closeModal(); renderKeepingPlace(); };
-  });
-  const add = $("#sq-add");
-  if(add) add.onclick = () => { list().push({ q:"", a:"" }); save(); renderKeepingPlace();
-    const all = $$("[data-sq]"); if(all.length) all[all.length - 1].focus(); };
-}
+function wireScreeningQuestions(p){ /* the chat panel is wired by its own delegated handler */ }
 
-function questionsBlock(){
-  return '<h3 style="margin:4px 0 7px">Medical questions for this subject</h3>' +
-    '<div class="hint" style="margin-bottom:8px">Free-form and specific to this subject. ' +
-    'Enter the answer / information now if it is known — the question and its answer are ' +
-    'carried into stage 2 of the procedure report and the briefing panel, and stay editable there.</div>' +
-    /* v3.0.0 (the owner, item 14): one question per box - the question on its own line, the
-       answer below it with room to write. It was three controls squeezed onto one line of
-       a 460px dialog. */
-    (PFQ.length
-      ? PFQ.map((q,i) => '<div class="q-item">' +
-          '<div class="row" style="gap:6px;flex-wrap:nowrap"><b class="q-n">' + (i + 1) + '</b>' +
-          '<input type="text" data-q="' + i + '" value="' + esc(q.q) + '" placeholder="The question" style="flex:1">' +
-          '<button type="button" class="btn btn-sm btn-danger" data-qdel="' + i + '" ' +
-          'style="flex:none">Remove</button></div>' +
-          '<textarea data-qa="' + i + '" rows="2" placeholder="Answer / information (optional)" style="margin-top:6px">' +
-            esc(q.a || "") + '</textarea></div>').join("")
-      : '<div class="hint">None yet.</div>') +
-    '<button type="button" class="btn btn-sm" id="q-add" style="margin-top:6px">Add a question</button>';
-}
 function remindersBlock(){
   return '<h3 style="margin:16px 0 7px">Reminders</h3>' +
     (PFR.length
@@ -38799,13 +39705,14 @@ function patientFormRender(p, isNew){
       'eligible count and the implanted count. Changeable at any stage until the report is ' +
       'finally locked.</div></div>' +
     '</div>' +
-    '<div class="grid g2">' +
-    '<div class="field"><label for="p-notes">Notes</label><textarea id="p-notes" rows="4">' + esc(p.notes || "") + '</textarea></div>' +
-    '<div class="field"><label for="p-pi">To discuss with the PI</label>' +
-      '<textarea id="p-pi" rows="4">' + esc(p.piNotes || "") + '</textarea>' +
-      '<div class="hint">Shown prominently in the briefing before the procedure report opens.</div></div>' +
-    '</div>' +
-    screeningChecksBlock(p) + questionsBlock() + remindersBlock(),
+    /* Notes and "To discuss with the PI" are gone (16 Nov 2026, the owner): the subject chat
+       below replaces them and the medical questions. Their old text is in the chat. */
+    screeningChecksBlock(p) +
+    '<h3 style="margin:16px 0 7px">Medical questions for this subject</h3>' +
+    (isNew || !patient(p.id)
+      ? '<div class="hint">Register the subject first — the questions and discussion open once it is saved.</div>'
+      : chatPanelHtml(p, "full")) +
+    remindersBlock(),
     '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
     '<button class="btn btn-primary" id="p-save">' + (isNew ? "Register" : "Save") + '</button>' +
     '</div>' + whyBox("p-why"));
@@ -38843,25 +39750,18 @@ function patientFormRender(p, isNew){
   /* Re-rendering the modal would lose focus, so the list edits are handled in place
      and only the changed row's value is read back. */
   const keep = () => {
-    $$("[data-q]").forEach(i => { PFQ[+i.dataset.q].q = i.value; });
-    $$("[data-qa]").forEach(i => { PFQ[+i.dataset.qa].a = i.value; });
     $$("[data-rd]").forEach(i => { PFR[+i.dataset.rd].date = i.value; });
     $$("[data-rt]").forEach(i => { PFR[+i.dataset.rt].text = i.value; });
   };
   const redraw = () => {
     const snap = { code:$("#p-code").value, date:$("#p-date").value,
-                   st:$("#p-st").value, notes:$("#p-notes").value, pi:$("#p-pi").value,
-                   site:$("#p-site").value, proto:$("#p-proto").value };
+                   st:$("#p-st").value, site:$("#p-site").value, proto:$("#p-proto").value };
     patientFormRender(p, isNew);
     $("#p-code").value = snap.code; $("#p-date").value = snap.date;
-    $("#p-st").value = snap.st; $("#p-notes").value = snap.notes;
-    $("#p-pi").value = snap.pi; $("#p-site").value = snap.site;
+    $("#p-st").value = snap.st; $("#p-site").value = snap.site;
     $("#p-proto").value = snap.proto;
   };
-  $("#q-add").onclick = () => { keep(); PFQ.push({ q:"", a:"" }); redraw(); };
   $("#r-add").onclick = () => { keep(); PFR.push({ date:"", text:"", done:false }); redraw(); };
-  $$("[data-qdel]").forEach(b => b.onclick = () => {
-    keep(); PFQ.splice(+b.dataset.qdel, 1); redraw(); });
   $$("[data-rdel]").forEach(b => b.onclick = () => {
     keep(); PFR.splice(+b.dataset.rdel, 1); redraw(); });
 
@@ -38895,10 +39795,8 @@ function patientFormRender(p, isNew){
        server-side and the oldest registrations have already fallen off it. */
     if(isNew && !p.registeredAt) p.registeredAt = nowISO();
     if(p.procedureDate && p.status === "ELIGIBLE") p.status = "SCHEDULED";
-    p.notes = $("#p-notes").value;
-    p.piNotes = $("#p-pi").value;
-    p.customQuestions = PFQ.filter(q => String(q.q).trim())
-                           .map(q => ({ q:q.q.trim(), a:q.a || "" }));
+    /* p.notes, p.piNotes and p.customQuestions are no longer written here (16 Nov 2026):
+       the subject chat holds them, and what they held is read into it (subjectChat.chatOf). */
     p.reminders = PFR.filter(r => String(r.text).trim())
                      .map(r => ({ date:r.date || "", text:r.text.trim(), done:!!r.done }));
     if(!p.images) p.images = [];
@@ -38921,7 +39819,7 @@ function patientFormRender(p, isNew){
       ? logAction("Registered subject " + code, { locationId:p.siteId,
           stateChanges:"→ " + PT_STATUS[p.status].label,
           comments:"Protocol: " + ((PROTOCOLS.find(x => x.k === protoAfter) || {}).label || protoAfter) +
-            "; " + p.customQuestions.length + " medical question(s), " + p.reminders.length + " reminder(s)" })
+            "; " + p.reminders.length + " reminder(s)" })
       : logAction("Edited subject " + code, { locationId:p.siteId,
           stateChanges: before === p.status ? "" : PT_STATUS[before].label + " → " + PT_STATUS[p.status].label });
       logProtocol();
@@ -39673,7 +40571,7 @@ function userForm(u){
        Managers and QA always get the stage mail and the stuck list, whatever is ticked here. */
     '<div style="margin:0 0 12px"><label class="check' + (u.stageUpdate ? " on" : "") +
       '" style="margin:0"><input type="checkbox" id="u-sgu"' + (u.stageUpdate ? " checked" : "") +
-      '><span><b>Stage Update</b> — email me when a screening stage is completed (CT, 3D model, pliable model, eligibility, scheduling)</span></label></div>' +
+      '><span><b>Stage Update</b> — email me when a screening stage is completed (CT, digital model, pliable model, eligibility, scheduling)</span></label></div>' +
     '<div style="margin:0 0 12px"><label class="check' + (u.stuckUpdate ? " on" : "") +
       '" style="margin:0"><input type="checkbox" id="u-stu"' + (u.stuckUpdate ? " checked" : "") +
       '><span><b>Stuck Update</b> — send me the daily email with the subjects stuck in screening, at every site</span></label></div>' +
