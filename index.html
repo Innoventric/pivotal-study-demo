@@ -230,7 +230,7 @@ tbody tr:hover{background:#fafbfc;}
 .tbl-wrap{overflow:auto; border:1px solid var(--line); border-radius:var(--radius); background:#fff;}
 .num{text-align:right; font-variant-numeric:tabular-nums;}
 .mono{font-family:Consolas,"SF Mono",Menlo,monospace; font-size:12px;}
-/* The Site Accountability Log runs nine columns wide, and a REF or a serial broken across
+/* The Device Accountability Log runs nine columns wide, and a REF or a serial broken across
    two lines cannot be read off the page and matched against a label. */
 #sr-tbl td.mono{white-space:nowrap;}
 .empty{padding:34px 16px; text-align:center; color:var(--muted); font-size:13px;}
@@ -401,7 +401,7 @@ tr.row-unconfirmed > td{background:var(--warn-bg);}
    the caret rotates when open. The expansion is one full-width cell holding a plain
    nested table, so the sticky/z-index rules of the outer matrix must be neutralised
    on it or the first serial column would float over the rest. */
-/* A completed batch on QA Approval opens to the units released under it (4 Nov 2026). */
+/* A completed batch on QA and Manager Approvals opens to the units released under it (4 Nov 2026). */
 tr[data-bopen]{cursor:pointer; user-select:none;}
 tr[data-bopen]:hover td{background:#fafbfc;}
 tr.bopen-sub > td{background:#fafbfc; padding:8px 12px 12px;}
@@ -11572,12 +11572,12 @@ if(typeof window !== "undefined") window.DeviceQr = api;
    pathway. The filename says "anat" for historical reasons; its contents are the
    workflow. */
 var SCREENING_STEPS = [
-  { k:"basic",     label:"Basic Clinical Data" },
-  { k:"discharge", label:"Discharge Letters" },
+  { k:"basic",     label:"Baseline Clinical Data" },
+  { k:"discharge", label:"Discharge Summaries" },
   { k:"history",   label:"Medical History" },
   { k:"echo",      label:"Echocardiography" },
   { k:"rhc",       label:"Right Heart Catheterization (RHC)" },
-  { k:"ct",        label:"CT Scan", gate:"Marking this available opens the anatomical evaluation." }
+  { k:"ct",        label:"CT Scan", gate:"Opens the anatomical evaluation." }
 ];
 
 var ANAT_STAGES = [
@@ -11592,19 +11592,19 @@ var ANAT_STAGES = [
      person (or by one of the same three roles), which is what lets the pathway go on.
      3.1 is still stored as printApproved*, so a stage released under the old rule reads
      as requested, which it was. See PRINT_GATE below. */
-  { k:"printing",  n:3,  label:"Model Printing",                     kind:"ops",  needsApproval:true },
-  { k:"casting",   n:4,  label:"Model Casting",                      kind:"ops"  },
-  { k:"pmins",     n:5,  label:"PM Insertion",                       kind:"ops",  needsPm:true },
+  { k:"printing",  n:3,  label:"Pliable Model Printing",            kind:"ops",  needsApproval:true },
+  { k:"casting",   n:4,  label:"Pliable Model Casting",             kind:"ops"  },
+  { k:"pmins",     n:5,  label:"Pacemaker Lead Insertion",           kind:"ops",  needsPm:true },
   /* The pliable model is where a borderline anatomy gets argued out, so this is the one
      evaluation stage that can open a scoring matrix. It carries no angle: the angle is
      decided later, on fluoroscopy. */
-  { k:"flexible",  n:6,  label:"Pliable model evaluation",           kind:"eval", noAngle:true, scoring:true },
-  { k:"fluoro",    n:7,  label:"Training session and Road Map definition", kind:"eval", final:true, strategy:true },
+  { k:"flexible",  n:6,  label:"Pliable Model Evaluation",           kind:"eval", noAngle:true, scoring:true },
+  { k:"fluoro",    n:7,  label:"Training Session & Road Map", kind:"eval", final:true, strategy:true },
   /* Replaces the old "Road Map" stage, which was folded into 7. This is where the
      patient is declared eligible and allocated to a study arm. */
   { k:"approvals", n:8,  label:"Eligibility & Approvals",            kind:"approval" },
-  { k:"scheduling",n:9,  label:"Randomization and procedure scheduling", kind:"sched", eligible:true },
-  { k:"order",     n:10, label:"Product Order Request",              kind:"order", eligible:true }
+  { k:"scheduling",n:9,  label:"Randomization & Scheduling", kind:"sched", eligible:true },
+  { k:"order",     n:10, label:"Product Order",                      kind:"order", eligible:true }
 ];
 
 /* Stages 1-8 must be finished (or Not required) before a procedure may be scheduled.
@@ -11883,7 +11883,7 @@ function stageComplete(p, s){
   return st === "Completed" && stageMissing(p, s).length === 0;
 }
 
-/* "3. Model Printing" - how a stage is named to a human, in an email or a log line. */
+/* "3. Pliable Model Printing" - how a stage is named to a human, in an email or a log line. */
 function stageName(s){ return s.n + ". " + s.label; }
 function stageByKey(k){
   for(var i = 0; i < ANAT_STAGES.length; i++) if(ANAT_STAGES[i].k === k) return ANAT_STAGES[i];
@@ -15246,7 +15246,7 @@ function seed(){
     mk("UNICA","M", "loc-wh-1","IN_WH", 210), mk("UNICA","M","loc-wh-2","IN_WH", 400),
     mk("UNICA","L", "loc-wh-1","IN_WH", 95),  mk("UNICA","XL","loc-wh-2","IN_WH", 500),
     /* Reserved for pat-1, whose order has gone out: one of the two of each it asks
-       for, so the patient sits on Allocations with the second pair still to reserve. */
+       for, so the patient sits on Device Allocations with the second pair still to reserve. */
     mk("UNICA","M", "loc-site-a",  "IN_SITE",150,{ allocatedTo:"pat-1", allocatedAt:nowISO() }),
     mk("UNICA","L","loc-site-a", "IN_SITE",260),
     mk("UNICA","S", "loc-site-b","IN_SITE",180),
@@ -17567,6 +17567,20 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.17.0", date: "16 November 2026", groups: [
+    { h:"Clearer names in the menu", items:[
+      "<b>Subject Overview</b> is now <b>Subjects in Screening</b>, <b>Subject Register</b> is <b>Subject Registration</b> and <b>Subject Screening</b> is <b>Screening &amp; Evaluation</b>.",
+      "<b>Screen Failure</b> is now <b>Screen Failures</b>, <b>Control arm</b> is <b>Control Arm Subjects</b> and <b>Site Accountability Log</b> is <b>Device Accountability Log</b>.",
+      "<b>New Device Registration</b> is now <b>Device Registration</b>, <b>QA Approval</b> is <b>QA and Manager Approvals</b>, <b>Send Devices Out</b> is <b>Ship Devices</b>, <b>Receive a Delivery</b> is <b>Receive Devices</b> and <b>Allocations</b> is <b>Device Allocations</b>.",
+      "<b>Activity History</b> is now <b>Audit Trail</b> and <b>Backup &amp; Sync</b> is <b>Sync Status</b>. Home sits at the top of the menu on its own.",
+      "Nothing moved: every screen does what it did, and mails and messages use the new names."
+    ]},
+    { h:"Screening & Evaluation: clearer wording", items:[
+      "Stages renamed: <b>3. Pliable Model Printing</b>, <b>4. Pliable Model Casting</b>, <b>5. Pacemaker Lead Insertion</b>, <b>6. Pliable Model Evaluation</b>, <b>7. Training Session &amp; Road Map</b>, <b>9. Randomization &amp; Scheduling</b>, <b>10. Product Order</b>.",
+      "<b>Clinical Screening Documents</b> lists <b>Baseline Clinical Data</b> and <b>Discharge Summaries</b>; the evaluation card is <b>Anatomical Evaluation</b> and counts stages <b>closed</b>.",
+      "Headings and explanations on the screen were reworded, including what Hold, Cancel and Disqualify each mean."
+    ]}
+  ]},
   { version: "3.16.2", date: "16 November 2026", groups: [
     { h:"The subject's folder, and requests waiting for you", items:[
       "<b>Folder</b> opened an empty window on some computers and stayed there. It now goes straight to the subject's folder in SharePoint; if the folder cannot be opened, the tab says why.",
@@ -20772,20 +20786,19 @@ function icon(k){
 
 /* The names are the operator's words for the job, not the system's words for the
    record it writes. "Device Shipment Inspection" is what the audit log calls it;
-   "Receive a Delivery" is what the person standing over the box is doing.
+   "Receive Devices" is what the person standing over the box is doing.
    Grouping follows the same rule — Devices, Procedures, Records, Setup — and no
    item is numbered, because the old "1" and "2" implied a sequence between two
    logistics screens that has never existed. */
 const NAV = [
-  { grp:"Start here" },
   { k:"today",    ic:"today",   label:"Home",               roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], todo:true },
   { grp:"Clinical workflow" },
   /* First in the menu since 10 Nov 2026 (the owner: Clinical workflow first with Subject
      Overview at its top, then Study Data, then Logistics with Stock Overview first). It
      answers "where is everybody", the question every clinical screen starts from. */
-  { k:"overview", ic:"chart",   label:"Subject Overview",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
-  { k:"patients", ic:"personAdd", label:"Subject Register", roles:["ADMIN","CPM"] },
-  { k:"screening",ic:"funnel",  label:"Subject Screening",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"overview", ic:"chart",   label:"Subjects in Screening",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"patients", ic:"personAdd", label:"Subject Registration", roles:["ADMIN","CPM"] },
+  { k:"screening",ic:"funnel",  label:"Screening & Evaluation",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
   { k:"clinical", ic:"case",    label:"Procedure Report",   roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
   /* The summary each submitted report opens (CLD-U-104, 20 Oct 2026). Same roles as the
      report; the badge counts the open ones given to YOU. */
@@ -20804,26 +20817,26 @@ const NAV = [
   { k:"followup", ic:"stethoscope", label:"Subjects in follow up", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* Every patient stopped, and why (2 Oct 2026, the owner). The clinical roles that see Study
      Status, because the rate on that screen is what this one explains. */
-  { k:"screenfail", ic:"funnel", label:"Screen Failure",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
+  { k:"screenfail", ic:"funnel", label:"Screen Failures",  roles:["ADMIN","CPM","EMPLOYEE","QA","MANAGER"] },
   /* Visible to every role: a control patient leaves every other list, so the one place
      they still appear must not be the one place somebody cannot look. */
-  { k:"control",  ic:"people",  label:"Control arm", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"control",  ic:"people",  label:"Control Arm Subjects", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* The same role list as In Transit, on the owner's instruction: the people who send boxes
      are the people who need the paperwork back. It sits here rather than beside In
      Transit because it reports on what has happened rather than moving anything - and
      because a "Shipments" entry next to In Transit is exactly the arrangement that was
      merged away once already for answering the same question twice. */
-  { k:"sitereport", ic:"history", label:"Site Accountability Log", roles:["ADMIN","CPM","WH_ADMIN"] },
+  { k:"sitereport", ic:"history", label:"Device Accountability Log", roles:["ADMIN","CPM","WH_ADMIN"] },
   { grp:"Logistics" },
   /* One row for every role. A warehouse manager still sees only their own warehouse,
      because the contents are scoped by visibleDevices() -> inScope(), not by the label. */
   { k:"stock",    ic:"stock",   label:"Stock Overview",     roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  { k:"register", ic:"factory", label:"New Device Registration", roles:["ADMIN","EMPLOYEE","QA","MANAGER"] },
+  { k:"register", ic:"factory", label:"Device Registration", roles:["ADMIN","EMPLOYEE","QA","MANAGER"] },
   /* Producers see it too, read-only, so they can follow their own batch instead of
      wondering whether it arrived. The badge counts only what YOU can act on. */
-  { k:"batches",  ic:"lens",    label:"QA Approval", roles:["ADMIN","EMPLOYEE","QA","MANAGER","WH_ADMIN"], qaBadge:true },
-  { k:"shipment", ic:"ship",    label:"Send Devices Out",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  { k:"arrival",  ic:"receive", label:"Receive a Delivery", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"batches",  ic:"lens",    label:"QA and Manager Approvals", roles:["ADMIN","EMPLOYEE","QA","MANAGER","WH_ADMIN"], qaBadge:true },
+  { k:"shipment", ic:"ship",    label:"Ship Devices",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"arrival",  ic:"receive", label:"Receive Devices", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* Sits between sending and receiving, which is where it belongs in the menu too.
      It also holds the shipment records and their paperwork: a separate "Shipments"
      entry existed for one release and was merged back in here, because the two screens
@@ -20835,11 +20848,11 @@ const NAV = [
   { k:"logistics", ic:"ship",   label:"Requests & Shipments", roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   /* What is reserved for whom, and from where - and the place to reserve it (24 Sep 2026,
      the owner). Everybody may look; only allocateUnits sees the buttons. */
-  { k:"allocations", ic:"people", label:"Allocations",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"allocations", ic:"people", label:"Device Allocations",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   { grp:"Records" },
   { k:"alerts",   ic:"alert",   label:"Alerts",             roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"], badge:true },
-  { k:"audit",    ic:"history", label:"Activity History",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
-  { k:"backup",   ic:"cloud",   label:"Backup & Sync",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"audit",    ic:"history", label:"Audit Trail",   roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
+  { k:"backup",   ic:"cloud",   label:"Sync Status",      roles:["ADMIN","CPM","EMPLOYEE","WH_ADMIN","QA","MANAGER"] },
   { grp:"Setup" },
   /* CPM since 11 Sep 2026, and the screen behind this entry is NOT the same screen for
      both of them: its tab strip is built from ADM_TABS, filtered by capability, so a CPM
@@ -21176,7 +21189,7 @@ function render(){
      full table reads on every page load, and a sixth for one screen would slow every
      other screen down. The body() above has already drawn with whatever is in hand,
      so a slow fetch shows an empty table for a moment rather than a blank app. */
-  /* `fresh` (16 Nov 2026): a view whose data other people change - QA Approval's requests -
+  /* `fresh` (16 Nov 2026): a view whose data other people change - QA and Manager Approvals's requests -
      loads again on every ENTRY, not once a session. The re-render after the load is the
      same view, so it does not load again. */
   if(v.load && (!LOADED_VIEWS.has(S.view) || (v.fresh && changedView))){
@@ -21372,10 +21385,10 @@ function todoItems(){
    functions change - the widgets do not. Role gating here is presentation only;
    real authorization must be enforced by that backend when it exists. */
 const HOME_MODULES = [
-  { key:"register",  ic:"receive",title:"New Device Registration",desc:"Produce new units into stock at Innoventric HQ." },
+  { key:"register",  ic:"receive",title:"Device Registration",desc:"Produce new units into stock at Innoventric HQ." },
   { key:"stock",     ic:"stock",  title:"Warehouse",              desc:"Device inventory across warehouses and sites." },
-  { key:"patients",  ic:"people", title:"Subjects Registration",  desc:"Register subjects and set up the table." },
-  { key:"screening", ic:"case",   title:"Subject Screening",      desc:"Screening, evaluation, scheduling and orders." },
+  { key:"patients",  ic:"people", title:"Subject Registration",   desc:"Register subjects and set up the table." },
+  { key:"screening", ic:"case",   title:"Screening & Evaluation",      desc:"Screening, evaluation, scheduling and orders." },
   /* The treatment-day form is the screen a field specialist opens most often, and it was
      the one module reachable only through the menu - asked for from the field, in the same
      words as the shortcuts that already existed for the warehouse and the register. */
@@ -21383,8 +21396,8 @@ const HOME_MODULES = [
   /* Two tiles, not one. Sending and receiving are two different screens reached from
      two different menu entries, and a single card labelled with both landed people on
      whichever one it happened to open - usually the wrong one. Split on 17 Aug 2026. */
-  { key:"shipment",  ic:"ship",   title:"Send Devices Out",  desc:"Send units to a site or a warehouse, or hand them to the team." },
-  { key:"arrival",   ic:"receive",title:"Receive a Delivery", desc:"Check arriving units in, one at a time." }
+  { key:"shipment",  ic:"ship",   title:"Ship Devices",  desc:"Send units to a site or a warehouse, or hand them to the team." },
+  { key:"arrival",   ic:"receive",title:"Receive Devices", desc:"Check arriving units in, one at a time." }
 ];
 function canAccessView(key){ return NAV.some(i => i.k === key && navAllowed(i)); }
 
@@ -21563,7 +21576,7 @@ function requestProgress(ref, lines, destinationId){
 /* LINKING A SHIPMENT TO ITS REQUEST (12 Nov 2026, the owner; v3.14.0). A request reads a
    shipment as its own only through `requestRef`, and until now that was set only when the
    box was started from the request's row. These two answer "what can this box be linked
-   to" and "what is it linked to", for the shipment card and for Send Devices Out.
+   to" and "what is it linked to", for the shipment card and for Ship Devices.
 
    The open requests to one place: the same queue Home shows, so a request the queue has
    already closed is not offered. */
@@ -21785,7 +21798,7 @@ const REQ_STATE = {
 };
 
 /* ---- RAISING A REQUEST FOR STOCK --------------------------------------------------
-   Four questions, and they are the SAME four Send Devices Out asks in its first two
+   Four questions, and they are the SAME four Ship Devices asks in its first two
    steps: from where, to where, which product, how many. That is deliberate - the form
    that answers a request should be the form that raised it, with the answers already in
    it, and a second screen asking the same things in different words is how two people
@@ -21810,7 +21823,7 @@ function availableAt(locationId, productType, size){
 }
 
 /* ---- ASKING FOR A SHIPMENT, IN THE WORDS THE SEND SCREEN USES -------------------
-   the owner, 23 Sep 2026: this should work the way Send Devices Out does. So it asks the same
+   the owner, 23 Sep 2026: this should work the way Ship Devices does. So it asks the same
    two questions in the same order - implant, delivery system, or both, and how many of
    each - and only then, optionally, which SIZES, shown against what the origin actually
    holds. A request that names no size is a real answer and the commonest one: the person
@@ -22024,7 +22037,7 @@ function askCancelRequest(ref){
   const what = row.kind === "PATIENT" ? "the product order request for " + row.id : "stock request " + row.id;
   modal("Cancel this request",
     '<p>Cancelling <b>' + esc(what) + '</b> to <b>' + esc(locName(row.siteId)) + '</b>.</p>' +
-    '<div class="note">A <b>Manager or another App Admin</b> has to approve it — on QA Approval. ' +
+    '<div class="note">A <b>Manager or another App Admin</b> has to approve it — on QA and Manager Approvals. ' +
       'Until then nothing changes. Once approved it leaves this list' +
       (row.kind === "PATIENT" ? '; stage 10 stays done and units already reserved for the subject stay reserved' : '') +
       '. You and the site’s warehouse managers are told.</div>' +
@@ -22331,7 +22344,7 @@ function procCountdown(p){
   const n = -d;
   return '<span class="pill p-grey">' + n + ' day' + (n > 1 ? "s" : "") + ' since procedure</span>';
 }
-/* SITE DETAILS (8 Nov 2026, the owner): an icon beside the site on Subject Overview (and a button
+/* SITE DETAILS (8 Nov 2026, the owner): an icon beside the site on Subjects in Screening (and a button
    at the top of the procedure report) opens everything on record for the site - address,
    contacts, physicians, echo operator, Responsible CPM, opening date and whether it is in the
    study. Read-only; editing stays in Administration. Delegated on the document, so every
@@ -22389,13 +22402,13 @@ function patientRowCells(p, opts){
     '<td>' + pill(PT_STATUS, displayStatus(p)) + '</td>' +
     '<td>' + stuckWithCell(p) + '</td><td>' + filesCell(p) + '</td>' +
     /* The folder moved into Files (9 Nov 2026). The pencil only where the report is what a
-       click on the row opens anyway, and only on Subject Overview / Home (opts.edit). */
+       click on the row opens anyway, and only on Subjects in Screening / Home (opts.edit). */
     '<td>' + casefile + '<div class="act-row">' + reportEyeBtn(p) +
       (opts && opts.edit && canSeeReport() && patientLandsOnReport(p) ? editReportBtn(p) : "") + '</div></td>';
 }
 /* HAS THE WAREHOUSE RESERVED THE UNITS, AND WHICH (27 Sep 2026, the owner). Read straight off
    the devices - allocatedTo is the reservation - so this column cannot disagree with the
-   Allocations screen. Counted against what the patient needs (productNeeds, two of each
+   Device Allocations screen. Counted against what the patient needs (productNeeds, two of each
    by default), and only once somebody has asked: before the request nothing is owed, so
    "Not allocated" there would be an alarm about nothing. Used, rejected, obsolete and
    expired units are left out, as heldFor() leaves them out. Serials are in the tooltip:
@@ -22711,7 +22724,7 @@ function deviceInventoryWidget(){
 }
 
 /* THE WHOLE QUEUE OF THINGS WAITING TO BE SENT, on every screen that needs it - Home, In
-   Transit, and (since 23 Sep 2026) Send Devices Out, which is the one screen that ANSWERS
+   Transit, and (since 23 Sep 2026) Ship Devices, which is the one screen that ANSWERS
    a request and was the only one that could not see them. One function, because two copies
    of a work queue drift and then disagree about what is outstanding.
 
@@ -22853,7 +22866,7 @@ function shipmentRequestsWidget(opts){
     '</div><div class="card-bd">' +
     filters + table +
     '<div class="hint" style="margin-top:9px">Two kinds of row: a subject’s ' +
-    '<b>Product Order Request</b> (stage 10), and a request for stock to be moved with no ' +
+    '<b>Product Order</b> (stage 10), and a request for stock to be moved with no ' +
     'subject behind it. <b>Still missing there</b> is counted from what is actually usable ' +
     'at that place — so a row leaves this list by itself when the shipment arrives and is ' +
     'checked in, with nothing to tick.' +
@@ -23175,7 +23188,7 @@ function qaStepHtml(units){
     '</div><div class="card-bd">' +
     '<p><b>Nothing enters stock when you press the button above.</b> The ' + units.length +
     ' unit(s) at <b>' + where + '</b> are held until ' + esc(who.list) + ' approves ' +
-    'them under <b>QA Approval</b> — possibly on another device and later today.</p>' +
+    'them under <b>QA and Manager Approvals</b> — possibly on another device and later today.</p>' +
     '<p class="hint">Every batch carries two signatures from two different people. ' +
     'Whoever confirms production is refused the approval on that batch, whatever ' +
     'their role.</p>' +
@@ -23183,7 +23196,7 @@ function qaStepHtml(units){
 }
 
 VIEWS.register = {
-  title:"New Device Registration",
+  title:"Device Registration",
   sub:"Produce new units into stock. Only possible at Innoventric HQ.",
   body(){
     if(!REG && !restoreRegister()) resetRegister();
@@ -23218,12 +23231,12 @@ VIEWS.register = {
               (!n.recipients
                 ? 'Nobody could be told about this batch</b> — no one holds ' +
                   esc(w.approvers || (n.roles || []).join("/")) + ', or none of them ' +
-                  'answers for this territory. It is in the QA Approval queue and can ' +
+                  'answers for this territory. It is in the QA and Manager Approvals queue and can ' +
                   'still be approved there, but somebody has to be given the role or the ' +
                   'territory before the next one is told either (Administration → Users).'
                 : 'The batch was saved, but no email went out</b> — ' +
                   esc(n.reason || "the mail server refused it") +
-                  '. It is in the QA Approval queue, but nobody has been told by email. ' +
+                  '. It is in the QA and Manager Approvals queue, but nobody has been told by email. ' +
                   'Tell ' + esc(w.approvers || (n.roles || []).join("/")) + ' another way.') +
               '</div>';
         return '<div class="card"><div class="card-bd">' +
@@ -23255,7 +23268,7 @@ VIEWS.register = {
           w.errors.map(e => esc((e.ref || "") + " " + (e.sn || "") + " — " + e.message)).join("<br>") + '</div>' : '') +
         '</div><div class="card-ft"><div class="row">' +
           '<button class="btn btn-primary" id="reg-again">Register another batch</button>' +
-          '<button class="btn" id="reg-toaudit">See it in Activity History</button>' +
+          '<button class="btn" id="reg-toaudit">See it in Audit Trail</button>' +
         '</div></div></div>';
     }
 
@@ -23525,8 +23538,8 @@ function findDeviceByCode(code){
 
 /* THE ONE WAY TO TURN A SCAN INTO A UNIT. Every scan field goes through this.
 
-   It exists because the screens had drifted apart. New Device Registration parsed the
-   real label with parseDeviceQr, while Receive a Delivery, the two procedure-report
+   It exists because the screens had drifted apart. Device Registration parsed the
+   real label with parseDeviceQr, while Receive Devices, the two procedure-report
    fields and the courier page compared the RAW scan against a serial number. A real
    Innoventric label is four newline-separated lines (REF, SN, mfg, expiry), so on those
    screens a genuine scan could never match anything and the operator was told "no unit
@@ -23767,7 +23780,7 @@ async function submitLabelChange(m, code, manual, context){
   }
   logAction("Label differs from the record: " + r.sn + " — awaiting QA/Admin approval (" + r.changeId + ")",
     { locationId:r.locationId, highPriority:true, stateChanges:text, comments:"Label scanned on " + context + "." });
-  notify("The label on " + r.sn + " differs from its record (" + text + "); waiting for approval (QA Approval).",
+  notify("The label on " + r.sn + " differs from its record (" + text + "); waiting for approval (QA and Manager Approvals).",
     ["QA","ADMIN"], [], r.locationId);
   commit();
   return { change:r, applied:false, device:m.device };
@@ -23790,7 +23803,7 @@ function applyLabelChangeLocally(r, note){
    warehouse or HQ (an App Admin decides) and a screening override (an App Admin or a
    Manager decides). approvalService.js on the server is the authority - same kinds, same
    approvers, and the person who asked can never decide. This is the drawing of it, the
-   queue on QA Approval, and the one helper every screen asks through. */
+   queue on QA and Manager Approvals, and the one helper every screen asks through. */
 const APPROVAL_KINDS = {
   FIFO_OVERRIDE:      { label:"FIFO override",      approvers:["ADMIN"] },
   SCREENING_OVERRIDE: { label:"Screening override", approvers:["ADMIN","MANAGER"] },
@@ -23940,7 +23953,7 @@ function askDecideApproval(id, approve){
     }catch(e){ go.disabled = false; showWhy("apr-why", e.message || "The server refused that."); }
   };
 }
-/* Delegated, like the obsolete buttons: the section is drawn on QA Approval today and may
+/* Delegated, like the obsolete buttons: the section is drawn on QA and Manager Approvals today and may
    be drawn elsewhere later, and a per-view wire() is the handler written twice. */
 document.addEventListener("click", async e => {
   const t = e.target.closest && e.target.closest("[data-aprok],[data-aprno],[data-aprwd]");
@@ -23961,7 +23974,7 @@ document.addEventListener("click", async e => {
    anatStages.applyStageOverride; who may press it is the server's
    (POST /api/patients/:id/stage-override). the owner's answers: a Manager, QA or App Admin gives
    it at once; a CPM or an Employee asks, and one of those three decides - here on the
-   stage or on QA Approval; the skipped stages stay open as tasks for the subject's CPM with
+   stage or on QA and Manager Approvals; the skipped stages stay open as tasks for the subject's CPM with
    a finish-by date that is required, so the daily mail chases them. */
 const STAGE_OVERRIDE_GIVE = ["ADMIN","MANAGER","QA"];
 const STAGE_OVERRIDE_ASK  = ["CPM","EMPLOYEE"];
@@ -24033,7 +24046,7 @@ function askStageOverride(p, s){
       '<input type="date" id="sov-due" min="' + esc(nowISO().slice(0, 10)) + '"></div>' +
     '<div class="hint">' + (give
       ? 'You are a Manager, QA or App Admin, so this takes effect at once. Recorded with your name, the date and the reason.'
-      : 'A Manager, QA or App Admin - somebody other than you - approves it, on this stage or on QA Approval. They are told by email.') +
+      : 'A Manager, QA or App Admin - somebody other than you - approves it, on this stage or on QA and Manager Approvals. They are told by email.') +
     '</div>' + whyBox("sov-err"),
     '<div class="row"><button class="btn" data-close="1">Cancel</button><span class="spacer"></span>' +
       '<button class="btn btn-pri" id="sov-go">' + (give ? "Open the stage" : "Send the request") + '</button></div>');
@@ -24127,7 +24140,7 @@ function syncTrainingDue(p){
   return true;
 }
 
-/* THE APPROVAL QUEUE, on QA Approval. Shown to everybody who opens the screen; acted on by
+/* THE APPROVAL QUEUE, on QA and Manager Approvals. Shown to everybody who opens the screen; acted on by
    QA and App Admin (approveLabelChange, enforced by the server). */
 function labelQaSection(){
   const open = labelChanges().filter(r => r.status === "AWAITING");
@@ -24216,7 +24229,7 @@ function askLabelReject(changeId){
   };
 }
 
-/* What Receive a Delivery offers in its list (v3.0.0, item 1): units on their way to one of
+/* What Receive Devices offers in its list (v3.0.0, item 1): units on their way to one of
    this person's locations - or, ticked as a return, units that went out from one - and,
    once the first unit has fixed where this delivery is being received, only units going
    there. Not the ones already on this delivery. The scan handler still checks each one. */
@@ -24308,7 +24321,7 @@ function arUnitDone(u){
   return arUnitPassed(u) || String((u && u.compromiseNote) || "").trim().length > 0;
 }
 VIEWS.arrival = {
-  title:"Receive a Delivery",
+  title:"Receive Devices",
   sub:"Scan every unit and run its own checks — a Unica implant and a delivery system are asked different questions. A unit that clears them all becomes usable stock; one that does not is rejected on its own.",
   body(){
     if(!AR && !restoreArrival()) resetArrival();
@@ -24336,7 +24349,7 @@ VIEWS.arrival = {
           'hand-entered rather than scanned. That is recorded against the inspection.</div>' : '') +
         '</div><div class="card-ft"><div class="row">' +
           '<button class="btn btn-primary" id="ar-next">Receive another delivery</button>' +
-          '<button class="btn" id="ar-toaudit">See it in Activity History</button>' +
+          '<button class="btn" id="ar-toaudit">See it in Audit Trail</button>' +
         '</div></div></div>';
     }
 
@@ -24347,7 +24360,7 @@ VIEWS.arrival = {
       inScope(d.destinationId || d.locationId));
     /* How many units are fully cleared - the header count for step 2. */
     const cleared = AR.units.filter(arUnitPassed).length;
-    SCANFIELDS["ar-scan"] = { label:"device label", onCode:labelChecked("Receive a Delivery", (code, manual, how) => {
+    SCANFIELDS["ar-scan"] = { label:"device label", onCode:labelChecked("Receive Devices", (code, manual, how) => {
       let hit;
       /* Reads the real four-line label, and still accepts a serial typed by hand. It
          used to compare the raw scan against a serial number, so scanning an actual
@@ -24658,13 +24671,13 @@ function submitArrival(){
 
   function recordOne(dev, before, u, wasHeadedFor){
     /* The SERIAL, not only the REF - added 8 Sep 2026 at the owner's request, because the
-       Site Accountability Log reads this line and could say four Unica S arrived without
+       Device Accountability Log reads this line and could say four Unica S arrived without
        saying WHICH four. The audit list has no column for a unit, and the entry itself is
        the only place a serial can go; the report splits it back off at the " · ". Lines
        written before this carry the REF alone and are matched to a unit by time there.
 
        A RETURN WRITES THE SAME SENTENCE, deliberately. SR_ARRIVAL_RE matches on this
-       exact opening and the Site Accountability Log finds nothing if it changes - and a
+       exact opening and the Device Accountability Log finds nothing if it changes - and a
        returned unit genuinely did arrive at the warehouse, which is the location this
        line is filed under. What makes it a return rather than a delivery goes in
        stateChanges and comments, which the report already reads. */
@@ -25799,7 +25812,7 @@ function renderKeepingPlace(){
 
 VIEWS.screening = {
   title:"Subject Screening & Evaluation",
-  sub:"Clinical screening, anatomical evaluation, scheduling and the product order request.",
+  sub:"Clinical screening, anatomical evaluation, scheduling and product ordering.",
   /* Stage 10 reserves units through usableFor(), which excludes anything already packed
      into a shipment that has not been handed over - and cannot know what is packed
      without the shipment rows. See ensureShipments. */
@@ -25810,7 +25823,7 @@ VIEWS.screening = {
        finished by definition. They are on the Follow up screen. */
     const list = activePatients().filter(p => !isPostProcedure(p) &&
       inPatientScope(p.siteId));
-    if(!list.length) return '<div class="empty">No subjects yet. A CPM or App Admin can add one in the Subject Register.</div>';
+    if(!list.length) return '<div class="empty">No subjects yet. A CPM or App Admin can add one in the Subject Registration.</div>';
     if(!SCR.patientId || !list.some(p => p.id === SCR.patientId)) SCR.patientId = list[0].id;
     const p = S.db.patients.find(x => x.id === SCR.patientId);
     if(!p.screening) { p.screening = blankScreening(); p.anat = blankAnat(); }
@@ -25842,14 +25855,13 @@ VIEWS.screening = {
             '>' + esc(x.label) + '</option>').join("") +
         '</select>' +
         (!studyAllowedFor(p, p.siteId)
-          ? '<div class="hint"><b>The site was not in the study</b> when this subject was ' +
-            'registered, so the subject is a compassionate case and is counted out of the ' +
-            'study\'s figures' + (isCompassionate(p) ? '' : ' (the record still says Study)') + '.</div>'
+          ? '<div class="hint"><b>Site not open for the study at registration.</b> Treated as a ' +
+            'compassionate case and excluded from study figures' + (isCompassionate(p) ? '' : ' (the record still says Study)') + '.</div>'
           : isCompassionate(p)
           ? '<div class="hint">Outside the study\'s eligible and implanted counts.</div>'
           : '<div class="hint">Part of the study. Switchable at any stage.</div>') +
       '</div>' +
-      '<div><label class="lbl-sm">Workflow status</label><div style="margin-top:5px">' +
+      '<div><label class="lbl-sm">Screening status</label><div style="margin-top:5px">' +
         pill(PT_STATUS, SM.isOnHold(p) ? "ON_HOLD" : p.status) +
         (p.cancelled && p.cancelled.is
           ? ' <span class="hint">stopped during ' + esc(p.cancelled.stage || "screening") + '</span>' : "") +
@@ -25860,7 +25872,7 @@ VIEWS.screening = {
     h += '<div class="grid g3" style="margin-top:4px">' +
       '<div class="calc"><small>Recommended implant size</small><b>' + esc(rec.size || "–") + '</b></div>' +
       '<div class="calc"><small>Implantation angle</small><b>' + esc(rec.angle || "–") + '</b></div>' +
-      '<div class="calc"><small>Derived from</small><b style="font-size:13px">' +
+      '<div class="calc"><small>Source stage</small><b style="font-size:13px">' +
         esc(rec.from || "no completed evaluation yet") + '</b></div>' +
       '</div>';
     if(rec.altSize) h += '<div class="hint">Alternative size on record: ' + esc(rec.altSize) + '</div>';
@@ -25899,8 +25911,8 @@ VIEWS.screening = {
         (mayDisqualify(p) ? '<button class="btn btn-sm btn-danger" data-disq="' + esc(p.id) + '">Disqualify subject</button>' : '');
       if(stopBtns){
         h += '<div class="row" style="justify-content:flex-end;margin:-4px 0 10px;gap:6px">' + stopBtns + '</div>' +
-          '<div class="hint" style="text-align:right;margin:-6px 0 10px">Hold: paused, not complying or an operational reason. ' +
-          'Cancel: will not be implanted, a reason unrelated to screening. Disqualify: screening found it — a screen failure before Eligible.</div>';
+          '<div class="hint" style="text-align:right;margin:-6px 0 10px"><b>Hold</b> – pause screening (non-compliance or operational reason). ' +
+          '<b>Cancel</b> – will not be implanted, for a reason unrelated to screening. <b>Disqualify</b> – excluded based on screening or evaluation findings.</div>';
       }
     }
     /* ON HOLD = READ-ONLY (9 Nov 2026, the owner: "to work on him he must be returned to
@@ -25911,10 +25923,10 @@ VIEWS.screening = {
 
     /* ---- Clinical screening ---- */
     const scrDone = SCREENING_STEPS.filter(s => p.screening[s.k].done).length;
-    h += '<div class="card"><div class="card-hd"><h2>Clinical Screening</h2>' +
+    h += '<div class="card"><div class="card-hd"><h2>Clinical Screening Documents</h2>' +
       '<span class="hint">' + scrDone + '/' + SCREENING_STEPS.length + ' received</span></div><div class="card-bd">' +
-      '<p class="hint">Only a CPM updates whether the clinical material has arrived. ' +
-      'Marking the CT available opens the anatomical evaluation below.</p>' +
+      '<p class="hint">Mark each item when it is received (CPM). ' +
+      'Marking the CT scan as received opens the anatomical evaluation below.</p>' +
       SCREENING_STEPS.map(s => {
         const st = p.screening[s.k];
         return '<label class="check' + (st.done ? " on" : "") + '">' +
@@ -25930,10 +25942,10 @@ VIEWS.screening = {
     const ctReady = p.screening.ct.done;
 
     /* ---- Anatomical evaluation ---- */
-    h += '<div class="card"><div class="card-hd"><h2>Anatomical Evaluation Workflow</h2>' +
+    h += '<div class="card"><div class="card-hd"><h2>Anatomical Evaluation</h2>' +
       '<span class="saved" id="sv-scr"></span>' +
       '<span class="hint">' + (ANAT_STAGES.length - missing.length) + '/' + ANAT_STAGES.length +
-      ' stages settled</span></div><div class="card-bd">';
+      ' stages closed</span></div><div class="card-bd">';
 
     if(!ctReady){
       h += '<div class="info">The CT scan is not marked as available yet, so stage 1 is not open. ' +
@@ -25950,8 +25962,8 @@ VIEWS.screening = {
           ? '<b>Override recorded.</b> ' + esc(p.anatOverride.reason) + ' — ' +
             esc(p.anatOverride.by) + ', ' + esc(fmtDate(p.anatOverride.at)) +
             '. Incomplete at the time: ' + esc(p.anatOverride.incomplete.join("; ")) + '.'
-          : '<b>' + missing.length + ' mandatory stage(s) still open.</b> A procedure cannot ' +
-            'be scheduled until they are finished, unless an override is given on the first locked stage.' +
+          : '<b>' + missing.length + ' mandatory stage' + (missing.length === 1 ? '' : 's') + ' open.</b> The procedure cannot ' +
+            'be scheduled until ' + (missing.length === 1 ? 'it is' : 'they are') + ' completed, unless an override is approved on the first locked stage.' +
             (ovReq && ovReq.status === "PENDING"
               ? '<div style="margin-top:6px"><span class="pill p-orange">override requested</span> by ' +
                 esc(ovReq.requestedByName || ovReq.requestedBy) + ', ' + esc(fmtTs(ovReq.requestedAt)) + ' — ' + esc(ovReq.reason) +
@@ -26465,7 +26477,7 @@ function pmDeemedNoPm(p){
    stage, the person and the date stamped. Before the patient was declared Eligible that
    is a SCREEN FAILURE, and the dialog says so before anybody presses the button; after it,
    the patient is WITHDRAWN. Which of the two is decided at that moment and stored
-   (`kind`), so the Screen Failure screen and the study figures never have to guess. */
+   (`kind`), so the Screen Failures screen and the study figures never have to guess. */
 const DISQUALIFY_CATEGORIES = [
   { k:"ANATOMY",  label:"Anatomically unsuitable" },
   { k:"CRITERIA", label:"Clinical inclusion/exclusion criteria" },
@@ -26508,9 +26520,9 @@ function openDisqualifyDialog(p, opts){
     (pre
       ? '<div class="warn"><b>This makes ' + esc(p.patientCode) + ' a SCREEN FAILURE.</b> The ' +
         'subject has not been declared eligible, so they are counted in the study’s screen ' +
-        'failure rate and listed on the Screen Failure screen with the reason you give here.</div>'
+        'failure rate and listed on the Screen Failures screen with the reason you give here.</div>'
       : '<div class="warn"><b>' + esc(p.patientCode) + ' was declared eligible, so this records ' +
-        'them as WITHDRAWN</b> — listed on the Screen Failure screen under its own label, and not ' +
+        'them as WITHDRAWN</b> — listed on the Screen Failures screen under its own label, and not ' +
         'counted as a screen failure.</div>') +
     '<div class="field" style="margin-top:10px"><label class="req" for="dq-cat">Why — category</label>' +
       '<select id="dq-cat"><option value="">— choose —</option>' +
@@ -26697,7 +26709,7 @@ function holdBanner(p){
    may act on it - Approve / Refuse for a Manager or App Admin, Withdraw for the asker. */
 /* REVIEW IN APP, from the request mail (16 Nov 2026). Opens the subject in Subject
    Screening, where the request's banner carries Approve / Refuse; a request this person
-   cannot see, or one already decided, lands on QA Approval with a word saying so. Once:
+   cannot see, or one already decided, lands on QA and Manager Approvals with a word saying so. Once:
    the id is removed as it is read. Returns true when it drew the screen itself. */
 const REVIEW_KEY = "pivotal.review";
 /* The link followed in a tab where the app is already open changes only the hash - no
@@ -26728,7 +26740,7 @@ function openReviewLink(){
   }
   const qaOk = NAV.some(i => i.k === "batches" && navAllowed(i));
   if(qaOk) go("batches");
-  toast(r ? "That subject could not be opened here; the request is on QA Approval." :
+  toast(r ? "That subject could not be opened here; the request is on QA and Manager Approvals." :
     "That request is not one you can see from this account.", "warn");
   return qaOk;
 }
@@ -27629,7 +27641,7 @@ function anatStageHtml(p, s, ctReady){
       inner += '<div class="note" style="margin-top:12px"><b>Allocated to ' +
         esc((STUDY_ARMS.find(x => x.k === a.studyArm) || {}).label || a.studyArm) +
         '</b> at this stage, before the allocation moved to stage 9. It is shown here as ' +
-        'a record; change it in <b>9. Randomization and procedure scheduling</b>.</div>';
+        'a record; change it in <b>9. Randomization &amp; Scheduling</b>.</div>';
     }else{
       inner += '<div class="hint" style="margin-top:10px">The study or control allocation ' +
         'is made in <b>stage 9</b>, once this stage is confirmed.</div>';
@@ -27667,7 +27679,7 @@ function anatStageHtml(p, s, ctReady){
           ? 'Set by the protocol: a <b>compassionate</b> case is outside the study, so there ' +
             'is nothing to randomise. Change the protocol to reopen this.'
           : 'A control-arm subject keeps their whole record but moves out ' +
-            'of screening and the register into <b>Control arm</b>.') + '</div>' +
+            'of screening and the register into <b>Control Arm Subjects</b>.') + '</div>' +
       '</div>';
     /* Said out loud, because otherwise a patient leaves the control group silently. */
     if(armLocked && recordedArmOf(p) === "CONTROL"){
@@ -28069,13 +28081,13 @@ function notCountedAtSite(p, n){
   const unchecked = mine.filter(d => d.size === n.size && d.status === "DELIVERED" &&
     (d.destinationId === p.siteId || (!d.destinationId && d.locationId === p.siteId)));
   if(unchecked.length) out.push(unchecked.length + " delivered and not checked in yet — " +
-    "check it in on Receive a Delivery and it counts");
+    "check it in on Receive Devices and it counts");
   return out;
 }
 
 /* ---- HOW FAR AN ORDER HAS GOT, and who it is waiting on -------------------------
    Requested → Proposed → Allocated → At site → Used, read off the order and the units, so
-   it cannot disagree with the queue or the Allocations screen. Shown in the queue, on
+   it cannot disagree with the queue or the Device Allocations screen. Shown in the queue, on
    stage 10 and on the procedure report. */
 function orderProgress(p){
   const o = (p.anat && p.anat.order) || {};
@@ -29746,7 +29758,7 @@ function askUnusedUnits(p){
             (l.id === homeOf(d) ? ' selected' : '') + '>' + esc(l.name) + '</option>').join("") +
         '</select></div>').join("") +
       '<div class="hint" style="margin-top:8px">A unit taken back shows as <b>on the way ' +
-        '(hand-carried)</b> until somebody checks it in with <b>Receive a Delivery</b> where it ' +
+        '(hand-carried)</b> until somebody checks it in with <b>Receive Devices</b> where it ' +
         'arrives. The four checks are the same.</div>' +
       '<div class="field" style="margin-top:10px"><label class="req" for="uu-who">Who is taking them</label>' +
         '<input type="text" id="uu-who" value="' + esc((S.me && S.me.name) || "") + '"></div>' +
@@ -29808,7 +29820,7 @@ async function takeBackUnused(p, plan){
           ". Awaiting the four arrival checks at " + locName(to) });
     }catch(e){
       toast("Could not record " + d.sn + " as going back: " + (e.message || "the server refused it") +
-        " It is still recorded at " + locName(from) + ". Use Send Devices Out with " +
+        " It is still recorded at " + locName(from) + ". Use Ship Devices with " +
         "'The equipment is going with the team'.", "bad");
     }
   }
@@ -29934,7 +29946,7 @@ function resetShip(){
          invoice:{ packages:1, dimensions:"", weight:"" } };
   saveDrafts();
 }
-/* START A SHIPMENT AGAINST A REQUEST. The card is on the Send Devices Out screen, so the
+/* START A SHIPMENT AGAINST A REQUEST. The card is on the Ship Devices screen, so the
    button's job is to fill in the first two steps and leave the person on the scan - which
    is the only part of this a system cannot do for them.
 
@@ -30170,7 +30182,7 @@ function pruneShipLines(){
 
    the owner's decisions: the unit lands as STOCK at the destination marked RETRO (not verified
    in the app); a reservation to a patient at another site is released and the CPMs told;
-   no shipment note is written; the Site Accountability Log shows it as its own kind of row,
+   no shipment note is written; the Device Accountability Log shows it as its own kind of row,
    dated when it really moved. The rules live in deviceService.recordPastMove - this only
    offers what that would accept and SAYS, before anything is pressed, what will happen.
 
@@ -30194,7 +30206,7 @@ function retroFloor(d){
    changes another record - a released reservation, a site left short before a procedure,
    a unit that was not the FIFO one - is said here, before, not discovered afterwards. */
 /* v3.0.0 (the owner, item 21): reached from Correct, when the admin says the unit really moved
-   - the Retroactive shipment card on Send Devices Out is gone. whyId is the message box of
+   - the Retroactive shipment card on Ship Devices is gone. whyId is the message box of
    the dialog that called it. */
 function askRecordPastMove(whyId){
   const why = m => showWhy(whyId || "cu-why-box", m);
@@ -30304,7 +30316,7 @@ function askRecordPastMove(whyId){
 }
 
 VIEWS.shipment = {
-  title:"Send Devices Out",
+  title:"Ship Devices",
   sub:"Choose what and how many, scan each unit, then confirm the whole shipment at once.",
   /* The queue and the units that are already packed both come from lists the boot snapshot
      does not carry. This screen is where a request is ANSWERED and it was the only one that
@@ -30418,7 +30430,7 @@ VIEWS.shipment = {
           esc(SH.destId ? locName(SH.destId) : "the destination chosen above") +
           '</b> straight away, as ' +
           '<b>delivered but not yet checked</b>. They do not count as stock anywhere until ' +
-          'somebody runs the four arrival checks on the <b>Receive a Delivery</b> screen — ' +
+          'somebody runs the four arrival checks on the <b>Receive Devices</b> screen — ' +
           'exactly as for any other arrival. Works in both directions: out to a hospital, ' +
           'or back to the office with what was not used.</div>'
         : '') +
@@ -30634,7 +30646,7 @@ VIEWS.shipment = {
    whole shipment is confirmed together at the end. */
 SCANFIELDS["sh-scan"] = {
   label:"device to send",
-  onCode:labelChecked("Send Devices Out", function(code, wasManual){
+  onCode:labelChecked("Ship Devices", function(code, wasManual){
     if(!SH) return;
     SH.lines = SH.lines || [];
     if(!SH.originId){ render(); return showWhy("sh-why", "Choose where the units are coming from (From) first."); }
@@ -30818,7 +30830,7 @@ async function askFifoApproval(deviceId){
         (st.p.wanted ? st.p.wanted.sn : "the earliest-expiry unit"), deviceId, originId:SH.originId,
         wantedSn: st.p.wanted ? st.p.wanted.sn : "" },
       reason });
-    render(); toast("Asked. An App Admin sees it on QA Approval; you are told when they decide.", "good");
+    render(); toast("Asked. An App Admin sees it on QA and Manager Approvals; you are told when they decide.", "good");
   }catch(e){ render(); showWhy("sh-why", e.message || "The request could not be sent."); }
 }
 document.addEventListener("click", e => {
@@ -31269,7 +31281,7 @@ function doShip(){
     const dev = l.deviceId ? device(l.deviceId) : null;
     if(!dev || dev.locationId !== SH.originId || !["IN_WH","IN_SITE"].includes(dev.status))
       return showWhy("sh-why", "A scanned unit (" + l.sn + ") is not in stock at this location. " +
-        "Remove it, or check it in on the Receive a Delivery screen first.");
+        "Remove it, or check it in on the Receive Devices screen first.");
     if(l.expired) return showWhy("sh-why", "A scanned unit (" + l.sn + ") is past its expiry date.");
     /* Asked again at the confirm, not only at the scan: the form is kept across screens, so
        a line scanned yesterday may since have been packed into somebody else's box. */
@@ -32050,7 +32062,7 @@ async function showDelivery(){
    at a hospital it had not reached.
 
    A unit leaves this log exactly two ways: somebody at the far end verifies it in
-   (Receive a Delivery, which runs the four checks), or an ADMIN / MANAGER / WH_ADMIN
+   (Receive Devices, which runs the four checks), or an ADMIN / MANAGER / WH_ADMIN
    records that it arrived and was signed for outside the app, with a reason. There is
    no third way, and nothing here counts as stock at either end. */
 let TRL = { from:"", to:"", sort:"oldest", scope:"open" };
@@ -32252,7 +32264,7 @@ VIEWS.transit = {
       h += '<div class="empty">' +
         (TRL.scope === "done" ? '<b>No completed shipments.</b>'
                               : '<b>Nothing is on the way.</b>') +
-        (!all.length ? 'A shipment appears here the moment units leave on Send Devices Out.'
+        (!all.length ? 'A shipment appears here the moment units leave on Ship Devices.'
          : TRL.scope === "done" ? 'Nothing matches these filters.'
          : 'Completed shipments are under “History”.') +
         '</div>';
@@ -32364,7 +32376,7 @@ VIEWS.transit = {
     h += '</tbody></table></div>';
 
     h += '<div class="hint" style="margin-top:8px">A unit becomes site stock when somebody ' +
-      'at the destination checks it in under <b>Receive a Delivery</b>. ' +
+      'at the destination checks it in under <b>Receive Devices</b>. ' +
       (canOverride
         ? 'If it arrived and was signed for outside the app, <b>Confirm arrival</b> records ' +
           'that — with your name and a reason, marked as an override.'
@@ -32756,7 +32768,7 @@ function askLinkRequest(shipmentId){
       'No unit moves.</div>' +
     '<div class="field" style="margin-top:8px"><label class="req" for="lr-why">Why</label>' +
       '<input type="text" id="lr-why" maxlength="400" autocomplete="off" ' +
-      'placeholder="e.g. packed from Send Devices Out, not from the request"></div>' + whyBox("lr-err"),
+      'placeholder="e.g. packed from Ship Devices, not from the request"></div>' + whyBox("lr-err"),
     '<div class="row"><button class="btn btn-primary" id="lr-go">Save</button>' +
     '<button class="btn" data-close="1">Cancel</button></div>');
   $("#lr-go").onclick = async () => {
@@ -32959,7 +32971,7 @@ function wireShipmentCard(){
 }
 
 /* ============================ SHIPPING DOCUMENTS ==========================
-   Printed through printDoc/printHtml, the same mechanism the Site Accountability Log
+   Printed through printDoc/printHtml, the same mechanism the Device Accountability Log
    and the Procedure Report already use - the browser's own print dialog and "Save as
    PDF". No PDF library is bundled and none is needed; default-src 'self' would refuse
    a CDN one anyway.
@@ -33178,7 +33190,7 @@ function docKindTitle(kind){
 /* ---- DRAFT DOCUMENTS FROM STEP 3 (24 Sep 2026, the owner) --------------------------------
    The same set In Transit offers - Proforma Invoice, End Use Letter where the destination
    needs one, and the document pack with the regulatory approvals - built by the server
-   from what Send Devices Out has filled in, before anything is confirmed. Every page says
+   from what Ship Devices has filled in, before anything is confirmed. Every page says
    DRAFT, with no invoice number, no AWB and no signature, and nothing is allocated or
    filed: the final documents still come from the shipment record, on In Transit, once
    the shipment exists. */
@@ -33388,7 +33400,7 @@ function askOverrideArrival(deviceId){
       'stock at <b>' + esc(dest) + '</b>.</p>' +
     '<div class="warn" style="margin:8px 0"><b>The four arrival checks will not be run.</b> ' +
       'Nobody scanned this unit, so this records that it arrived — it does not verify its ' +
-      'condition. A damaged unit must go through Receive a Delivery instead.</div>' +
+      'condition. A damaged unit must go through Receive Devices instead.</div>' +
     '<div class="field"><label class="req" for="ovr-why">How was the arrival confirmed?</label>' +
       '<input type="text" id="ovr-why" maxlength="400" ' +
       'placeholder="e.g. signed courier POD 4471, confirmed by phone with the cath lab"></div>' +
@@ -33820,7 +33832,7 @@ function batchReworkTick(units, id){
      · scans the NEW label of every unit, which must read the serial WITH -R and, if the
        label carries an expiry date, the date the unit will have,
    and sends it to QA. The unit stays In rework until a QA person - never the admin who
-   brought it back - releases it in QA Approval. deviceQr.reworkLabelProblem is the one rule
+   brought it back - releases it in QA and Manager Approvals. deviceQr.reworkLabelProblem is the one rule
    for the label, read here and by the server. */
 let RWB = null;
 function reworkReleases(){ return (S.db && Array.isArray(S.db.reworkReleases)) ? S.db.reworkReleases : []; }
@@ -33993,7 +34005,7 @@ async function submitReworkReturn(go){
           comments:"Label replaced: yes. New label " + (sc.manual ? "HAND-ENTERED" : "scanned") + ": " + sc.sn + "." });
       }
       notify((units.length === 1 ? units[0].sn + " is back from rework and waits" : units.length + " units are back from rework and wait") +
-        " for QA release (QA Approval).", ["QA"], [], RWB.hqId);
+        " for QA release (QA and Manager Approvals).", ["QA"], [], RWB.hqId);
     }
   }catch(e){
     go.disabled = false;
@@ -34423,7 +34435,7 @@ function stkCell(v, r, bold){
    says how many at each place are reserved; this says for whom, which is the question a
    warehouse is actually asked ("can I send these four?"). Grouped by the unit's column,
    so it reads beside the matrix, and filtered exactly as the matrix is: same columns,
-   same product, same status rule. The Allocations screen holds the same units by patient,
+   same product, same status rule. The Device Allocations screen holds the same units by patient,
    with the buttons; this is the stock-side view of them and changes nothing. */
 function stockReservedCard(cols){
   if(FL.resv === "FREE") return "";
@@ -34530,7 +34542,7 @@ function askUnitNote(deviceId){
     '<div class="field"><label for="un-text">What should people know about this unit?</label>' +
       '<textarea id="un-text" rows="4" maxlength="1000">' + esc(d.note || "") + '</textarea>' +
       '<div class="hint">One note per unit; saving replaces it, and a blank note removes it. ' +
-      'Who changed it and when goes into Activity History.</div></div>' + whyBox("un-why"),
+      'Who changed it and when goes into Audit Trail.</div></div>' + whyBox("un-why"),
     '<div class="row"><button class="btn btn-primary" id="un-go">Save note</button>' +
     '<button class="btn" data-close="1">Cancel</button></div>');
   $("#un-go").onclick = async () => {
@@ -34605,7 +34617,7 @@ function unitDetailTable(units, opts){
         '<td>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</td>' +
         '<td>' + where + '</td>' +
         '<td>' + unitStatusPill(d) +
-          (pendingLabelChange(d.id) ? ' <span class="pill p-orange" title="A scanned label disagrees with this record - waiting for QA/Admin approval in QA Approval">Label change pending</span>' : '') +
+          (pendingLabelChange(d.id) ? ' <span class="pill p-orange" title="A scanned label disagrees with this record - waiting for QA/Admin approval in QA and Manager Approvals">Label change pending</span>' : '') +
           '</td>' +
         '<td' + (exp && exp <= soon ? ' class="warn-cell" title="expires within 90 days"' : '') +
           '>' + esc(exp ? fmtDate(exp) : "—") + '</td>' +
@@ -34984,7 +34996,7 @@ VIEWS.stock = {
     h += '<div class="card"><div class="card-bd"><div class="row" style="margin:0">' +
       '<button class="btn btn-sm" data-newreq="1">Request a shipment</button>' +
       '<span class="hint">Somewhere short of something? Ask for it to be sent, and it ' +
-      'joins the queue on Home, In Transit and Send Devices Out.</span>' +
+      'joins the queue on Home, In Transit and Ship Devices.</span>' +
       '</div></div></div>';
     h += '<div style="height:14px"></div>';
 
@@ -35140,7 +35152,7 @@ function exportCSV(){
 let ALF = { site:"", product:"" };
 const ALLOC_DONE = ["USED", "REJECTED", "OBSOLETE", "EXPIRED"];
 VIEWS.allocations = {
-  title:"Allocations",
+  title:"Device Allocations",
   sub:"What is reserved for which subject, where each unit is and where it comes from. Reserve and release from here.",
   async load(){ await ensureShipments(); },
   body(){
@@ -35360,7 +35372,7 @@ function srFetch(siteId){
     .then(() => { if(S.view === "sitereport") render(); });
 }
 /* ARRIVALS FROM THE UNIT HISTORY (v3.0.0). The arrival line is written only by the four
-   checks on Receive a Delivery, so a unit the team carried in, scanned at the table, or
+   checks on Receive Devices, so a unit the team carried in, scanned at the table, or
    that was corrected or moved after the fact never appeared here - on DEV a site with 119
    log lines had not one of them. DeviceMovements is written by the server for every
    change of place, so every way in is there. One row per stay: an arrival event opens a
@@ -35661,7 +35673,7 @@ function iProducedBatch(b){
 }
 
 VIEWS.batches = {
-  title:"QA Approval",
+  title:"QA and Manager Approvals",
   /* The requests waiting for a decision were read at sign-in only, so one asked while the
      app was open never appeared here until a reload (the owner, 16 Nov 2026). Read on every
      entry; a failed read keeps what is in hand (loadApprovalRequests). */
@@ -35678,7 +35690,7 @@ VIEWS.batches = {
     const rw = approvalQaSection() + labelQaSection() + reworkQaSection();
     if(!all.length){
       return rw + '<div class="empty">No batches yet. A batch appears here once production ' +
-        'has been confirmed on the New Device Registration screen.</div>';
+        'has been confirmed on the Device Registration screen.</div>';
     }
     const open = all.filter(b => b.status !== "COMPLETED");
     const done = all.filter(b => b.status === "COMPLETED");
@@ -36222,7 +36234,7 @@ function confirmDispose(batchId){
    This screen exists so that "left the list" never means "lost". Read-only: the way
    back is to change the allocation at stage 8, which is where it was decided. */
 VIEWS.control = {
-  title:"Control arm",
+  title:"Control Arm Subjects",
   sub:"Subjects allocated to the Control arm. Their record is kept in full; no product is ordered and no procedure is scheduled.",
   body(){
     const list = controlPatients();
@@ -36230,7 +36242,7 @@ VIEWS.control = {
       return '<div class="empty">No subjects in the Control arm yet. ' +
         'The allocation is made at stage 8, Eligibility &amp; Approvals.</div>';
     }
-    return '<div class="card"><div class="card-hd"><h2>Control arm</h2>' +
+    return '<div class="card"><div class="card-hd"><h2>Control Arm Subjects</h2>' +
       '<span class="pill p-grey">' + list.length + '</span></div><div class="card-bd">' +
       '<div class="tbl-wrap"><table><thead><tr>' +
         '<th>Code</th><th>Site</th><th>Allocated</th><th>Decided by</th>' +
@@ -37354,7 +37366,7 @@ async function saveClosedSummary(p){
 }
 
 VIEWS.screenfail = {
-  title:"Screen Failure",
+  title:"Screen Failures",
   sub:"Every subject stopped before Eligible, and why — with those withdrawn later shown apart.",
   body(){
     const sites = visiblePatientSites();
@@ -37450,7 +37462,7 @@ VIEWS.screenfail = {
    Status below, unchanged. They were two readers on one screen: somebody looking for a
    patient scrolled past a dashboard to reach the table. */
 VIEWS.overview = {
-  title:"Subject Overview",
+  title:"Subjects in Screening",
   sub:"Where every subject stands — the same table as Home, with its filters.",
   body(){ return patientStatusWidget(); },
   wire(){ wirePatientStatusWidget(); }
@@ -37649,7 +37661,7 @@ function fuSummaryBtn(p){
 
 /* EDIT THE REPORT - a pencil (9 Nov 2026, the owner: "Open report" did not say it opens the
    report for editing). Never on a locked report. Handled in the capture phase, so on
-   Subject Overview the row underneath does not also open. */
+   Subjects in Screening the row underneath does not also open. */
 function editReportBtn(p){
   if(!p || p.fileLocked) return "";
   return '<button class="btn btn-sm btn-eye lbl" data-fu-open="' + p.id + '" ' +
@@ -37666,7 +37678,7 @@ document.addEventListener("click", e => {
   go("clinical", { SITEID:p.siteId, PID:p.id });
 }, true);
 
-/* THE EVALUATION FILES, ONE BUTTON EACH (9 Nov 2026, the owner), on Subject Overview and
+/* THE EVALUATION FILES, ONE BUTTON EACH (9 Nov 2026, the owner), on Subjects in Screening and
    Follow up: CT report, 3D model, pliable model, Road Map, patient presentation, and the
    folder. A stage with files opens the viewer on its first one. A stage the subject has
    already passed with nothing filed is shown greyed and does nothing; a stage not yet
@@ -37914,7 +37926,7 @@ VIEWS.shiplog = {
       return h + '<div class="empty">' +
         (everything.length
           ? '<b>Nothing matches these filters.</b>Widen the dates, or clear the search.'
-          : '<b>Nothing has been sent yet.</b>A shipment appears here the moment it is prepared on Send Devices Out.') +
+          : '<b>Nothing has been sent yet.</b>A shipment appears here the moment it is prepared on Ship Devices.') +
         '</div>';
     }
 
@@ -38029,7 +38041,7 @@ VIEWS.shiplog = {
    (with Allocate, Send this, Withdraw and "Request a shipment", which opens as a dialog),
    every request ever made and how far it got, and the shipments log with its paperwork.
    Three tabs over parts that already existed - the requests card, the shipments log -
-   so each is still drawn by one function. In Transit and Send Devices Out lost their copy
+   so each is still drawn by one function. In Transit and Ship Devices lost their copy
    of the requests card and point here instead. */
 let LOGTAB = "open";
 function logisticsLink(){
@@ -38113,7 +38125,7 @@ VIEWS.logistics = {
 };
 
 VIEWS.sitereport = {
-  title:"Site Accountability Log",
+  title:"Device Accountability Log",
   sub:"Every unit whose stay at a site touches the two dates — its serial, when it arrived, who received it, whether it was found compromised, and when it left the hospital. Export to Excel (CSV) or PDF.",
   body(){
     srDefaults();
@@ -38265,8 +38277,8 @@ function siteReportPDF(){
           'serial was written into the log.</p>' : "")
       : '<div class="pr-empty">No unit came into or left this site in this period.</div>');
   /* No patient here, so it is named for what it actually is: the site and the period. */
-  printHtml(printDoc("Site Accountability Log — " + locName(SR.siteId), body),
-            "Site Accountability Log - " + slugify(locName(SR.siteId)) + " " + SR.from + " to " + SR.to);
+  printHtml(printDoc("Device Accountability Log — " + locName(SR.siteId), body),
+            "Device Accountability Log - " + slugify(locName(SR.siteId)) + " " + SR.from + " to " + SR.to);
 }
 
 /* ============================================ CASE-FILE PDF (feature 2) === */
@@ -38274,7 +38286,7 @@ function siteReportPDF(){
    image-group helper and a 130-line HTML body. The server builds that document now
    (caseFilePdf.js) from the STORED patient and files it in the patient's folder, so a
    second rendering in the page would be a second version of a clinical record. The
-   .pr-* print styles below still dress the Site Accountability Log, which is still
+   .pr-* print styles below still dress the Device Accountability Log, which is still
    printed from here. */
 
 
@@ -38524,7 +38536,7 @@ async function exportCaseFilePDF(p){
 
 /* ============================================================= AUDIT LOG = */
 VIEWS.audit = {
-  title:"Activity History",
+  title:"Audit Trail",
   sub:"Everything that has happened, newest first — who did it, where, and what changed.",
   body(){
     const s = scopedLocIds();
@@ -38578,7 +38590,7 @@ VIEWS.alerts = {
 
 /* ============================================== PATIENT & CLINICAL SETUP = */
 VIEWS.patients = {
-  title:"Subject Register",
+  title:"Subject Registration",
   sub:"Register a subject and set up what the team needs at the table: sizing, " +
       "medical questions, reminders and notes for the PI.",
   body(){
@@ -38663,9 +38675,9 @@ function screeningQuestionsCard(p){
   const qs = Array.isArray(p.customQuestions) ? p.customQuestions : [];
   const mayEdit = (can("managePatients") || can("editAnatomical")) && !p.fileLocked;
   const dis = mayEdit ? "" : " disabled";
-  return '<div class="card"><div class="card-hd"><h2>Clinical questions</h2>' +
-      '<span class="hint">' + qs.length + ' question(s)</span></div><div class="card-bd">' +
-    '<div class="hint" style="margin:0 0 8px">Asked at registration, answered as the evaluation goes - ' +
+  return '<div class="card"><div class="card-hd"><h2>Clinical Questions</h2>' +
+      '<span class="hint">' + qs.length + (qs.length === 1 ? ' question' : ' questions') + '</span></div><div class="card-bd">' +
+    '<div class="hint" style="margin:0 0 8px">Recorded at registration, answered during the evaluation, ' +
       'and carried into stage 2 of the procedure report.</div>' +
     (qs.length ? qs.map((q, i) => '<div class="q-item">' +
       '<div class="row" style="flex-wrap:nowrap;gap:6px">' +
@@ -38937,7 +38949,7 @@ function patientFormRender(p, isNew){
 
 /* ==================================================== BACKUP & SYNC LOG = */
 VIEWS.backup = {
-  title:"Backup & Sync",
+  title:"Sync Status",
   sub:"Every file written to OneDrive, and anything still waiting to go up.",
   body(){
     const q = S.db.backupQueue;
@@ -39494,7 +39506,7 @@ function approvalMailAlert(n, approvers, batchId){
                : "The batch was saved, but no email went out",
     '<div class="warn"><b>Batch <span class="mono">' + esc(batchId) + '</span> is waiting ' +
       'for a signature, and no email reached anybody.</b></div>' +
-    '<p>The batch is <b>saved and safe</b>. It is in the QA Approval queue and can be ' +
+    '<p>The batch is <b>saved and safe</b>. It is in the QA and Manager Approvals queue and can be ' +
       'approved by anyone who opens that screen. Nothing has entered stock, and nothing ' +
       'is lost — what did not happen is the <b>telling</b>.</p>' +
     (nobody
