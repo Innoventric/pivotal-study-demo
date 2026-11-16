@@ -12349,7 +12349,9 @@ function wasStopped(p){ return !!(p.cancelled && p.cancelled.is); }
    the one rule, read by the server, the page and the daily mail. */
 var HOLD_CATEGORIES = [
   { k: "NON_COMPLIANCE", label: "Subject not complying" },
-  { k: "OPERATIONAL",    label: "Operational reason preventing screening" }
+  { k: "OPERATIONAL",    label: "Operational reason preventing screening" },
+  /* 16 Nov 2026 (the owner): a reason that fits neither - the words below carry it. */
+  { k: "OTHER",          label: "Other" }
 ];
 function holdCategoryLabel(k){
   for(var i = 0; i < HOLD_CATEGORIES.length; i++) if(HOLD_CATEGORIES[i].k === k) return HOLD_CATEGORIES[i].label;
@@ -17565,6 +17567,18 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.16.0", date: "16 November 2026", groups: [
+    { h:"Hold: a third reason", items:[
+      "Putting a subject on hold now offers <b>Other</b> beside the two categories, for a reason that fits neither. The explanation in words is still required."
+    ]},
+    { h:"Approve a hold or cancel from the mail", items:[
+      "The mail a Manager or App Admin receives for a hold or cancel request now has three buttons: <b>Approve</b>, <b>Review in app</b> and <b>Decline</b>.",
+      "<b>Approve</b> and <b>Decline</b> work without signing in: the button opens a short page with the request, and one more press confirms it. The decision is recorded under the name of the person the mail was sent to, exactly as if it was pressed in the app. Declining asks for a reason, which is sent to whoever asked.",
+      "Each link works once and expires after 7 days. A link opened after somebody has already decided says who decided and when, and changes nothing.",
+      "<b>Review in app</b> opens the subject in Subject Screening, where the request waits with its Approve / Refuse buttons.",
+      "Units held for the subject are released by the server when the hold or cancel is applied, whichever way it was approved."
+    ]}
+  ]},
   { version: "3.15.0", date: "15 November 2026", groups: [
     { h:"A procedure with no report no longer goes unnoticed", items:[
       "From the morning after a procedure’s scheduled date, if its procedure report has not been submitted, the site’s <b>Responsible CPM</b> and the <b>clinic manager</b> are told once by mail, and the subject is listed at the top of the daily mail every day until the report is submitted.",
@@ -20523,6 +20537,13 @@ async function boot(){
 
   /* "#delivery?site=..&inv=.." is the QR code on an invoice (v3.0.0, item 18). */
   if(location.hash === "#delivery" || location.hash.startsWith("#delivery?")){ return showDelivery(); }
+  /* "#review=<requestId>" is the Review in app button of a hold/cancel request mail
+     (16 Nov 2026). Kept in sessionStorage, because signing in goes to Microsoft and back
+     and the hash does not survive the trip; opened once the app is entered (openReviewLink). */
+  if(location.hash.startsWith("#review=")){
+    try{ sessionStorage.setItem(REVIEW_KEY, decodeURIComponent(location.hash.slice(8))); }catch(e){}
+    try{ history.replaceState(null, "", location.pathname + location.search); }catch(e){}
+  }
 
   /* NO ANSWER FROM THE SERVER, and this device holds a report taken offline: start on that,
      as the person who took it, rather than on the standalone sample data. */
@@ -20898,6 +20919,7 @@ function paintModeBar(){
 }
 function enterAppRest(){
   renderUserMenu();
+  if(openReviewLink()) return;
   render();
   paintOffline();
   /* Started with no network: no What’s New marker can be written, and the report is the
@@ -23813,6 +23835,7 @@ async function decideApproval(r, approve, note){
     if(out.audit) S.db.logs.unshift(out.audit);
     /* A screening override is written on the subject by the server; take its copy. */
     if(out.patient) mergePatient(out.patient, { authoritative:true });
+    takeReleasedUnits(out.released);
     /* A hold or a cancel (9 Nov 2026): the units go back once it is on the record. */
     if(approve && out.patient && STOP_BY_APPROVAL[r.kind]) await afterStopApplied(patient(out.patient.id), STOP_BY_APPROVAL[r.kind]);
     return out;
@@ -26658,6 +26681,38 @@ function holdBanner(p){
 }
 /* A hold or cancel waiting for a decision: who asked and why, and the buttons for whoever
    may act on it - Approve / Refuse for a Manager or App Admin, Withdraw for the asker. */
+/* REVIEW IN APP, from the request mail (16 Nov 2026). Opens the subject in Subject
+   Screening, where the request's banner carries Approve / Refuse; a request this person
+   cannot see, or one already decided, lands on QA Approval with a word saying so. Once:
+   the id is removed as it is read. Returns true when it drew the screen itself. */
+const REVIEW_KEY = "pivotal.review";
+/* The link followed in a tab where the app is already open changes only the hash - no
+   reload, so boot never sees it. Take it here too. */
+window.addEventListener("hashchange", () => {
+  if(!location.hash.startsWith("#review=")) return;
+  try{ sessionStorage.setItem(REVIEW_KEY, decodeURIComponent(location.hash.slice(8))); }catch(e){}
+  try{ history.replaceState(null, "", location.pathname + location.search); }catch(e){}
+  if(S.me && !$("#app").hidden) openReviewLink();
+});
+function openReviewLink(){
+  let id = "";
+  try{ id = sessionStorage.getItem(REVIEW_KEY) || ""; sessionStorage.removeItem(REVIEW_KEY); }catch(e){ return false; }
+  if(!id || !S.me) return false;
+  const r = approvals().find(x => x.requestId === id);
+  const pid = r && ((r.subject && r.subject.patientId) || r.subjectKey);
+  const p = pid ? patient(pid) : null;
+  const screenOk = NAV.some(i => i.k === "screening" && navAllowed(i));
+  if(r && p && screenOk){
+    SCR.patientId = p.id; go("screening");
+    if(r.status !== "PENDING") toast("This request was already " + (r.status === "USED" ? "approved" : r.status.toLowerCase()) + ".", "warn");
+    return true;
+  }
+  const qaOk = NAV.some(i => i.k === "batches" && navAllowed(i));
+  if(qaOk) go("batches");
+  toast(r ? "That subject could not be opened here; the request is on QA Approval." :
+    "That request is not one you can see from this account.", "warn");
+  return qaOk;
+}
 function stopRequestBanner(p){
   return ["SUBJECT_HOLD","SUBJECT_CANCEL"].map(kind => {
     const r = approvals().find(x => x.kind === kind && x.subjectKey === p.id && x.status === "PENDING");
@@ -26686,7 +26741,7 @@ function openStopDialog(p, kind){
         'screen failure and is not counted in the screen-failure rate. Units held for the subject are released. ' +
         '(If screening found the subject unsuitable, use <b>Disqualify</b> instead.)</p>') +
     (hold ? '<div class="field"><label class="req" for="stp-cat">Why — category</label><select id="stp-cat">' +
-        '<option value="">— choose —</option>' + SM.HOLD_CATEGORIES.map(c => '<option value="' + c.k + '">' + esc(c.label) + '</option>').join("") +
+        '<option value="">— choose —</option>' + SM.HOLD_CATEGORIES.map(c => '<option value="' + c.k + '">' + esc(c.k === "OTHER" ? "Other — explain below" : c.label) + '</option>').join("") +
       '</select></div>' : '') +
     '<div class="field"><label class="req" for="stp-why">Why — in words</label>' +
       '<textarea id="stp-why" maxlength="1000"></textarea></div>' +
@@ -26714,7 +26769,7 @@ async function sendSubjectStop(p, kind, input){
     const out = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/" + (kind === "HOLD" ? "hold" : "cancel"), input);
     if(out.request) putApproval(out.request);
     if(out.audit) S.db.logs.unshift(out.audit);
-    if(out.patient){ mergePatient(out.patient, { authoritative:true }); await afterStopApplied(p, kind); }
+    if(out.patient){ mergePatient(out.patient, { authoritative:true }); takeReleasedUnits(out.released); await afterStopApplied(p, kind); }
     return out;
   }
   /* Standalone: the same rule, written here. */
@@ -26737,6 +26792,16 @@ async function sendSubjectStop(p, kind, input){
 }
 /* Once a hold or a cancel is on the record: the status, and the units back. The server
    releases a unit to a clinical role only once the stored record says so, which it now does. */
+/* Since 16 Nov 2026 the server releases the units of a subject it puts on hold or cancels
+   (releaseStoppedUnits) and answers with them; take its rows so afterStopApplied finds
+   nothing left to release. */
+function takeReleasedUnits(rows){
+  if(!Array.isArray(rows)) return;
+  for(const d of rows){
+    const i = S.db.devices.findIndex(x => x.id === d.id);
+    if(i >= 0) S.db.devices[i] = d;
+  }
+}
 async function afterStopApplied(p, kind){
   if(!p) return;
   if(kind === "CANCEL") p.status = "CANCELLED";
