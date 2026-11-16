@@ -17567,6 +17567,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.16.2", date: "16 November 2026", groups: [
+    { h:"The subject's folder, and requests waiting for you", items:[
+      "<b>Folder</b> opened an empty window on some computers and stayed there. It now goes straight to the subject's folder in SharePoint; if the folder cannot be opened, the tab says why.",
+      "A request asked while you already had the app open did not appear on <b>QA Approval</b> until the page was reloaded. The screen now reads the requests each time you open it, and <b>Review in app</b> in the mail does too."
+    ]}
+  ]},
   { version: "3.16.1", date: "16 November 2026", groups: [
     { h:"Approvals: a second role counts", items:[
       "Somebody whose <b>Manager</b> or <b>App Admin</b> role is a second role (for example <b>Clinical PM + Manager</b>) was mailed requests but could neither see nor decide them, in the app or from the mail. They now see them on the subject and on QA Approval, and can approve or decline them from the mail."
