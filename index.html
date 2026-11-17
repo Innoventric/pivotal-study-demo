@@ -39611,9 +39611,14 @@ function openSubjectChat(p){
 /* Working copies, so Cancel really cancels rather than half-applying. */
 let PFR = [];
 
-function patientForm(p){
+/* REGISTRATION (17 Nov 2026, the owner): site first, then study or compassionate, then the
+   subject code, then "Create subject". The system says the subject was created and the SAME
+   window carries on as the subject's edit form, with the chat open in it. Editing later is
+   that same window, filled in. `justCreated` puts the "created" line at its top. */
+function patientForm(p, justCreated){
   const isNew = !p;
-  p = p || { id:uid("pat"), patientCode:"", siteId:visibleLocations().filter(l => l.type === "SITE")[0]?.id || "",
+  /* The site is chosen first, by hand (17 Nov 2026, the owner) - no longer pre-filled. */
+  p = p || { id:uid("pat"), patientCode:"", siteId:"",
              procedureDate:"", unicaSize:"", dsSize:"", status:"CREATED",
              submitted:false, fileLocked:false, notes:"", piNotes:"",
              customQuestions:[], reminders:[], images:[], caseFile:{} };
@@ -39622,7 +39627,7 @@ function patientForm(p){
   if(!p.screening) p.screening = blankScreening();
   if(!p.anat) p.anat = blankAnat();
   PFR = (p.reminders || []).map(r => ({ date:r.date, text:r.text, done:!!r.done }));
-  patientFormRender(p, isNew);
+  patientFormRender(p, isNew, justCreated);
 }
 
 /* THE CLINICAL QUESTIONS ON SCREENING. Since 16 Nov 2026 (the owner) this card shows every OPEN
@@ -39664,13 +39669,40 @@ function screeningChecksBlock(p){
     }).join("");
 }
 
-function patientFormRender(p, isNew){
-  modal(isNew ? "Register a subject" : "Edit " + p.patientCode,
+function patientFormRender(p, isNew, justCreated){
+  const siteField = '<div class="field"><label class="req" for="p-site">1. Site</label><select id="p-site">' +
+      (isNew ? '<option value="">— choose the site —</option>' : '') +
+      locationOptions(S.db.locations.filter(l => l.type === "SITE"), p.siteId) + '</select></div>';
+  const protoField =
+    /* PROTOCOL. Chosen here, and also on the Screening screen so it can be switched
+       without opening this form.
+
+       IT IS DECIDED FOR YOU WHEN THE SITE IS NOT IN THE STUDY - see siteInStudy(). That
+       is not a restriction dressed up as a rule: a site that has not opened is not
+       recruiting, so a patient treated there is compassionate use by definition, and
+       offering the other option would be offering something that cannot be true. Filling
+       in the site's opening date is what makes the choice live again, and the hint says
+       so rather than leaving somebody to discover it. */
+    '<div class="field"><label class="req" for="p-proto">2. Study or compassionate</label><select id="p-proto">' +
+      (isNew ? '<option value="">— choose —</option>' : '') +
+      PROTOCOLS.map(x => '<option value="' + x.k + '"' +
+        (!isNew && x.k === protocolOf(p) ? " selected" : "") + '>' + esc(x.label) + '</option>').join("") +
+      '</select>' +
+      '<div class="hint" id="p-proto-why"></div></div>';
+  const codeField = '<div class="field"><label class="req" for="p-code">3. Subject code</label>' +
+      '<input type="text" id="p-code" value="' + esc(p.patientCode) + '" autocomplete="off"></div>';
+  if(isNew){
+    modal("Register a subject",
+      '<div class="grid g3">' + siteField + protoField + codeField + '</div>' +
+      '<div class="hint">Once the subject is created, the questions and discussion open in this window.</div>',
+      '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
+      '<button class="btn btn-primary" id="p-save">Create subject</button>' +
+      '</div>' + whyBox("p-why"));
+  }else modal("Edit " + p.patientCode,
+    (justCreated ? '<div class="okbox" style="margin-bottom:10px"><b>Subject ' + esc(p.patientCode) +
+      ' created.</b> Ask questions or add comments below — the chat is open.</div>' : '') +
+    '<div class="grid g3">' + siteField + protoField + codeField + '</div>' +
     '<div class="grid g2">' +
-    '<div class="field"><label class="req" for="p-code">Subject code</label>' +
-      '<input type="text" id="p-code" value="' + esc(p.patientCode) + '"></div>' +
-    '<div class="field"><label class="req" for="p-site">Site</label><select id="p-site">' +
-      locationOptions(S.db.locations.filter(l => l.type === "SITE"), p.siteId) + '</select></div>' +
     '<div class="field"><label for="p-date">Procedure date</label>' +
       /* Read-only since 2 Oct 2026: a procedure date is set by ordering its products, at
          stage 9 or 10 of the Screening screen - never typed in here on its own. */
@@ -39687,34 +39719,15 @@ function patientFormRender(p, isNew){
         esc(PT_STATUS[k].label) + '</option>').join("") + '</select>' +
       '<div class="hint">Tracked automatically; correcting it by hand is audit-logged. To stop a ' +
       'subject, use <b>Disqualify subject</b> on the Screening screen.</div></div>' +
-    /* PROTOCOL. Chosen here, and also on the Screening screen so it can be switched
-       without opening this form.
-
-       IT IS DECIDED FOR YOU WHEN THE SITE IS NOT IN THE STUDY - see siteInStudy(). That
-       is not a restriction dressed up as a rule: a site that has not opened is not
-       recruiting, so a patient treated there is compassionate use by definition, and
-       offering the other option would be offering something that cannot be true. Filling
-       in the site's opening date is what makes the choice live again, and the hint says
-       so rather than leaving somebody to discover it. */
-    '<div class="field"><label for="p-proto">Protocol</label><select id="p-proto">' +
-      PROTOCOLS.map(x => '<option value="' + x.k + '"' +
-        (x.k === protocolOf(p) ? " selected" : "") + '>' + esc(x.label) + '</option>').join("") +
-      '</select>' +
-      '<div class="hint" id="p-proto-why">A compassionate case keeps its full record and is ' +
-      'treated exactly the same, but is counted out of the study\'s own figures — the ' +
-      'eligible count and the implanted count. Changeable at any stage until the report is ' +
-      'finally locked.</div></div>' +
     '</div>' +
     /* Notes and "To discuss with the PI" are gone (16 Nov 2026, the owner): the subject chat
        below replaces them and the medical questions. Their old text is in the chat. */
-    screeningChecksBlock(p) +
     '<h3 style="margin:16px 0 7px">Medical questions for this subject</h3>' +
-    (isNew || !patient(p.id)
-      ? '<div class="hint">Register the subject first — the questions and discussion open once it is saved.</div>'
-      : chatPanelHtml(p, "full")) +
+    chatPanelHtml(p, "full") +
+    screeningChecksBlock(p) +
     remindersBlock(),
-    '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
-    '<button class="btn btn-primary" id="p-save">' + (isNew ? "Register" : "Save") + '</button>' +
+    '<div class="row"><button class="btn" data-close="1">' + (justCreated ? "Close" : "Cancel") + '</button>' +
+    '<button class="btn btn-primary" id="p-save">Save</button>' +
     '</div>' + whyBox("p-why"));
   /* Wide (v3.0.0, item 14): the form holds a dozen fields and a list of questions. */
   const pfm = $("#modal-root .modal"); if(pfm) pfm.classList.add("modal-wide");
@@ -39725,6 +39738,12 @@ function patientFormRender(p, isNew){
   const paintProtocol = () => {
     const sel = $("#p-proto"), why = $("#p-proto-why"), site = $("#p-site");
     if(!sel || !site) return;
+    /* Site first (17 Nov 2026): until one is chosen there is nothing to decide. */
+    if(!site.value){
+      sel.disabled = true; sel.value = "";
+      if(why) why.innerHTML = 'Choose the site first.';
+      return;
+    }
     const inStudy = studyAllowedFor(p, site.value);
     sel.disabled = !inStudy;
     if(!inStudy){
@@ -39754,14 +39773,15 @@ function patientFormRender(p, isNew){
     $$("[data-rt]").forEach(i => { PFR[+i.dataset.rt].text = i.value; });
   };
   const redraw = () => {
-    const snap = { code:$("#p-code").value, date:$("#p-date").value,
-                   st:$("#p-st").value, site:$("#p-site").value, proto:$("#p-proto").value };
-    patientFormRender(p, isNew);
-    $("#p-code").value = snap.code; $("#p-date").value = snap.date;
-    $("#p-st").value = snap.st; $("#p-site").value = snap.site;
+    const snap = { code:$("#p-code").value, date:($("#p-date") || {}).value,
+                   st:($("#p-st") || {}).value, site:$("#p-site").value, proto:$("#p-proto").value };
+    patientFormRender(p, isNew, justCreated);
+    $("#p-code").value = snap.code; if($("#p-date")) $("#p-date").value = snap.date;
+    if($("#p-st")) $("#p-st").value = snap.st; $("#p-site").value = snap.site;
     $("#p-proto").value = snap.proto;
   };
-  $("#r-add").onclick = () => { keep(); PFR.push({ date:"", text:"", done:false }); redraw(); };
+  const radd = $("#r-add");
+  if(radd) radd.onclick = () => { keep(); PFR.push({ date:"", text:"", done:false }); redraw(); };
   $$("[data-rdel]").forEach(b => b.onclick = () => {
     keep(); PFR.splice(+b.dataset.rdel, 1); redraw(); });
 
@@ -39777,14 +39797,20 @@ function patientFormRender(p, isNew){
   $("#p-save").onclick = async () => {
     keep();
     const code = $("#p-code").value.trim();
+    /* In the order they are asked (17 Nov 2026). */
+    if(!$("#p-site").value) return showWhy("p-why", "Choose the site first.");
+    if(!$("#p-proto").value) return showWhy("p-why", "Choose study or compassionate.");
     if(!code) return showWhy("p-why", "A subject code is required.");
+    if(isNew && S.db.patients.some(x => x.id !== p.id && String(x.patientCode || "").trim().toLowerCase() === code.toLowerCase()))
+      return showWhy("p-why", "A subject with the code " + code + " already exists.");
     const before = p.status;
     const protoBefore = protocolOf(p);
     p.patientCode = code;
     p.siteId = $("#p-site").value;
-    p.procedureDate = $("#p-date").value;
-    /* Implant/DS size is NOT set here — the anatomical evaluation is its source. */
-    p.status = $("#p-st").value;
+    if($("#p-date")) p.procedureDate = $("#p-date").value;
+    /* Implant/DS size is NOT set here — the anatomical evaluation is its source. A new
+       subject is created as CREATED; the status field is on the edit form only. */
+    if($("#p-st")) p.status = $("#p-st").value;
     /* Read from the site, not from the control: a disabled select is easy to re-enable
        from a console, and this is the rule rather than a convenience. */
     p.protocol = studyAllowedFor(p, $("#p-site").value) ? $("#p-proto").value : "COMPASSIONATE";
@@ -39825,11 +39851,20 @@ function patientFormRender(p, isNew){
       logProtocol();
     };
 
+    /* Created: say so, and keep the SAME window open as the subject's edit form, with the
+       chat in it (17 Nov 2026, the owner). An edit closes as before. */
+    const done = () => {
+      if(isNew){
+        toast("Subject " + code + " created.", "good");
+        render();
+        patientForm(patient(p.id) || p, true);
+      }else{ closeModal(); toast("Saved.", "good"); render(); }
+    };
     if(S.backend){
       const btn = $("#p-save"); btn.disabled = true;
       try{
         await savePatientRemote(p);            // creates or updates, merges into S.db
-        logSave(); closeModal(); toast("Saved.", "good"); render();
+        logSave(); done();
       }catch(e){
         btn.disabled = false;
         showWhy("p-why", e.code === "CONFLICT"
@@ -39841,7 +39876,7 @@ function patientFormRender(p, isNew){
 
     if(isNew) S.db.patients.push(p);
     logSave();
-    commit(); closeModal(); toast("Saved.", "good"); render();
+    commit(); done();
   };
 }
 
