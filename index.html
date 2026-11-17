@@ -180,6 +180,7 @@ textarea{min-height:70px; resize:vertical;}
 .pf-img{max-width:100%; max-height:60vh; display:block; margin:0 auto;}
 .pf-frame{width:100%; height:60vh; border:0; background:#fff;}
 .req::after{content:" *"; color:var(--brand-md);}
+.hint.req-note{color:var(--bad-fg); font-weight:600;}
 
 /* Validation. Refusals used to render into a .hint at 2.88:1, 11.5px, pushed to the
    far right of the card footer — visually indistinguishable from nothing happening.
@@ -11700,8 +11701,11 @@ function scoringGaps(a){
     var missing = SCORING_CRITERIA.filter(function(c){ return !String(row[c.k] || "").trim(); }).length;
     if(missing) out.push("Scoring: " + missing + " criteria not scored for " + name);
   });
-  if(!sc.decision) out.push("Scoring: the conclusion");
-  else if(sc.decision === "ELIGIBLE" && !String(sc.chosenSize || "").trim()) out.push("Scoring: the recommended implant size");
+  /* THE CONCLUSION IS TWO DECISIONS (v3.19.0, 17 Nov 2026, the owner): the anatomical decision AND
+     the implant size - the size is asked whatever the decision, unless the anatomy is unsuitable
+     (there is no size to choose). It used to be asked only for ELIGIBLE. */
+  if(!sc.decision) out.push("Scoring: the anatomical decision");
+  if(sc.decision !== "UNSUITABLE" && !String(sc.chosenSize || "").trim()) out.push("Scoring: the recommended implant size");
   return out;
 }
 /* The Digital Model's recommendation (16 Nov 2026). */
@@ -11743,7 +11747,7 @@ function stageRequired(s){
   if(s.kind === "ops")   return [];
   /* Eligibility is two approvals and an arm. The arm is what stage 9 acts on, so a
      stage that closed without it would leave the randomisation with nothing to read. */
-  if(s.kind === "approval") return [["eligibleByInnoventric","Subject eligible by Innoventric"],
+  if(s.kind === "approval") return [["eligibleByInnoventric","Clinical suitability is evaluated and approved by Innoventric"],
                                     ["committeeApproval","Eligibility committee approval"]];
   /* MOVED 2026-08-12: the arm is allocated HERE now, not at stage 8 - randomisation and
      scheduling are one act. Hospital and Physician are gone: the hospital is already the
@@ -11855,7 +11859,22 @@ function stageTouched(p, s){
     return !admin[k] && String(a[k] || "").trim() !== "";
   });
 }
-function stageMissing(p, s){
+/* THE DIGITAL MODEL IN TWO PARTS (v3.19.0, 17 Nov 2026, the owner). 2.1 is the evaluator's: the
+   measurements, the files and the initial recommendation (suitability, size, angles, PM).
+   Confirming 2.1 mails the Anatomical evaluation team and gives them the task of 2.2: the
+   scoring, the conclusion (anatomical decision + implant size) and whether a physical model is
+   needed. Completing 2.2 completes the stage, and the clinic managers decide feasibility (PRINT
+   GATE). A stage completed before this has no part1 stamp and is read as done. */
+function hasParts(s){ return !!(s && s.modelGate); }
+function part1Of(p){ return ((p && p.anat && p.anat.model3d) || {}).part1 || null; }
+function part1Done(p){
+  var a = (p && p.anat && p.anat.model3d) || {};
+  return !!(a.part1 && a.part1.at) || a.status === "Completed";
+}
+/* opts.part: 1 = only what 2.1 asks, 2 = only what 2.2 asks; none = the whole stage. */
+function stageMissing(p, s, opts){
+  var part = (opts && opts.part) || 0;
+  if(!hasParts(s)) part = 0;
   var a = (p.anat || {})[s.k] || {};
   /* Booleans are checked as booleans. Coercing them to text the way the other fields
      are compared would read `false` as the four-character string "false" - which is not
@@ -11876,7 +11895,7 @@ function stageMissing(p, s){
   var value = function(f){
     return (s.kind === "sched" && f === "studyArm") ? studyArmOf(p) : a[f];
   };
-  var out = required.filter(function(r){ return empty(value(r[0])); })
+  var out = part === 2 ? [] : required.filter(function(r){ return empty(value(r[0])); })
                     .map(function(r){ return r[1]; });
   /* An approval somebody else has to give is a requirement like any other, and belongs
      in the same list so it appears wherever missing content is reported. */
@@ -11889,18 +11908,19 @@ function stageMissing(p, s){
      to Anatomical Evaluation. Confirming, and confirming again after a reopen, both ask. */
   if(s.kind === "eval" && a.status !== "Completed"){
     var suit = suitabilityOf(a.suitability);
-    if(suit === SUIT.UNSUITABLE){
+    var p1 = part !== 2, p2 = part !== 1;
+    if(p1 && suit === SUIT.UNSUITABLE){
       if(empty(a.unsuitableReason)) out.push("Why the subject is not suitable");
       if(!anatFilesOf(p, s.k).length) out.push("An image or PDF showing why");
     }
     /* 16 Nov 2026 (the owner): unsure of the size = two sizes, and they must differ. */
-    if(suit === SUIT.SIZE_TBC){
+    if(p1 && suit === SUIT.SIZE_TBC){
       if(empty(a.altSize)) out.push("Alternative size");
       else if(String(a.altSize) === String(a.size || "")) out.push("An alternative size different from the recommended one");
     }
-    if(suit === SUIT.CHALLENGING && empty(a.challengeReason)) out.push("What makes the anatomy challenging");
-    if(s.scoring) out = out.concat(scoringGaps(a));
-    if(s.modelGate && suit !== SUIT.UNSUITABLE){
+    if(p1 && suit === SUIT.CHALLENGING && empty(a.challengeReason)) out.push("What makes the anatomy challenging");
+    if(p2 && s.scoring) out = out.concat(scoringGaps(a));
+    if(p2 && s.modelGate && suit !== SUIT.UNSUITABLE){
       if(empty(a.modelNeed)) out.push("Physical model needed or not");
       else if(empty(a.modelNeedWhy)) out.push("Why (physical model)");
     }
@@ -11910,8 +11930,10 @@ function stageMissing(p, s){
      images of the 3D model and two of the pliable model, and the patient presentation
      at stage 8. The same rule as above - asked only of a stage not yet Completed, so
      nothing already signed off reopens. */
-  var gap = stageFileGap(p, s);
+  var gap = part === 2 ? "" : stageFileGap(p, s);
   if(gap && a.status !== "Completed") out.push(gap);
+  /* The whole stage: 2.1 has to have been confirmed (it is what told the evaluation team). */
+  if(!part && hasParts(s) && a.status !== "Completed" && !part1Done(p)) out.unshift("2.1 confirmed");
   return out;
 }
 /* Where each stage files its documents, under the patient's folder. A stage not named
@@ -12250,14 +12272,102 @@ function orderCancelled(p){
    and no longer the Responsible CPM of the HQ location.
    Returns the stored value (a user id, which in served mode is the email), or "".
    One function, read by the page, the server and the daily mail. */
+/* SINCE v3.19.0 (17 Nov 2026, the owner) the two jobs are separate ticks. "Clinic manager" may be on
+   MANY people - they decide clinical feasibility (clinicManagersOf). The tasks of a site with no
+   Responsible CPM stay with ONE person ("Chen is responsible to close open tasks"): the person
+   ticked "Takes tasks of sites with no CPM" (taskFallback). Until somebody is ticked that, the
+   first clinic manager takes them - exactly what happened while only one could be ticked, so
+   production keeps working on the day this ships. The name is kept: every reader of it means
+   "who takes the unowned tasks". */
+function internalUser(u){ return !!u && String(u.accessType || "").toUpperCase() !== "EXTERNAL"; }
+function userKey(u){ return String(u.id || u.email || "").trim(); }   // served mode: id IS the email
 function clinicManagerOf(users){
   var list = users || [];
   for(var i = 0; i < list.length; i++){
-    var u = list[i];
-    if(u && u.clinicManager === true && String(u.accessType || "").toUpperCase() !== "EXTERNAL")
-      return String(u.id || u.email || "").trim();   // served mode: id IS the email
+    if(internalUser(list[i]) && list[i].taskFallback === true) return userKey(list[i]);
+  }
+  for(var j = 0; j < list.length; j++){
+    if(internalUser(list[j]) && list[j].clinicManager === true) return userKey(list[j]);
   }
   return "";
+}
+/* ---- SUBJECT CODES (v3.19.0, 17 Nov 2026, the owner) ------------------------------------------
+   A STUDY subject's code is given by the system: the site's study number (401, set on the
+   location, unique) and a running number at that site in the order subjects were created -
+   401-01, 401-02. Compassionate (CU) subjects are not numbered: their code is their initials,
+   typed. Existing subjects keep the code they have. Switching protocol:
+     Study -> CU   keeps the number and adds "-CU"            401-03 -> 401-03-CU
+     CU -> Study   a "-CU" that was a study number drops it   401-03-CU -> 401-03
+                   initials get the next automatic number     AB -> 401-04
+   One function, used by the page (before showing the code) and by caseService (the authority). */
+function siteNumberOk(n){ return /^\d{3}$/.test(String(n == null ? "" : n).trim()); }
+function studyProto(p){ return String((p && p.protocol) || "STUDY").trim().toUpperCase() !== "COMPASSIONATE"; }
+var AUTO_CODE_RE = /^\d{3}-\d{2,}$/;
+function nextStudyCode(siteNumber, patients){
+  var num = String(siteNumber).trim(), max = 0;
+  var re = new RegExp("^" + num + "-(\\d+)(-CU)?$", "i");
+  (patients || []).forEach(function(p){
+    var m = re.exec(String((p && p.patientCode) || "").trim());
+    if(m && +m[1] > max) max = +m[1];
+  });
+  var n = String(max + 1);
+  return num + "-" + (n.length < 2 ? "0" + n : n);
+}
+var NO_SITE_NUMBER = "This site has no site number yet. An App Admin or a Manager sets it on " +
+  "Administration -> Locations before a study subject can be numbered there.";
+/* prev: the stored subject (null when new); next: what is being saved. Returns { code } or
+   { error, errCode }. Never changes anything itself. */
+function subjectCodeFor(prev, next, siteNumber, patients){
+  var study = studyProto(next), num = String(siteNumber == null ? "" : siteNumber).trim();
+  var typed = String((next && next.patientCode) || "").trim(), code;
+  if(!prev){
+    if(study){
+      if(!siteNumberOk(num)) return { error: NO_SITE_NUMBER, errCode: "NO_SITE_NUMBER" };
+      code = nextStudyCode(num, patients);
+    }else code = typed;
+  }else{
+    var was = studyProto(prev), old = String(prev.patientCode || "").trim();
+    if(was && !study) code = /-CU$/i.test(old) ? old : old + "-CU";
+    else if(!was && study){
+      var m = /^(\d{3}-\d{2,})-CU$/i.exec(old);
+      if(m) code = m[1];
+      else{
+        if(!siteNumberOk(num)) return { error: NO_SITE_NUMBER, errCode: "NO_SITE_NUMBER" };
+        code = nextStudyCode(num, patients);
+      }
+    }
+    else if(study && AUTO_CODE_RE.test(old)) code = old;    // a given number is not retyped
+    else code = typed || old;
+  }
+  if(!code) return { error: "A subject code is required.", errCode: "NO_CODE" };
+  var lc = code.toLowerCase(), id = next && next.id;
+  for(var i = 0; i < (patients || []).length; i++){
+    var o = patients[i];
+    if(o && o.id !== id && String(o.patientCode || "").trim().toLowerCase() === lc)
+      return { error: "A subject with the code " + code + " already exists.", errCode: "DUPLICATE_CODE" };
+  }
+  return { code: code };
+}
+/* Another site already holding this number, or null. */
+function siteNumberHolder(locations, siteId, n){
+  var v = String(n == null ? "" : n).trim();
+  if(!v) return null;
+  for(var i = 0; i < (locations || []).length; i++){
+    var l = locations[i];
+    if(l && l.id !== siteId && String(l.siteNumber || "").trim() === v) return l;
+  }
+  return null;
+}
+
+/* Everyone ticked Clinic manager (internal only). */
+function clinicManagersOf(users){
+  return (users || []).filter(function(u){ return internalUser(u) && u.clinicManager === true; }).map(userKey)
+    .filter(Boolean);
+}
+/* The Anatomical evaluation team (v3.19.0): ticked on Administration -> Users. */
+function evalTeamOf(users){
+  return (users || []).filter(function(u){ return internalUser(u) && u.anatEvalTeam === true; }).map(userKey)
+    .filter(Boolean);
 }
 function responsibleCpm(locations, siteId, users){
   var list = locations || [];
@@ -12315,7 +12425,10 @@ var api = {
   stageFileCount: stageFileCount,
   stageFileGap: stageFileGap,
   responsibleCpm: responsibleCpm,
-  clinicManagerOf: clinicManagerOf,
+  clinicManagerOf: clinicManagerOf, clinicManagersOf: clinicManagersOf, evalTeamOf: evalTeamOf,
+  siteNumberOk: siteNumberOk, nextStudyCode: nextStudyCode, subjectCodeFor: subjectCodeFor,
+  siteNumberHolder: siteNumberHolder,
+  hasParts: hasParts, part1Of: part1Of, part1Done: part1Done,
   SUIT: SUIT, suitabilityOf: suitabilityOf, suitabilityOptions: suitabilityOptions,
   scoringGaps: scoringGaps, MODEL_NEED: MODEL_NEED, modelNeedLabel: modelNeedLabel,
   PRINT_GATE_STAGES: PRINT_GATE_STAGES, printGateApplies: printGateApplies,
@@ -14182,6 +14295,13 @@ const ROOM_CHECKS = [
   "Backup device available in the room"
 ];
 
+/* AT THE END OF THE PROCEDURE (v3.19.0, 17 Nov 2026, the owner): two optional ticks, in his words.
+   Optional - neither holds back the submission. Stored as caseFile.postChecks[i]. */
+const POST_CHECKS = [
+  "I handed over the patient card",
+  "The physician filled in the patient questionnaire"
+];
+
 /* Kept for reading back reports written before verification became per-unit. A locked
    record must print exactly as it was signed, so this list cannot be tidied away. */
 const DEVICE_CONFIRMS = [
@@ -14240,13 +14360,28 @@ function fmtDur(m){
   return Math.floor(m / 60) + "h " + String(m % 60).padStart(2, "0") + "m";
 }
 
-function contrastTotal(c){
+/* CF AND SALINE (v3.19.0, 17 Nov 2026, the owner). A PURE injection has one volume. A DILUTED one
+   has two: the contrast fluid (CF) and the saline it was diluted with. The CF is kept in the
+   same key the single volume always used (contrast<i>Vol), the saline in contrast<i>Saline.
+   Two totals: TOTAL CF counts the contrast only - every Vol, pure or diluted - and TOTAL
+   INJECTION VOLUME counts everything injected, CF + saline. A report written before this has
+   no saline anywhere, so its diluted volumes count as undiluted (the owner: "leave them as not
+   diluted") and its two totals are equal. */
+function sumKey(c, suffix){
   let sum = 0, any = false;
   for(const i of CONTRAST_ROWS){
-    const v = parseFloat((c || {})["contrast" + i + "Vol"]);
+    const v = parseFloat((c || {})["contrast" + i + suffix]);
     if(!isNaN(v)){ sum += v; any = true; }
   }
   return any ? sum : null;
+}
+function contrastTotal(c){ return sumKey(c, "Vol"); }                 // TOTAL CF
+function contrastDiluted(c, i){ return String((c || {})["contrast" + i + "Form"] || "") === "Diluted"; }
+function contrastAnyDiluted(c){ return CONTRAST_ROWS.some(i => contrastDiluted(c, i)); }
+function contrastInjectionTotal(c){                                   // CF + saline
+  const cfv = sumKey(c, "Vol"), sal = sumKey(c, "Saline");
+  if(cfv === null && sal === null) return null;
+  return (cfv || 0) + (sal || 0);
 }
 function fmtContrast(v){ return v === null ? "—" : String(Math.round(v * 100) / 100); }
 
@@ -14304,8 +14439,9 @@ function recommendationOf(p, stages){
 }
 
 const api = {
-  TRAINING_ITEMS, DEVICE_CHECKS, ROOM_CHECKS, DEVICE_CONFIRMS, CONTRAST_ROWS, PT_STATUS,
+  TRAINING_ITEMS, DEVICE_CHECKS, ROOM_CHECKS, POST_CHECKS, DEVICE_CONFIRMS, CONTRAST_ROWS, PT_STATUS,
   statusLabel, minsBetween, fmtDur, contrastTotal, fmtContrast, pressureText,
+  contrastDiluted, contrastAnyDiluted, contrastInjectionTotal,
   angleKey, angleTextOf, recommendationOf
 };
 
@@ -14904,7 +15040,7 @@ const SESSION_KEY = DEMO ? "pivotal.demo.session"    : "pivotal.localsession";
    any other value (or none) is replaced by a fresh seed, once. Raise this whenever seed()
    changes in a way an old copy would show wrongly. Demo only: in the live app the local
    copy is a cache of the server and is never reseeded. */
-const DEMO_SEED_VERSION = 3;   // 3 (15 Nov 2026): a seeded procedure two days ago with no report
+const DEMO_SEED_VERSION = 4;   // 4 (17 Nov 2026, v3.19.0): site numbers, a clinic manager, an evaluation team member; 3 (15 Nov 2026): a seeded procedure two days ago with no report
 /* Half-finished inspections and shipments. The case file has autosaved from the
    start; these two screens did not, so a phone locking mid-inspection threw the
    work away silently. Two adjacent screens behaving oppositely is its own bug. */
@@ -15654,6 +15790,14 @@ function seed(){
     { id:"usr-prod",  name:"Alex Morgan", email:"production@example.com", role:"EMPLOYEE", locationId:"loc-hq", title:"Production Specialist", phone:"+1-555-0110" },
     { id:"usr-wh",    name:"Jordan Meyer",   email:"warehouse@example.com", role:"WH_ADMIN", locationId:"loc-wh-1", title:"Warehouse Manager", phone:"+1-555-0108" }
   ];
+  /* v3.19.0: the sample hospitals carry site numbers, so a Study subject can be registered
+     and numbered in the demo; the App Admin is a clinic manager and Noam on the evaluation team, so
+     the new Digital Model steps have somebody to go to (the App Admin as clinic manager). Set here rather than in the rows
+     above so the demo build's de-identification rules, which match those rows, are untouched. */
+  { const nums = { "loc-site-a":"401", "loc-site-b":"402", "loc-site-c":"403" };
+    for(const l of L) if(nums[l.id]) l.siteNumber = nums[l.id];
+    const adm = U.find(u => u.id === "usr-admin"); if(adm) adm.clinicManager = true;
+    const noam = U.find(u => u.id === "usr-emp"); if(noam) noam.anatEvalTeam = true; }
   let n = 1000;
   /* REF and SN are built from the real Innoventric label scheme, so a seeded device
      is indistinguishable from a scanned one and the QR cross-check exercises the same
@@ -16068,7 +16212,14 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                               "orderCancel",
                               /* the subject chat and the print gate (16 Nov 2026): written
                                  only by POST /api/patients/:id/chat and /print-gate */
-                              "chat", "printGate"];
+                              "chat", "printGate",
+                              /* the subject code (v3.19.0): a study subject is numbered by
+                                 the server (caseService.settleSubjectCode). It is typed only
+                                 in the registration window, saved by its button, so nothing
+                                 typed can be in the air when the reply lands. */
+                              "patientCode",
+                              /* the unused-units task (v3.19.0): written only by its routes */
+                              "unusedTask"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -18178,6 +18329,32 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.19.0", date: "17 November 2026", groups: [
+    { h:"Registering a subject", items:[
+      "A <b>Study</b> subject is numbered by the app: the site number and a running number at that site — <b>401-01</b>, <b>401-02</b>. Every hospital site has a <b>Site number</b> (Administration → Locations), and no two sites share one. A compassionate subject is not numbered: type the initials.",
+      "A Study subject moved to compassionate keeps the number with <b>-CU</b> added (401-03-CU). A compassionate subject moved to Study gets the next number at the site.",
+      "<b>Initial Subject Data</b> is required when a subject is created."
+    ]},
+    { h:"Digital Model Evaluation in two parts", items:[
+      "<b>2.1</b>: the measurements, the images and the initial recommendation. <b>Done with 2.1</b> emails the <b>Anatomical evaluation team</b> (a tick on Administration → Users) and gives them the task.",
+      "<b>2.2</b>: the team scores it and concludes with <b>two decisions</b> — the anatomical decision and the implant size — and whether a physical model is needed.",
+      "Then every <b>Clinic manager</b> and every Clinical PM is told, and any clinic manager decides whether the subject is clinically feasible. Several people can now be ticked Clinic manager; the tasks of a site with no Clinical PM go to the one person ticked <b>Sites with no CPM</b>."
+    ]},
+    { h:"Procedure report", items:[
+      "A <b>diluted</b> injection asks for the <b>CF</b> volume and the <b>saline</b> volume separately. <b>Total CF</b> counts the contrast only; <b>Total injection volume</b> counts both. Reports written before this read as undiluted.",
+      "There is no Submit button any more. <b>Save and close</b> submits the report when nothing is outstanding, and only saves when something is.",
+      "On submitting, you are asked whether the team took the unused units. If yes, they go back hand-carried and the warehouse managers and App Admins are told. If not, they stay at the site and the App Admins and warehouse managers get a task to keep them there or send them to a warehouse.",
+      "Two optional ticks at the end: <b>I handed over the patient card</b> and <b>The physician filled in the patient questionnaire</b>.",
+      "When alternative devices were used, <b>Reason</b> and <b>Failure detail</b> now say plainly that they are required."
+    ]},
+    { h:"Email", items:[
+      "The full summary now arrives on <b>Sunday</b> morning only.",
+      "On the other days you get a short mail of <b>your own tasks</b> — only if you have open tasks and one of them changed (done, taken away, a new date, now due or late, a chat item you were tagged in, or a reminder). A new task still comes in its own mail."
+    ]},
+    { h:"Wording", items:[
+      "Eligibility &amp; Approvals: <b>Clinical suitability is evaluated and approved by Innoventric</b>."
+    ]}
+  ]},
   { version: "3.18.0", date: "16 November 2026", groups: [
     { h:"Questions and discussion on every subject", items:[
       "<b>Notes</b> and <b>To discuss with the PI</b> are gone from Subject Registration. In their place, and in place of the medical questions, each subject has a <b>chat</b>: ask a question or add a comment, reply, <b>tag</b> people, mark an item <b>Critical</b> or <b>Solved</b>, <b>Reopen</b> it, <b>Bump</b> it back to the top, and set a <b>reminder</b> for a user.",
@@ -21892,6 +22069,22 @@ function todoItems(){
   /* 0 (chat) — THE SUBJECT CHAT (16 Nov 2026): open questions and tasks this person is
      tagged in, or holds as the site's CPM; reminders set for them that have come due; and,
      for the Clinical Manager, the feasibility decisions waiting after the Digital Model. */
+  /* Unused units left at a site after a procedure (v3.19.0): the App Admins' and warehouse
+     managers' task - keep them there or send them to a warehouse. */
+  for(const p of unusedTasksForMe()) out.push({ ic:"alert", tone:"t-amber", view:"home", patientId:p.id,
+    title: p.unusedTask.units.length + " unused unit(s) at " + locName(p.unusedTask.siteId) + " — keep or send back?",
+    sub: "After " + p.patientCode + "'s procedure · " + p.unusedTask.units.map(u => u.sn).join(", "),
+    onOpen: () => askUnusedDecision(p) });
+  /* 2.2 waiting on the Anatomical evaluation team (v3.19.0): 2.1 confirmed, stage still open. */
+  const myTeam = idsToEmails(AnatStages.evalTeamOf(S.db.users || [])).includes(myEmailLc());
+  const toScore = myTeam ? activePatients().filter(p => inPatientScope(p.siteId) && !SM.isOnHold(p) &&
+    p.anat && p.anat.model3d && p.anat.model3d.part1 && p.anat.model3d.status !== "Completed" &&
+    p.anat.model3d.status !== "Not required") : [];
+  for(const p of toScore) out.push({ ic:"case", tone:"t-blue", view:"screening", patientId:p.id,
+    title: p.patientCode + " — score the digital model (2.2)",
+    sub: "2.1 confirmed by " + (p.anat.model3d.part1.byName || p.anat.model3d.part1.by) + " · " +
+         fmtTs(p.anat.model3d.part1.at),
+    onOpen: () => { SCR.patientId = p.id; go("screening"); } });
   const pg = mayDecidePrintGate() ? activePatients().filter(p => inPatientScope(p.siteId) && AnatStages.printGatePending(p)) : [];
   for(const p of pg) out.push({ ic:"alert", tone:"t-red", view:"screening", patientId:p.id,
     title: p.patientCode + " — clinical feasibility to decide",
@@ -25493,6 +25686,7 @@ function seedProcDate(p){
   if(!c.procDate && p.procedureDate) c.procDate = String(p.procedureDate).slice(0, 10);
 }
 
+const FAIL_REQ_HINT = "Required — alternative devices were used.";
 function migrateContrast(p){
   const c = p && p.caseFile;
   if(!c || p.fileLocked) return;
@@ -25534,7 +25728,7 @@ function tf(p, key, label, type, opts){
         '<input type="' + type + '" id="' + fid + '" data-cf="' + key + '" value="' + esc(v) + '"' + ro(p) +
         (opts.step ? ' step="' + opts.step + '"' : "") + '>' + nowBtn +
         (nowBtn ? '</div>' : "")) +
-    (opts.hint ? '<div class="hint">' + esc(opts.hint) + '</div>' : "") + '</div>';
+    (opts.hint ? '<div class="hint' + (opts.hintReq ? ' req-note' : '') + '">' + esc(opts.hint) + '</div>' : "") + '</div>';
 }
 
 /* A pressure is three numbers and the moment they were read, not one number.
@@ -26364,17 +26558,25 @@ function contrastBlock(p){
          time somebody reconstructed; a time the app wrote is the time it actually was.
          Never overwritten once set - a correction is a correction. */
       tf(p, "contrast" + i + "Time", "Injection " + i + " — time", "time") +
-      tf(p, "contrast" + i + "Vol", "Injection " + i + " — volume (mL)", "number") +
+      /* The form first (v3.19.0): it decides whether there is one volume or two. Pure - one
+         box; Diluted - CF and saline, each its own box (PD.contrastInjectionTotal). */
       '<div class="field"><label for="cf-contrast' + i + 'Form">Injection ' + i + ' — form</label>' +
         '<select id="cf-contrast' + i + 'Form" data-cf="contrast' + i + 'Form"' + ro(p) + '>' +
         ["","Pure","Diluted"].map(o =>
           '<option' + (c["contrast" + i + "Form"] === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
         '</select></div>' +
+      (PD.contrastDiluted(c, i)
+        ? tf(p, "contrast" + i + "Vol", "Injection " + i + " — CF volume (mL)", "number") +
+          tf(p, "contrast" + i + "Saline", "Injection " + i + " — saline volume (mL)", "number")
+        : tf(p, "contrast" + i + "Vol", "Injection " + i + " — volume (mL)", "number")) +
       tf(p, "contrast" + i + "Note", "Injection " + i + " — notes", "text") +
     '</div>').join("") +
   '<div class="grid g2" style="margin:4px 0 12px">' +
-    '<div class="calc"><small>Total contrast volume (computed, mL)</small>' +
+    '<div class="calc"><small>Total CF (computed, mL)</small>' +
       '<b id="calc-contrast">' + fmtContrast(contrastTotal(c)) + '</b></div>' +
+    (PD.contrastAnyDiluted(c)
+      ? '<div class="calc"><small>Total injection volume — CF + saline (computed, mL)</small>' +
+        '<b id="calc-inj">' + fmtContrast(PD.contrastInjectionTotal(c)) + '</b></div>' : '') +
   '</div>';
 }
 function fmtContrast(v){ return PD.fmtContrast(v); }function fmtContrast(v){ return v === null ? "—" : String(Math.round(v * 100) / 100); }
@@ -26705,12 +26907,22 @@ VIEWS.screening = {
       const wasCompassionate = isCompassionate(p);
       const nameOf = k => (PROTOCOLS.find(x => x.k === k) || {}).label || k;
       const from = protocolOf(p);
+      /* THE CODE FOLLOWS THE PROTOCOL (v3.19.0, the owner): Study -> CU adds "-CU" to the number;
+         CU -> Study drops a "-CU" that was a study number, else gives the next number at the
+         site. Refused (and the switch undone) when the site has no site number yet. */
+      const oldCode = p.patientCode;
+      const site = loc(p.siteId);
+      const cr = AnatStages.subjectCodeFor({ protocol:from, patientCode:oldCode },
+        { id:p.id, protocol:proto.value, patientCode:oldCode }, site && site.siteNumber, S.db.patients || []);
+      if(cr.error){ proto.value = from; return toast(cr.error, "bad"); }
       p.protocol = proto.value;
       const to = protocolOf(p);
       if(to === from) return;
+      p.patientCode = cr.code;
       logAction("Protocol changed for " + p.patientCode + " to " + nameOf(to), {
         locationId:p.siteId, highPriority:true,
-        stateChanges: nameOf(from) + " → " + nameOf(to),
+        stateChanges: nameOf(from) + " → " + nameOf(to) +
+          (cr.code !== oldCode ? "; code " + oldCode + " → " + cr.code : ""),
         comments: to === "COMPASSIONATE"
           ? "Counted OUT of the study's eligible and implanted figures from now on."
           : "Counted back INTO the study's eligible and implanted figures." });
@@ -26920,9 +27132,27 @@ VIEWS.screening = {
       if(mailIt && stageComplete(p2, stage)) requestStageDoneMail(p2, stage);
     };
 
+    /* 2.1 CONFIRMED (v3.19.0): stamp it, save, and ask the server to mail the evaluation team
+       once the stored record carries the stamp. The stage stays open for 2.2. */
+    $$("[data-part1]").forEach(b => b.onclick = () => {
+      const stage = ANAT_STAGES.find(x => x.k === b.dataset.part1);
+      const a = p.anat[stage.k];
+      const gaps = stageMissing(p, stage, { part:1 });
+      if(gaps.length) return showWhy("part1-why", "Still needed for 2.1: " + gaps.join(", ") + ".");
+      a.part1 = { by: myEmailLc(), byName: S.me.name, at: nowISO() };
+      if(!a.status || a.status === "Not started") a.status = "In progress";
+      logAction("Digital Model Evaluation 2.1 confirmed for " + p.patientCode, { locationId:p.siteId,
+        stateChanges:"2.1 confirmed; evaluation team asked to score (2.2)",
+        comments:"Suitability " + suitabilityOf(a.suitability) + (a.size ? " · size " + a.size : "") });
+      commit(); schedulePatientSave(p); renderKeepingPlace(); flashSaved();
+      requestEvalTeamMail(p);
+    });
+
     $$("[data-stgdone]").forEach(b => b.onclick = () => {
       const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgdone);
       const a = p.anat[stage.k];
+      if(AnatStages.hasParts(stage) && !mayScoreModel(p)) return showWhy("stg-why-" + stage.k,
+        "2.2 is confirmed by the Anatomical evaluation team, an App Admin or a Manager.");
       const gaps = stageMissing(p, stage);
       /* 3.2 belongs to the person printing, or to the print gate. */
       if(stage.needsApproval && !mayConfirmPrinted(p, stage, myRoles(), S.me && S.me.email))
@@ -26942,7 +27172,7 @@ VIEWS.screening = {
           "The borderline comparison needs a conclusion before this stage can be confirmed.");
         if(sc.decision === "DISCUSSION") return showWhy("stg-why-" + stage.k,
           "This is held for internal discussion. Change the decision once it is resolved.");
-        if(sc.decision === "ELIGIBLE" && !sc.chosenSize) return showWhy("stg-why-" + stage.k,
+        if(sc.decision !== "UNSUITABLE" && !sc.chosenSize) return showWhy("stg-why-" + stage.k,
           "Choose the recommended implant size.");
       }
       modal("Confirm stage " + stage.n,
@@ -27306,6 +27536,14 @@ function autoAssignStage(p, next, opts){
    server waits for this subject's save to land and reads everything from the stored
    record, so this only names the stage. Best effort: it never costs the confirmation. */
 const STAGE_DONE_MAIL = ["ct", "model3d", "flexible", "approvals", "scheduling"];
+/* The evaluation team's mail and task notice after 2.1 (v3.19.0). Best effort, like the
+   stage-done mail; standalone has nobody to mail. */
+function requestEvalTeamMail(p){
+  if(!S.backend || !p) return;
+  api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/eval-team-mail", {})
+    .then(r => { if(r && r.team === 0) toast("Nobody is ticked as Anatomical evaluation team - set it on Administration → Users.", "warn"); })
+    .catch(() => {});
+}
 function requestStageDoneMail(p, stage){
   if(!S.backend || !p || !stage || !STAGE_DONE_MAIL.includes(stage.k)) return;
   api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/stage-done-mail", { stageKey: stage.k })
@@ -28282,6 +28520,9 @@ function anatStageHtml(p, s, ctReady){
   }
   else if(s.kind === "eval"){
     const suit = suitabilityOf(a.suitability);
+    /* The Digital Model in two parts (v3.19.0, the owner) - anatStages.hasParts. */
+    if(AnatStages.hasParts(s)) inner += '</div><h3 style="margin:4px 0 8px">2.1 Digital model — measurements and initial recommendation</h3>' +
+      '<div class="grid g3">';
     inner += f("suitability","Anatomical suitability","select",{ options:AnatStages_suitOptions(s) }) +
       '</div>' +
       /* CHALLENGING ANATOMY says what is challenging (16 Nov 2026, the owner); at the digital and
@@ -28326,10 +28567,22 @@ function anatStageHtml(p, s, ctReady){
         f("pmLeads","Number of PM leads","number") + '</div>' +
         angleGroup(p, s, "pmCrossingAngle", "PM crossing angle", dis);
     }
-    if(s.scoring) inner += scoringBlock(p, s, dis);
-    if(s.modelGate) inner += modelNeedBlock(p, s, dis);
-    if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
-    inner += anatFilesBlock(p, s);
+    if(AnatStages.hasParts(s)){
+      /* 2.1's files belong to 2.1: the evaluator files the images, then confirms. */
+      inner += anatFilesBlock(p, s) + part1Block(p, s);
+      const open2 = AnatStages.part1Done(p);
+      const may2 = mayScoreModel(p);
+      const dis2 = (open2 && may2) ? dis : " disabled";
+      inner += '<h3 style="margin:18px 0 8px">2.2 Anatomical scoring — Anatomical evaluation team</h3>' +
+        (!open2 ? '<div class="note">Opens once 2.1 is confirmed — the evaluation team is then emailed and given the task.</div>'
+          : !may2 ? '<div class="note">Scored by the Anatomical evaluation team (ticked on Administration → Users).</div>' : '') +
+        scoringBlock(p, s, dis2) + modelNeedBlock(p, s, dis2);
+    }else{
+      if(s.scoring) inner += scoringBlock(p, s, dis);
+      if(s.modelGate) inner += modelNeedBlock(p, s, dis);
+      if(s.strategy) inner += f("strategy","Final implant strategy","textarea");
+      inner += anatFilesBlock(p, s);
+    }
   }
   else if(s.kind === "ops"){
     inner += '</div><div class="grid g2">' +
@@ -28358,7 +28611,7 @@ function anatStageHtml(p, s, ctReady){
       '<label class="check' + (a.eligibleByInnoventric ? " on" : "") + '">' +
         '<input type="checkbox" data-anat="' + s.k + '|eligibleByInnoventric"' +
         (a.eligibleByInnoventric ? " checked" : "") + dis + '>' +
-        '<span>Subject eligible by Innoventric</span></label>' +
+        '<span>Clinical suitability is evaluated and approved by Innoventric</span></label>' +
       '<label class="check' + (a.committeeApproval ? " on" : "") + '">' +
         '<input type="checkbox" data-anat="' + s.k + '|committeeApproval"' +
         (a.committeeApproval ? " checked" : "") + dis + '>' +
@@ -29189,24 +29442,28 @@ function scoringBlock(p, s, dis){
           '.</b> It is a prompt, not a decision.') +
   '</div>';
 
+  /* THE CONCLUSION IS TWO DECISIONS (v3.19.0, the owner): the anatomical decision and the implant
+     size, side by side. The size is asked whatever the decision, unless the anatomy is
+     unsuitable (anatStages.scoringGaps). */
   h += '<h4 style="margin:14px 0 6px">Conclusion</h4>' +
-    '<div class="field"><label class="req">Decision</label>' +
+    '<div class="grid g2">' +
+    '<div class="field"><label class="req">Anatomical decision</label>' +
       '<select data-scdec="' + s.k + '"' + dis + '>' +
         '<option value="">— choose —</option>' +
         SCORING_DECISIONS.map(d => '<option value="' + d.k + '"' +
           (sc.decision === d.k ? " selected" : "") + '>' + esc(d.label) + '</option>').join("") +
-      '</select></div>';
-
-  if(sc.decision === "ELIGIBLE"){
-    h += '<div class="grid g2">' +
+      '</select></div>' +
+    (sc.decision === "UNSUITABLE" ? '<div></div>' :
       '<div class="field"><label class="req">Recommended implant size</label>' +
         '<select data-scchosen="' + s.k + '"' + dis + '>' +
           [""].concat(UNICA_SIZES).map(o => '<option' +
             (String(sc.chosenSize || "") === o ? " selected" : "") + '>' + esc(o) + '</option>').join("") +
-        '</select></div>' +
-      '<div class="field"><label>Notes for the proctor</label>' +
-        '<input type="text" data-scproc="' + s.k + '" value="' + esc(sc.proctorNotes || "") + '"' + dis + '></div>' +
-      '</div>';
+        '</select></div>') +
+    '</div>';
+
+  if(sc.decision === "ELIGIBLE"){
+    h += '<div class="field"><label>Notes for the proctor</label>' +
+        '<input type="text" data-scproc="' + s.k + '" value="' + esc(sc.proctorNotes || "") + '"' + dis + '></div>';
   }else if(sc.decision === "DISCUSSION"){
     h += '<div class="field"><label class="req">What has to be decided</label>' +
       '<input type="text" data-scdisc="' + s.k + '" placeholder="e.g. M versus L — which, and why"' +
@@ -29242,14 +29499,43 @@ function modelNeedBlock(p, s, dis){
       'clinically feasible. Nothing is printed before that.</div>' +
     printGateBlock(p);
 }
-/* Who decides (the server is the authority - printGateDeciders in server.js): the person
-   ticked Clinic manager, else an App Admin or a Manager. */
+/* Who decides (the server is the authority - printGateDeciders in server.js): since v3.19.0
+   EVERY person ticked Clinic manager; when nobody is ticked, an App Admin or a Manager. */
+function idsToEmails(ids){
+  return (ids || []).map(id => String(id).includes("@") ? id : ((user(id) || {}).email || ""))
+    .filter(Boolean).map(e => String(e).toLowerCase());
+}
 function mayDecidePrintGate(){
   if(!S.me || isExternalUser()) return false;
-  const cm = String(AnatStages.clinicManagerOf(S.db.users || []) || "");
-  const cmEmail = cm ? (cm.includes("@") ? cm : ((user(cm) || {}).email || "")) : "";
-  if(cmEmail) return String(cmEmail).toLowerCase() === myEmailLc();
+  const cms = idsToEmails(AnatStages.clinicManagersOf(S.db.users || []));
+  if(cms.length) return cms.includes(myEmailLc());
   return hasRole("ADMIN") || hasRole("MANAGER");
+}
+/* Who scores the digital model (2.2): the Anatomical evaluation team, and an App Admin or a
+   Manager. While nobody is ticked on the team, anybody who may edit the evaluation - a step
+   nobody can take would stop every subject. */
+function mayScoreModel(p){
+  if(!S.me || isExternalUser() || !can("editAnatomical")) return false;
+  const team = idsToEmails(AnatStages.evalTeamOf(S.db.users || []));
+  if(!team.length) return true;
+  return team.includes(myEmailLc()) || hasRole("ADMIN") || hasRole("MANAGER");
+}
+/* 2.1's confirmation: who confirmed it, or the button. Confirming stamps the stage's part1 and
+   asks the server to mail the evaluation team (POST /api/patients/:id/eval-team-mail). */
+function part1Block(p, s){
+  const a = p.anat[s.k], one = a.part1;
+  if(one && one.at){
+    return '<div class="okbox" style="margin-top:8px"><b>2.1 confirmed</b> by ' + esc(one.byName || one.by || "") +
+      ' · ' + esc(fmtTs(one.at)) + '. The Anatomical evaluation team was asked to score it (2.2).</div>';
+  }
+  if(a.status === "Completed") return "";
+  const gaps = stageMissing(p, s, { part:1 });
+  if(!can("editAnatomical") || p.fileLocked) return "";
+  if(gaps.length) return '<div class="hint" style="margin-top:8px">To confirm 2.1: ' + esc(gaps.join(", ")) + '.</div>';
+  return '<div class="row" style="margin-top:8px"><button class="btn btn-primary" data-part1="' + s.k + '">' +
+    'Done with 2.1 — send to the evaluation team</button>' +
+    '<span class="hint">Records you and the time, emails the Anatomical evaluation team and gives them the scoring task.</span></div>' +
+    whyBox("part1-why");
 }
 function printGateBlock(p){
   if(!AnatStages.printGateApplies(p)) return "";
@@ -29433,7 +29719,9 @@ function stageActions(p, s, state){
   const btns = [];
 
   /* Stage 3's "I'm done" is 3.2, the model printed: the printer's, or the print gate's. */
-  const mayDone = may && (!s.needsApproval || mayConfirmPrinted(p, s, myRoles(), S.me && S.me.email));
+  const mayDone = may && (!s.needsApproval || mayConfirmPrinted(p, s, myRoles(), S.me && S.me.email)) &&
+    /* the digital model's Done is 2.2, the evaluation team's (v3.19.0) */
+    (!AnatStages.hasParts(s) || mayScoreModel(p));
   /* Stage 10 is confirmed by ordering, and stage 9 of a study patient by the same press -
      a separate "I'm done" on either would be a way to schedule a procedure with nothing
      ordered for it, which is the thing the one-step order exists to prevent. */
@@ -29452,11 +29740,15 @@ function stageActions(p, s, state){
     btns.push('<button class="btn btn-primary" data-stgdone="' + s.k + '">Done</button>');
     btns.push('<span class="hint">' + (s.needsApproval
       ? 'Confirms 3.2: the model is printed. Records you and the time.'
-      : 'Records you and the time as having completed this stage.') + '</span>');
+      : AnatStages.hasParts(s)
+        ? 'Confirms 2.2 and completes the stage. The clinic managers are then asked about clinical feasibility.'
+        : 'Records you and the time as having completed this stage.') + '</span>');
   }
   if(may && !mayDone && ready){
-    btns.push('<span class="hint">Waiting for ' + esc(a.assignedTo ? assigneeLabel(a.assignedTo) : "the person printing it") +
-      ' to confirm the model is printed.</span>');
+    btns.push('<span class="hint">' + (AnatStages.hasParts(s)
+      ? 'Waiting for the Anatomical evaluation team to confirm 2.2.'
+      : 'Waiting for ' + esc(a.assignedTo ? assigneeLabel(a.assignedTo) : "the person printing it") +
+        ' to confirm the model is printed.') + '</span>');
   }
   if(may && !byOrder && !ready && (state === "In progress" || state === "Not started") && stageMissing(p, s).length){
     btns.push('<span class="hint">' + (s.needsApproval && !a.printApproved
@@ -29828,9 +30120,13 @@ VIEWS.clinical = {
           (c.replManual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</div>' : '') +
         '</div>' : "") +
       '<div class="grid g2">' +
-        tf(p,"failReason","Reason","text",{req:failReq}) +
-        tf(p,"failDetail","Failure detail","textarea",{req:failReq}) +
+        /* The mandatory mark said out loud (v3.19.0, the owner): a small asterisk was easy to miss. */
+        tf(p,"failReason","Reason","text",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
+        tf(p,"failDetail","Failure detail","textarea",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
       '</div>' +
+      /* Two optional ticks (v3.19.0, the owner) - nothing waits on them. */
+      '<h3 style="margin:14px 0 7px">At the end of the procedure <span class="hint" style="font-weight:400">— optional</span></h3>' +
+      PD.POST_CHECKS.map((t, i) => cbox(p, "postChecks", t, i)).join("") +
       tf(p,"postNotes","Post-procedure notes","textarea") +
       /* Last thing in the last stage, and deliberately AFTER the failure fields: the
          failed unit is one of the answers, so the list cannot be settled before them. */
@@ -29864,16 +30160,16 @@ VIEWS.clinical = {
            just leaves, Save and close also files a draft line in the audit log and reports
            what is still outstanding. */
         '<button class="btn" id="pt-exit">Close</button>' +
-        (p.submitted && !cfSubmittedOpen(p) ? '' : '<button class="btn btn-primary" id="pt-submit">' +
-          (p.submitted ? "Re-submit procedure report" : "Submit procedure report") + '</button>') +
+        /* NO SUBMIT BUTTON (v3.19.0, 17 Nov 2026, the owner): Save and close submits by itself when
+           nothing is outstanding (saveOrSubmit), and only saves when something is. */
         (p.submitted && can("lockCaseFile")
           ? '<button class="btn btn-dark" id="pt-lock">Final permanent lock</button>' : "") +
         (p.submitted && !can("lockCaseFile")
           ? '<span class="hint">Only a Clinical PM or App Admin can perform the final lock.</span>' : "") +
       '</div>' +
       '<div class="hint" style="margin-top:8px">Fields save as you type. ' +
-        '<b>Save and close</b> always works, even with mandatory fields empty — only ' +
-        'submission requires them.</div>' +
+        '<b>Save and close</b> always works. When nothing is outstanding it also <b>submits</b> the ' +
+        'report; while something is, it only saves.</div>' +
       outstandingList(p)) +
     '</div></div></div>';
     return h;
@@ -30053,6 +30349,8 @@ VIEWS.clinical = {
       if(ss) ss.textContent = fmtDur(minsBetween(c.dsIn, c.dsOut));
       const ct = $("#calc-contrast");
       if(ct) ct.textContent = fmtContrast(contrastTotal(c));
+      const ci = $("#calc-inj");
+      if(ci) ci.textContent = fmtContrast(PD.contrastInjectionTotal(c));
       /* Sys\Dias(Mean) readouts follow the three inputs as they are typed, so the
          operator sees the value in the form it will be reported in. */
       ["ivcPre","ivcPost"].forEach(k => {
@@ -30131,6 +30429,8 @@ VIEWS.clinical = {
            box, so it has to redraw rather than just store. */
         if(t.dataset.cf === "asExpected" || t.dataset.cf === "notExpectedBranch" ||
            t.dataset.cf === "roadmapPerRec") structural = true;
+        /* Pure or Diluted decides whether the injection has one volume box or two (v3.19.0). */
+        if(/^contrast\d+Form$/.test(t.dataset.cf)) structural = true;
         /* An angle locks its opposite - RAO and LAO cannot both describe one projection.
            Done in place: this fires on every keystroke, and re-rendering the form under
            someone typing a number mid-procedure is worse than the problem it solves. */
@@ -30247,7 +30547,7 @@ VIEWS.clinical = {
       ug.disabled = false;
       render();
     };
-    const sv = $("#pt-save");   if(sv) sv.onclick = () => saveDraft(p);
+    const sv = $("#pt-save");   if(sv) sv.onclick = () => saveOrSubmit(p);
     const ex = $("#pt-exit");
     if(ex) ex.onclick = async () => {
       /* FLUSHES the pending write, and used to drop it. Dropping was defended as what
@@ -30303,7 +30603,7 @@ VIEWS.clinical = {
       if(wasViewing) toast("Left the report.", "good");
       else if(!_exitWarned) toast("Left the report. Everything you typed is saved.", "good");
     };
-    const sb = $("#pt-submit"); if(sb) sb.onclick = () => submitCase(p);
+    /* #pt-submit is gone (v3.19.0) - Save and close submits. */
     const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
     const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
     const ps = $("#pt-sum");    if(ps) ps.onclick = () => openSummary(p.id);
@@ -30435,6 +30735,18 @@ async function fileProcedureReport(p, locked){
   }
 }
 
+/* SAVE AND CLOSE (v3.19.0, the owner): nothing outstanding -> submit (the summary opens as before),
+   and close; something outstanding -> save only, and close. A submitted report that was
+   reopened for editing is submitted again the same way. */
+async function saveOrSubmit(p){
+  const submittable = !p.submitted || cfSubmittedOpen(p);
+  if(submittable && !missingForSubmit(p).length){
+    const done = await submitCase(p);
+    if(done && PID === p.id && S.view === "clinical"){ PID = null; render(); }
+    return;
+  }
+  return saveDraft(p);
+}
 async function saveDraft(p){
   commit();
   const m = missingForSubmit(p);
@@ -30478,12 +30790,13 @@ async function submitCase(p){
     showWhy("pt-why", "Not ready to submit — " + m[0] +
       (m.length > 1 ? ", and " + (m.length - 1) + " other item(s) listed below" : "") +
       ". Save and close still works.");
-    return;
+    return false;
   }
   clearWhy("pt-why");
-  /* Where the unused units are, before anything is sent. Backing out submits nothing. */
-  const back = await askUnusedUnits(p);
-  if(back === null) return;
+  /* The unused units, before anything is sent (v3.19.0): did the team take them? Backing
+     out submits nothing. */
+  const back = await askUnusedTaken(p);
+  if(back === null) return false;
   const cancelled = c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED";
   const newStatus = cancelled && p.status !== "CANCELLED" ? "CANCELLED" : p.status;
 
@@ -30505,7 +30818,7 @@ async function submitCase(p){
     if(!offline){
       try{ await submitPatientRemote(p.id, body); }
       catch(e){
-        if(e.code !== "OFFLINE") return showWhy("pt-why", e.message || "Submit failed on the server.");
+        if(e.code !== "OFFLINE"){ showWhy("pt-why", e.message || "Submit failed on the server."); return false; }
         offline = true;
       }
     }
@@ -30514,13 +30827,14 @@ async function submitCase(p){
       toast("Procedure report submitted. Still editable until locked.", "good"); render();
       await releaseAfterClose(p, "procedure report submitted");
       await takeBackUnused(p, back);
+      await reportUnusedUnits(p, back);
       /* THE SUMMARY OPENS NOW (the owner: at the end of the report, the summary form opens).
          The server opened it with the submit; whoever may fill it in is taken straight to it. */
       if(summaryOf(p) && summaryOf(p).status === "OPEN" && mayWorkSummary(p)){
         toast("The procedure summary is open — due within " + PSF.DUE_HOURS + " hours.", "good");
         openSummary(p.id);
       }
-      return;
+      return true;
     }
     /* No network: submitted on this device, exactly as standalone does it below, and the
        same request waits in the queue - everything after it (the released spares, the
@@ -30546,6 +30860,8 @@ async function submitCase(p){
   render();
   await releaseAfterClose(p, "procedure report submitted");
   await takeBackUnused(p, back);
+  await reportUnusedUnits(p, back);
+  return true;
 }
 /* WHAT WAS NOT USED GOES BACK, AT SUBMIT (24 Sep 2026, the owner). The units used are recorded
    in the report, so submitting it is the confirmation of what went into the patient - and
@@ -30616,11 +30932,17 @@ function unusedAtSite(p){
     d.locationId === p.siteId && !used.has(up(d.sn)) &&
     (onTable.has(up(d.sn)) || d.allocatedTo === p.id));
 }
-/* Resolves { deviceId: destinationLocId } for the units going back (empty when all stay),
-   or null when the operator backs out - in which case nothing is submitted. */
-function askUnusedUnits(p){
+/* THE UNUSED UNITS AT SUBMISSION (v3.19.0, 17 Nov 2026, the owner). One question to the person
+   closing the report: did the team take the unused units with them?
+     Yes - they tick which, where to, and who carries them: those go hand-carried (as before),
+           and the warehouse managers and App Admins are told.
+     No  - nothing moves: the units stay at the site, and the App Admins and warehouse
+           managers get a task to decide - keep them there, or send them to a warehouse.
+   Resolves the same plan takeBackUnused reads ({ deviceId: to, __who }) plus __stayed (the
+   ids left at the site), or null when the person backs out - then nothing is submitted. */
+function askUnusedTaken(p){
   const units = unusedAtSite(p);
-  if(!units.length) return Promise.resolve({});
+  if(!units.length) return Promise.resolve({ __stayed:[] });
   const homes = visibleLocations().filter(l => l.type === "WAREHOUSE" || l.type === "HQ");
   const homeOf = d => {
     const o = loc(d.shippedFromId);
@@ -30631,49 +30953,144 @@ function askUnusedUnits(p){
   return new Promise(resolve => {
     let settled = false;
     const finish = v => { if(!settled){ settled = true; resolve(v); } };
-    modal("Units that were not used",
+    modal("Products that were not used",
       '<p>These units were not used in <b>' + esc(p.patientCode) + '</b> and are recorded at <b>' +
-        esc(locName(p.siteId)) + '</b>. Where are they now?</p>' +
-      units.map(d => '<div style="border:1px solid var(--line-2);border-radius:6px;padding:10px;margin:0 0 8px">' +
-        '<div style="margin:0 0 6px"><b>' + esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) +
-          '</b> <span class="mono">' + esc(d.sn || "—") + '</span></div>' +
-        '<label class="check" style="margin:0 0 4px"><input type="radio" name="uu-' + esc(d.id) +
-          '" value="STAY"><span>Stays at ' + esc(locName(p.siteId)) + '</span></label>' +
-        '<label class="check" style="margin:0 0 4px"><input type="radio" name="uu-' + esc(d.id) +
-          '" value="BACK"><span>The team is taking it back to:</span></label>' +
-        '<select data-uu-to="' + esc(d.id) + '" style="width:100%" aria-label="Taking ' + esc(d.sn || "it") + ' back to">' +
-          homes.map(l => '<option value="' + esc(l.id) + '"' +
-            (l.id === homeOf(d) ? ' selected' : '') + '>' + esc(l.name) + '</option>').join("") +
-        '</select></div>').join("") +
-      '<div class="hint" style="margin-top:8px">A unit taken back shows as <b>on the way ' +
-        '(hand-carried)</b> until somebody checks it in with <b>Receive Devices</b> where it ' +
-        'arrives. The four checks are the same.</div>' +
-      '<div class="field" style="margin-top:10px"><label class="req" for="uu-who">Who is taking them</label>' +
-        '<input type="text" id="uu-who" value="' + esc((S.me && S.me.name) || "") + '"></div>' +
-      whyBox("uu-why"),
-      '<div class="row"><button class="btn btn-primary" id="uu-go">Submit the report</button>' +
+        esc(locName(p.siteId)) + '</b>.</p>' +
+      '<div class="field"><label class="req">Did the team take the unused units with them?</label>' +
+        '<label class="check" style="margin:0 0 4px"><input type="radio" name="ut-took" value="YES"><span>Yes — the team took them</span></label>' +
+        '<label class="check" style="margin:0 0 4px"><input type="radio" name="ut-took" value="NO"><span>No — they stayed at ' +
+          esc(locName(p.siteId)) + '</span></label></div>' +
+      '<div id="ut-yes" hidden>' +
+        units.map(d => '<div style="border:1px solid var(--line-2);border-radius:6px;padding:10px;margin:0 0 8px">' +
+          '<label class="check on" style="margin:0 0 6px"><input type="checkbox" data-ut-took="' + esc(d.id) + '" checked><span><b>' +
+            esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</b> <span class="mono">' +
+            esc(d.sn || "—") + '</span> — taken</span></label>' +
+          '<select data-ut-to="' + esc(d.id) + '" style="width:100%" aria-label="Taking ' + esc(d.sn || "it") + ' to">' +
+            homes.map(l => '<option value="' + esc(l.id) + '"' + (l.id === homeOf(d) ? ' selected' : '') + '>' +
+              esc(l.name) + '</option>').join("") + '</select></div>').join("") +
+        '<div class="field" style="margin-top:10px"><label class="req" for="ut-who">Who is carrying them</label>' +
+          '<input type="text" id="ut-who" value="' + esc((S.me && S.me.name) || "") + '"></div>' +
+        '<div class="hint">A unit taken shows as <b>on the way (hand-carried)</b> until it is checked in with ' +
+          '<b>Receive Devices</b>. The warehouse managers and App Admins are told. An unticked unit stays at the site.</div>' +
+      '</div>' +
+      '<div id="ut-no" class="hint" hidden>Nothing moves. The App Admins and warehouse managers get a task to decide: ' +
+        'keep the units at the site, or send them to a warehouse.</div>' +
+      whyBox("ut-why"),
+      '<div class="row"><button class="btn btn-primary" id="ut-go">Submit the report</button>' +
       '<button class="btn" data-close="1">Cancel</button></div>');
-    /* Backing out by any route submits nothing - see askDepartureTime. */
     MODAL_CLEANUP = () => finish(null);
-    $("#uu-go").onclick = () => {
-      const plan = {};
-      for(const d of units){
-        const pick = document.querySelector('input[name="uu-' + CSS.escape(d.id) + '"]:checked');
-        if(!pick) return showWhy("uu-why", "Say where " + (d.sn || "each unit") + " is now.");
-        if(pick.value === "BACK"){
-          const to = (document.querySelector('[data-uu-to="' + CSS.escape(d.id) + '"]') || {}).value;
-          if(!to) return showWhy("uu-why", "Choose where " + d.sn + " is going back to.");
-          plan[d.id] = to;
+    const paint = () => {
+      const v = (document.querySelector('input[name="ut-took"]:checked') || {}).value;
+      $("#ut-yes").hidden = v !== "YES"; $("#ut-no").hidden = v !== "NO";
+    };
+    $$('input[name="ut-took"]').forEach(r => r.onchange = paint);
+    $$("[data-ut-took]").forEach(cb => cb.onchange = () => cb.closest(".check").classList.toggle("on", cb.checked));
+    $("#ut-go").onclick = () => {
+      const v = (document.querySelector('input[name="ut-took"]:checked') || {}).value;
+      if(!v) return showWhy("ut-why", "Say whether the team took the unused units.");
+      const plan = { __stayed:[] };
+      if(v === "YES"){
+        for(const d of units){
+          const cb = document.querySelector('[data-ut-took="' + CSS.escape(d.id) + '"]');
+          if(cb && cb.checked){
+            const to = (document.querySelector('[data-ut-to="' + CSS.escape(d.id) + '"]') || {}).value;
+            if(!to) return showWhy("ut-why", "Choose where " + d.sn + " is going.");
+            plan[d.id] = to;
+          }else plan.__stayed.push(d.id);
         }
-      }
-      const who = ($("#uu-who").value || "").trim();
-      if(Object.keys(plan).length && !who) return showWhy("uu-why", "Say who is taking them.");
-      plan.__who = who;
-      /* Settle BEFORE closing, or MODAL_CLEANUP resolves it as a cancel. */
+        const who = ($("#ut-who").value || "").trim();
+        if(Object.keys(plan).some(k => !k.startsWith("__")) && !who) return showWhy("ut-why", "Say who is carrying them.");
+        plan.__who = who;
+      }else plan.__stayed = units.map(d => d.id);
       finish(plan);
       closeModal();
     };
   });
+}
+/* Tell the server what happened to the unused units (v3.19.0): the units taken are announced
+   to the warehouse managers and App Admins; the units left at the site become their task.
+   Standalone mirrors it on the record. Best effort - the units themselves already moved. */
+async function reportUnusedUnits(p, plan){
+  if(!plan) return;
+  const taken = Object.keys(plan).filter(k => !k.startsWith("__")).map(id => ({ id, toId: plan[id] }));
+  const stayed = (plan.__stayed || []).slice();
+  if(!taken.length && !stayed.length) return;
+  const body = { taken, stayed, who: plan.__who || "" };
+  if(S.backend && !queueFor(p)){
+    try{
+      const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/unused-units", body);
+      if(r && r.patient && r.patient.unusedTask !== undefined) p.unusedTask = r.patient.unusedTask;
+      if(stayed.length) toast(stayed.length + " unused unit(s) stay at " + locName(p.siteId) +
+        " — the App Admins and warehouse managers are asked what to do with them.", "good");
+      return;
+    }catch(e){
+      if(e.code !== "OFFLINE") return toast("The unused units were not reported: " + (e.message || "refused") +
+        ". Tell an App Admin.", "warn");
+    }
+  }
+  if(S.backend){
+    offEnqueue({ kind:"unused", pid:p.id, code:p.patientCode, method:"POST",
+      path:"/api/patients/" + encodeURIComponent(p.id) + "/unused-units", body, label:"Unused units reported" });
+    return;
+  }
+  if(stayed.length) p.unusedTask = unusedTaskFor(p, stayed, myEmailLc(), S.me.name);
+  notify((taken.length ? taken.length + " unused unit(s) of " + p.patientCode + " taken back by " + (plan.__who || "the team") : "") +
+    (taken.length && stayed.length ? "; " : "") +
+    (stayed.length ? stayed.length + " left at " + locName(p.siteId) + " — decide: keep or send to a warehouse" : ""),
+    ["WH_ADMIN", "ADMIN"], [], p.siteId);
+  commit();
+}
+function unusedTaskFor(p, ids, by, byName){
+  return { status:"OPEN", at:nowISO(), by, byName, siteId:p.siteId,
+    units: ids.map(id => { const d = device(id) || {}; return { id, sn:d.sn || "", productType:d.productType || "", size:d.size || "" }; }) };
+}
+/* Who decides: an App Admin, or a warehouse manager whose stock scope covers the site. */
+function mayDecideUnused(p){
+  if(!S.me || isExternalUser()) return false;
+  if(hasRole("ADMIN")) return true;
+  return hasRole("WH_ADMIN") && inScope(p.siteId);
+}
+function unusedTasksForMe(){
+  return (S.db.patients || []).filter(p => p.unusedTask && p.unusedTask.status === "OPEN" && mayDecideUnused(p));
+}
+function askUnusedDecision(p){
+  const t = p.unusedTask; if(!t || t.status !== "OPEN") return;
+  const homes = visibleLocations().filter(l => l.type === "WAREHOUSE" || l.type === "HQ");
+  modal("Unused units at " + locName(t.siteId),
+    '<p>Left at <b>' + esc(locName(t.siteId)) + '</b> after <b>' + esc(p.patientCode) + '</b>\'s procedure' +
+      ' (reported by ' + esc(t.byName || t.by || "") + ' · ' + esc(fmtTs(t.at)) + '). For each unit: keep it at the site, or send it to a warehouse.</p>' +
+    t.units.map(u => '<div style="border:1px solid var(--line-2);border-radius:6px;padding:10px;margin:0 0 8px">' +
+      '<div style="margin:0 0 6px"><b>' + esc((u.productType === "UNICA" ? "Unica " : "DS ") + (u.size || "")) +
+        '</b> <span class="mono">' + esc(u.sn || "—") + '</span></div>' +
+      '<label class="check" style="margin:0 0 4px"><input type="radio" name="ud-' + esc(u.id) + '" value="KEEP"><span>Keep at the site</span></label>' +
+      '<label class="check" style="margin:0 0 4px"><input type="radio" name="ud-' + esc(u.id) + '" value="SEND"><span>Send to a warehouse:</span></label>' +
+      '<select data-ud-to="' + esc(u.id) + '" style="width:100%">' +
+        homes.map(l => '<option value="' + esc(l.id) + '">' + esc(l.name) + '</option>').join("") + '</select></div>').join("") +
+    '<div class="hint">Sending is then done with <b>Ship Devices</b> from the site; the site\'s Clinical PM is told.</div>' +
+    whyBox("ud-why"),
+    '<div class="row"><button class="btn btn-primary" id="ud-go">Save the decision</button>' +
+    '<button class="btn" data-close="1">Cancel</button></div>');
+  $("#ud-go").onclick = async () => {
+    const items = [];
+    for(const u of t.units){
+      const pick = document.querySelector('input[name="ud-' + CSS.escape(u.id) + '"]:checked');
+      if(!pick) return showWhy("ud-why", "Decide for " + (u.sn || "each unit") + ".");
+      items.push({ id:u.id, action:pick.value,
+        toId: pick.value === "SEND" ? (document.querySelector('[data-ud-to="' + CSS.escape(u.id) + '"]') || {}).value || "" : "" });
+    }
+    if(S.backend){
+      try{
+        const r = await api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/unused-units/decide", { items });
+        p.unusedTask = r.patient.unusedTask;
+      }catch(e){ return showWhy("ud-why", e.message || "The server refused it."); }
+    }else{
+      p.unusedTask = Object.assign({}, t, { status:"DECIDED", decision:{ items, by:myEmailLc(), byName:S.me.name, at:nowISO() } });
+      logAction("Unused units of " + p.patientCode + " decided", { locationId:t.siteId,
+        stateChanges: items.map(i => i.action === "SEND" ? "send to " + locName(i.toId) : "keep at the site").join("; ") });
+      commit();
+    }
+    closeModal(); toast("Decision saved.", "good"); render();
+  };
 }
 /* Carry the units home. After the submit and after the reservations are released, so
    the server sees a closed file. Reported per unit: a move the server refused leaves the
@@ -39817,7 +40234,18 @@ function patientForm(p, justCreated){
   if(!p.screening) p.screening = blankScreening();
   if(!p.anat) p.anat = blankAnat();
   PFR = (p.reminders || []).map(r => ({ date:r.date, text:r.text, done:!!r.done }));
+  /* What the subject was when the window opened - the code rule (anatStages.subjectCodeFor)
+     compares against it to tell a protocol switch from an ordinary edit. */
+  PF_PREV = isNew ? null : { id:p.id, protocol:p.protocol, patientCode:p.patientCode };
   patientFormRender(p, isNew, justCreated);
+}
+let PF_PREV = null;
+/* The code this window would save, by the shared rule - shown in the code field before the
+   press, and checked again at the press. The server is the authority (caseService). */
+function pfCodePreview(p, siteId, proto, typed){
+  const site = loc(siteId);
+  return AnatStages.subjectCodeFor(PF_PREV, { id:p.id, protocol:proto, patientCode:typed },
+    site && site.siteNumber, S.db.patients || []);
 }
 
 /* THE CLINICAL QUESTIONS ON SCREENING. Since 16 Nov 2026 (the owner) this card shows every OPEN
@@ -39879,11 +40307,18 @@ function patientFormRender(p, isNew, justCreated){
         (!isNew && x.k === protocolOf(p) ? " selected" : "") + '>' + esc(x.label) + '</option>').join("") +
       '</select>' +
       '<div class="hint" id="p-proto-why"></div></div>';
-  const codeField = '<div class="field"><label class="req" for="p-code">3. Subject code</label>' +
-      '<input type="text" id="p-code" value="' + esc(p.patientCode) + '" autocomplete="off"></div>';
+  /* v3.19.0 (17 Nov 2026, the owner): a STUDY subject's code is given by the system (site number +
+     running number, 401-01); a compassionate subject's code is its initials, typed. The field
+     is redrawn by paintCode() whenever the site or the protocol changes. */
+  const codeField = '<div class="field"><label class="req" for="p-code" id="p-code-lbl">3. Subject code</label>' +
+      '<input type="text" id="p-code" value="' + esc(p.patientCode) + '" autocomplete="off">' +
+      '<div class="hint" id="p-code-why"></div></div>';
+  /* INITIAL SUBJECT DATA (v3.19.0, the owner): required at creation. One free-text field for now. */
+  const initField = '<div class="field"><label' + (isNew ? ' class="req"' : '') + ' for="p-init">4. Initial Subject Data</label>' +
+      '<textarea id="p-init" rows="3" maxlength="4000">' + esc(p.initialData || "") + '</textarea></div>';
   if(isNew){
     modal("Register a subject",
-      '<div class="grid g3">' + siteField + protoField + codeField + '</div>' +
+      '<div class="grid g3">' + siteField + protoField + codeField + '</div>' + initField +
       '<div class="hint">Once the subject is created, the questions and discussion open in this window.</div>',
       '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
       '<button class="btn btn-primary" id="p-save">Create subject</button>' +
@@ -39891,7 +40326,7 @@ function patientFormRender(p, isNew, justCreated){
   }else modal("Edit " + p.patientCode,
     (justCreated ? '<div class="okbox" style="margin-bottom:10px"><b>Subject ' + esc(p.patientCode) +
       ' created.</b> Ask questions or add comments below — the chat is open.</div>' : '') +
-    '<div class="grid g3">' + siteField + protoField + codeField + '</div>' +
+    '<div class="grid g3">' + siteField + protoField + codeField + '</div>' + initField +
     '<div class="grid g2">' +
     '<div class="field"><label for="p-date">Procedure date</label>' +
       /* Read-only since 2 Oct 2026: a procedure date is set by ordering its products, at
@@ -39950,10 +40385,46 @@ function patientFormRender(p, isNew, justCreated){
         'the implanted count. Changeable at any stage until the report is finally locked.';
     }
   };
+  /* The code follows the site and the protocol (v3.19.0). Study: given by the system, shown
+     read-only. Compassionate: initials, typed. The text a person typed is kept aside, so
+     switching to Study and back does not lose it. */
+  let typedCode = isNew ? "" : String(p.patientCode || "");
+  const paintCode = () => {
+    const inp = $("#p-code"), why = $("#p-code-why"), lbl = $("#p-code-lbl");
+    if(!inp) return;
+    const proto = $("#p-proto").value, siteId = $("#p-site").value;
+    if(!inp.disabled) typedCode = inp.value;
+    if(!siteId || !proto){
+      inp.disabled = true; inp.value = isNew ? "" : String(p.patientCode || "");
+      if(why) why.textContent = isNew ? "Choose the site and the protocol first." : "";
+      return;
+    }
+    const r = pfCodePreview(p, siteId, proto, typedCode);
+    /* Typed only for a compassionate subject that was compassionate when the window opened
+       (or is new): a study subject switched to compassionate keeps its number + "-CU". */
+    const given = proto !== "COMPASSIONATE" ||
+      !!(PF_PREV && String(PF_PREV.protocol || "STUDY").toUpperCase() !== "COMPASSIONATE");
+    if(lbl) lbl.textContent = proto === "COMPASSIONATE" ? "3. Subject initials" : "3. Subject number";
+    if(given){
+      inp.disabled = true;
+      inp.value = r.code || "";
+      if(why) why.innerHTML = r.error ? '<span style="color:var(--bad-fg)">' + esc(r.error) + '</span>'
+        : (proto === "COMPASSIONATE" ? 'Keeps its study number with <b>-CU</b> added.'
+          : (!PF_PREV || PF_PREV.patientCode !== r.code)
+            ? 'Given automatically from the site number when you save.' : 'Given by the system.');
+    }else{
+      inp.disabled = false;
+      inp.value = typedCode;
+      if(why) why.textContent = "A compassionate subject is not numbered - type the initials.";
+    }
+  };
   {
     const site = $("#p-site");
-    if(site){ const prev = site.onchange; site.onchange = e => { if(prev) prev(e); paintProtocol(); }; }
+    if(site){ const prev = site.onchange; site.onchange = e => { if(prev) prev(e); paintProtocol(); paintCode(); }; }
+    const pr = $("#p-proto");
+    if(pr){ const prev = pr.onchange; pr.onchange = e => { if(prev) prev(e); paintCode(); }; }
     paintProtocol();
+    paintCode();
   }
 
   /* Re-rendering the modal would lose focus, so the list edits are handled in place
@@ -39963,12 +40434,13 @@ function patientFormRender(p, isNew, justCreated){
     $$("[data-rt]").forEach(i => { PFR[+i.dataset.rt].text = i.value; });
   };
   const redraw = () => {
-    const snap = { code:$("#p-code").value, date:($("#p-date") || {}).value,
+    const snap = { code:$("#p-code").value, init:($("#p-init") || {}).value, date:($("#p-date") || {}).value,
                    st:($("#p-st") || {}).value, site:$("#p-site").value, proto:$("#p-proto").value };
     patientFormRender(p, isNew, justCreated);
     $("#p-code").value = snap.code; if($("#p-date")) $("#p-date").value = snap.date;
     if($("#p-st")) $("#p-st").value = snap.st; $("#p-site").value = snap.site;
     $("#p-proto").value = snap.proto;
+    if($("#p-init")) $("#p-init").value = snap.init || "";
   };
   const radd = $("#r-add");
   if(radd) radd.onclick = () => { keep(); PFR.push({ date:"", text:"", done:false }); redraw(); };
@@ -39986,16 +40458,22 @@ function patientFormRender(p, isNew, justCreated){
 
   $("#p-save").onclick = async () => {
     keep();
-    const code = $("#p-code").value.trim();
     /* In the order they are asked (17 Nov 2026). */
     if(!$("#p-site").value) return showWhy("p-why", "Choose the site first.");
     if(!$("#p-proto").value) return showWhy("p-why", "Choose study or compassionate.");
-    if(!code) return showWhy("p-why", "A subject code is required.");
-    if(isNew && S.db.patients.some(x => x.id !== p.id && String(x.patientCode || "").trim().toLowerCase() === code.toLowerCase()))
-      return showWhy("p-why", "A subject with the code " + code + " already exists.");
+    const protoPick = studyAllowedFor(p, $("#p-site").value) ? $("#p-proto").value : "COMPASSIONATE";
+    /* The code by the shared rule (v3.19.0): numbered for Study, initials for compassionate,
+       duplicates refused. The server applies the same rule and is the authority. */
+    const cr = pfCodePreview(p, $("#p-site").value, protoPick,
+      $("#p-code").disabled ? "" : $("#p-code").value.trim());
+    if(cr.error) return showWhy("p-why", cr.error);
+    const code = cr.code;
+    const initialData = ($("#p-init") ? $("#p-init").value : "").trim();
+    if(isNew && !initialData) return showWhy("p-why", "Initial Subject Data is required.");
     const before = p.status;
     const protoBefore = protocolOf(p);
     p.patientCode = code;
+    p.initialData = initialData;
     p.siteId = $("#p-site").value;
     if($("#p-date")) p.procedureDate = $("#p-date").value;
     /* Implant/DS size is NOT set here — the anatomical evaluation is its source. A new
@@ -40003,7 +40481,7 @@ function patientFormRender(p, isNew, justCreated){
     if($("#p-st")) p.status = $("#p-st").value;
     /* Read from the site, not from the control: a disabled select is easy to re-enable
        from a console, and this is the rule rather than a convenience. */
-    p.protocol = studyAllowedFor(p, $("#p-site").value) ? $("#p-proto").value : "COMPASSIONATE";
+    p.protocol = protoPick;
     /* THE REGISTRATION MOMENT, stamped once and never again. Nothing recorded it before
        20 Aug 2026, which is why the days-to-Eligible average can only be computed for the
        patients that have one - see registrationDate(). Set on the record itself rather
@@ -40301,7 +40779,9 @@ VIEWS.admin = {
             ? ' <span class="pill p-blue">+ ' +
               esc(userExtraRoles(u).map(r => (ROLES[r] || {}).label || r).join(", ")) + '</span>'
             : '') +
-          (u.clinicManager ? ' <span class="pill p-green" title="Takes every task of a site with no Responsible CPM">Clinic manager</span>' : '') +
+          (u.clinicManager ? ' <span class="pill p-green" title="Decides whether a subject is clinically feasible">Clinic manager</span>' : '') +
+          (u.taskFallback ? ' <span class="pill p-green" title="Takes every task of a site with no Responsible CPM">Sites with no CPM</span>' : '') +
+          (u.anatEvalTeam ? ' <span class="pill p-blue" title="Scores the Digital Model Evaluation">Evaluation team</span>' : '') +
           '</td>' +
         '<td>' + esc([u.locationId, userExtraRoles(u).length ? u.extraLocationId : null]
                        .filter(Boolean).map(locName).join(" · ") || "All locations") +
@@ -40665,7 +41145,8 @@ async function loadAdminUserRecords(){
       if(u) Object.assign(u, { accessType:f.accessType, extraRoles:f.extraRoles || [], geography:f.geography || [],
                                extraLocationId:f.extraLocationId || null, screenUpdate:f.screenUpdate === true,
                                stageUpdate:f.stageUpdate === true, stuckUpdate:f.stuckUpdate === true,
-                               clinicManager:f.clinicManager === true });
+                               clinicManager:f.clinicManager === true, taskFallback:f.taskFallback === true,
+                               anatEvalTeam:f.anatEvalTeam === true });
     }
   }catch(e){ /* the form still opens; it simply cannot show what it was not sent */ }
 }
@@ -40799,20 +41280,29 @@ function userForm(u){
       '><span><b>Stage Update</b> — email me when a screening stage is completed (CT, digital model, pliable model, eligibility, scheduling)</span></label></div>' +
     '<div style="margin:0 0 12px"><label class="check' + (u.stuckUpdate ? " on" : "") +
       '" style="margin:0"><input type="checkbox" id="u-stu"' + (u.stuckUpdate ? " checked" : "") +
-      '><span><b>Stuck Update</b> — send me the daily email with the subjects stuck in screening, at every site</span></label></div>' +
+      '><span><b>Stuck Update</b> — send me the Sunday summary email with the subjects stuck in screening, at every site</span></label></div>' +
     '<div class="hint" style="margin:-6px 0 12px">App Admins, Managers and QA receive both whether or not these are ticked.</div>' +
-    /* "Clinic manager" (v3.13.0, 10 Nov 2026, the owner: a role on the person, not a site). Takes
-       every task of a hospital site that has no Responsible CPM - anatStages.responsibleCpm.
-       One person: ticking somebody moves it to them. Never a partner account. */
+    /* Three ticks since v3.19.0 (17 Nov 2026, the owner). CLINIC MANAGER may be on many people:
+       they decide whether a subject is clinically feasible after the Digital Model Evaluation.
+       SITES WITH NO CPM is one person (it moves when ticked): every task of a hospital site
+       with no Responsible CPM - anatStages.clinicManagerOf. EVALUATION TEAM: mailed and tasked
+       to score the digital model. None of them on a partner account. */
+    '<div style="margin:0 0 12px"><label class="check' + (u.clinicManager ? " on" : "") +
+      '" style="margin:0"><input type="checkbox" id="u-cm"' + (u.clinicManager ? " checked" : "") +
+      '><span><b>Clinic manager</b> — decides whether a subject is clinically feasible, after the anatomical scoring</span></label></div>' +
     (function(){
-      const holder = (S.db.users || []).find(x => x.clinicManager === true && x.id !== u.id);
-      return '<div style="margin:0 0 12px"><label class="check' + (u.clinicManager ? " on" : "") +
-        '" style="margin:0"><input type="checkbox" id="u-cm"' + (u.clinicManager ? " checked" : "") +
-        '><span><b>Clinic manager</b> — takes every task of a hospital site that has no Responsible CPM</span></label>' +
+      const holder = (S.db.users || []).find(x => x.taskFallback === true && x.id !== u.id);
+      return '<div style="margin:0 0 12px"><label class="check' + (u.taskFallback ? " on" : "") +
+        '" style="margin:0"><input type="checkbox" id="u-tf"' + (u.taskFallback ? " checked" : "") +
+        '><span><b>Sites with no CPM</b> — takes every task of a hospital site that has no Responsible CPM</span></label>' +
         '<div class="hint" style="margin-top:4px">' + (holder
           ? 'Now: <b>' + esc(holder.name || holder.email || holder.id) + '</b>. Ticking this moves it to this person.'
-          : 'Nobody is the clinic manager yet.') + ' One person at a time; not for partner accounts.</div></div>';
+          : 'Nobody is ticked yet, so the first clinic manager takes them.') + ' One person at a time.</div></div>';
     })() +
+    '<div style="margin:0 0 12px"><label class="check' + (u.anatEvalTeam ? " on" : "") +
+      '" style="margin:0"><input type="checkbox" id="u-aet"' + (u.anatEvalTeam ? " checked" : "") +
+      '><span><b>Anatomical evaluation team</b> — email me and give me a task to score a digital model</span></label>' +
+      '<div class="hint" style="margin-top:4px">Not for partner accounts.</div></div>' +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
       '<div class="field"><label for="u-p">Phone</label><input type="tel" id="u-p" value="' + esc(u.phone||"") + '"></div></div>' +
@@ -40937,9 +41427,11 @@ function userForm(u){
       screenUpdate: !!($("#u-su") || {}).checked,
       stageUpdate: !!($("#u-sgu") || {}).checked,
       stuckUpdate: !!($("#u-stu") || {}).checked,
-      clinicManager: !!($("#u-cm") || {}).checked });
-    if(u.clinicManager && u.accessType === "EXTERNAL")
-      return showWhy("u-why", "A partner account cannot be the clinic manager.");
+      clinicManager: !!($("#u-cm") || {}).checked,
+      taskFallback: !!($("#u-tf") || {}).checked,
+      anatEvalTeam: !!($("#u-aet") || {}).checked });
+    if((u.clinicManager || u.taskFallback || u.anatEvalTeam) && u.accessType === "EXTERNAL")
+      return showWhy("u-why", "A partner account cannot be a clinic manager, take unassigned tasks or be on the evaluation team.");
 
     if(S.backend){
       try{
@@ -40953,7 +41445,9 @@ function userForm(u){
                                 screenUpdate:u.screenUpdate === true,
                                 stageUpdate:u.stageUpdate === true,
                                 stuckUpdate:u.stuckUpdate === true,
-                                clinicManager:u.clinicManager === true }) });
+                                clinicManager:u.clinicManager === true,
+                                taskFallback:u.taskFallback === true,
+                                anatEvalTeam:u.anatEvalTeam === true }) });
         if(!r.ok){
           const e = await r.json().catch(() => ({}));
           return showWhy("u-why", (e.error && e.error.message) || "The server refused it.");
@@ -40961,8 +41455,8 @@ function userForm(u){
       }catch(e){ return showWhy("u-why", "Could not reach the server."); }
     }
     if(isNew) S.db.users.push(u);
-    // One clinic manager: the server cleared the previous holder; mirror it here.
-    if(u.clinicManager) for(const x of S.db.users) if(x !== u && x.clinicManager) x.clinicManager = false;
+    // One person takes the unowned site tasks: the server cleared the previous holder; mirror it here.
+    if(u.taskFallback) for(const x of S.db.users) if(x !== u && x.taskFallback) x.taskFallback = false;
     const roleText = u.role + (extraRoles.length ? " + " + extraRoles.join(", ") : "") +
       (accessType === "EXTERNAL" ? " (external)" : "");
     logAction((isNew ? "Provisioned " : "Updated ") + u.email + " as " + roleText,
@@ -41063,7 +41557,14 @@ function locForm(l){
       '<div class="hint">The day this site became able to take subjects. It is what the ' +
         'days to the first study subject and the recruitment rate are measured from — ' +
         'leave it empty and this site is reported as having no figures, rather than ' +
-        'being given wrong ones.</div></div><div></div></div>' : "") +
+        'being given wrong ones.</div></div>' +
+      /* THE SITE NUMBER (v3.19.0, 17 Nov 2026, the owner): 401, 402 ... A study subject here is
+         numbered from it (401-01, 401-02). Unique; fixed once a subject carries it. */
+      '<div class="field"><label for="l-num">Site number</label>' +
+      '<input type="text" id="l-num" inputmode="numeric" maxlength="3" placeholder="e.g. 401" value="' + esc(l.siteNumber || "") + '">' +
+      '<div class="hint">Three digits. Every study subject at this site is numbered from it — ' +
+        '401-01, 401-02 — and none can be registered here as Study until it is set. ' +
+        'No two sites share a number.</div></div></div>' : "") +
     '<div class="grid g3"><div class="field"><label for="l-c">Contact person</label>' +
       '<input type="text" id="l-c" value="' + esc(l.contact) + '"></div>' +
       '<div class="field"><label for="l-p">Phone</label><input type="tel" id="l-p" value="' + esc(l.phone) + '"></div>' +
@@ -41116,6 +41617,16 @@ function locForm(l){
     if($("#l-t").value !== "SITE") cpmPick = null;
     if($("#l-t").value === "SITE" && !cpmPick)
       return showWhy("l-why", "Choose the Responsible CPM - a hospital site cannot be saved without one.");
+    /* The site number (v3.19.0): the server makes the same checks, and also refuses changing a
+       number already in subject codes (SITE_NUMBER_IN_USE). Said here before the press. */
+    const siteNumber = $("#l-t").value === "SITE" ? (($("#l-num") || {}).value || "").trim() : "";
+    if(siteNumber && !AnatStages.siteNumberOk(siteNumber))
+      return showWhy("l-why", "The site number is three digits, like 401.");
+    const numHolder = AnatStages.siteNumberHolder(S.db.locations, l.id, siteNumber);
+    if(numHolder) return showWhy("l-why", "Site number " + siteNumber + " already belongs to " + numHolder.name + ".");
+    if(l.siteNumber && l.siteNumber !== siteNumber &&
+       (S.db.patients || []).some(x => new RegExp("^" + l.siteNumber + "-\\d+(-CU)?$", "i").test(String(x.patientCode || ""))))
+      return showWhy("l-why", "Site number " + l.siteNumber + " is already in subject codes, so it cannot be changed.");
     Object.assign(l, { name, type:$("#l-t").value, address:$("#l-a").value.trim(),
       country:$("#l-country").value.trim(),
       region:$("#l-region").value.trim(),
@@ -41125,7 +41636,7 @@ function locForm(l){
       contact:$("#l-c").value.trim(), phone:$("#l-p").value.trim(),
       email:$("#l-e").value.trim(), cpmUserId:cpmPick,
       physician1:($("#l-ph1").value || "").trim(), physician2:($("#l-ph2").value || "").trim(),
-      echoist:($("#l-echo").value || "").trim() });
+      echoist:($("#l-echo").value || "").trim(), siteNumber });
 
     if(S.backend){
       /* Live database: the server writes the Lists row and returns it with a fresh
@@ -41144,6 +41655,7 @@ function locForm(l){
           openedAt:l.openedAt || "",
           contact:l.contact, phone:l.phone, email:l.email, cpmUserId:l.cpmUserId,
           physician1:l.physician1 || "", physician2:l.physician2 || "", echoist:l.echoist || "",
+          siteNumber:l.siteNumber || "",
           _etag:l._etag });
         const i = S.db.locations.findIndex(x => x.id === saved.id);
         if(i >= 0) S.db.locations[i] = saved; else S.db.locations.push(saved);
