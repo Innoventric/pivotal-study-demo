@@ -16325,7 +16325,7 @@ function scheduleCaseFileSave(p){
   if(!S.backend || !p || !p.id) return;
   /* A report kept on this device has now been worked on, so once it has all reached the
      server it is the device's to delete (pkgMaybeRetire). */
-  if(pkgOf(p.id)) pkgTouch(p.id);
+  if(pkgHeld(p.id)) pkgTouch(p.id);
   if(queueFor(p)){
     /* No network, or something earlier for this patient still waiting: the write goes to
        the queue behind it rather than overtaking it. */
@@ -16826,11 +16826,24 @@ async function pkgSave(p, opts){
   if(!p || !S.me) return;
   opts = opts || {};
   const prev = pkgOf(p.id) || {};
+  /* Two kinds (17 Nov 2026). An EDITOR package (opts.editor: the report taken offline) is
+     held on the server and retires once synced. A READ-ONLY one (opts.readOnly: "Keep files
+     on this device") holds nothing, is never edited, and goes after 7 days. An editor
+     package wins: keeping files on a report already held does not shorten or weaken the
+     hold, and opening a read-only copy for editing turns it into an editor one. A plain
+     refresh (no opts) keeps whichever it was. */
+  const readOnly = opts.editor ? false
+    : opts.readOnly ? (prev.id ? !!prev.readOnly : true)
+    : !!prev.readOnly;
+  const until = (opts.readOnly && prev.id && !prev.readOnly) ? (prev.until || null)
+    : (opts.until || prev.until || null);
   const rec = Object.assign({}, prev, pkgSnapshot(p), {
     pinned: !!(opts.pinned || prev.pinned),
     touched: !!prev.touched,
     downloadedAt: prev.downloadedAt || nowISO(),
-    until: opts.until || prev.until || null
+    until,
+    readOnly,
+    files: opts.files || prev.files || []
   });
   OFF.pkgs[p.id] = rec;
   await offPersist("pkgs", rec);
@@ -16842,10 +16855,17 @@ function pkgTouch(id){
   offPersist("pkgs", k);
 }
 async function pkgDrop(id){
-  if(!OFF.pkgs[id]) return;
+  const k = OFF.pkgs[id];
+  if(!k) return;
   delete OFF.pkgs[id];
   await offPersist("pkgs", id, true);
+  /* The subject's files go with the package, whichever kind it was. */
+  if(k.files && k.files.length) await offDropFiles(k.files);
 }
+/* The package that HOLDS the report (taken offline to edit). A read-only copy is not one:
+   it must never make opening the report take the 36-hour claim, keep the report from being
+   released on close, or say "others can only view it". */
+function pkgHeld(id){ const k = pkgOf(id); return k && !k.readOnly ? k : null; }
 /* Keep each package as fresh as the record on screen. Debounced: commit() runs on every
    keystroke, and the package is a copy for a reload with no network, not the save. */
 function pkgRefreshSoon(){
@@ -16863,6 +16883,12 @@ function pkgRefreshSoon(){
    a report downloaded ahead and not used yet - that one is still waiting for its day. */
 async function pkgMaybeRetire(id){
   const k = pkgOf(id);
+  /* A read-only copy has nothing to sync and no hold to hand back: it goes when its 7 days
+     are up (the owner), on Remove, or at sign-out - with or without a network. */
+  if(k && k.readOnly){
+    if(pkgExpired(k)){ await pkgDrop(id); paintOffline(); }
+    return;
+  }
   if(!k || !S.backend || !S.me || k.user !== S.me.email) return;
   if(netDown() || OFF.ops.some(o => o.pid === id)) return;
   if(k.pinned && !k.touched) return;
@@ -16871,6 +16897,143 @@ async function pkgMaybeRetire(id){
   catch(e){ if(e.code === "OFFLINE") return; }
   await pkgDrop(id);
   paintOffline();
+}
+
+/* ---- A SUBJECT'S FILES ON THIS DEVICE, to read with no network (17 Nov 2026) ------
+   Phase A of offline beyond the report. the owner's three decisions, asked one at a time:
+   (1) ONLY the files the app knows - the evaluation files, the procedure images, an
+       uploaded procedure summary and the filed procedure report. Never a folder listing:
+       a file dropped into SharePoint by hand has had no identifier review, and the app
+       has never shown one (patientFileList says the same).
+   (2) Anybody who can see a subject's files (canSeeReport), from the subject's folder
+       dialog. READ ONLY: no claim is taken, nobody else is affected. The editor's "Keep
+       on this device for offline use" on the report brings the files too.
+   (3) The copy goes after 7 DAYS, on Remove, or at sign-out - whichever comes first.
+       Keeping it again starts the 7 days again.
+
+   The bytes live in the Cache Storage bucket OFF_FILES_CACHE, under each file's own
+   address, and sw.js answers those addresses from it ONLY when the network does not - so
+   every <img>, PDF frame, download link and the report viewer work offline unchanged,
+   and with a network the server still answers, and still checks who is asking. The
+   package (IndexedDB `pkgs`) holds the subject's record and the list of addresses kept,
+   which is what deletes them. sw.js reads the same bucket name; offlineReport.test.js
+   asserts the two agree. */
+const OFF_FILES_CACHE = "pivotal-files-v1";
+const OFF_READ_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+function pkgExpired(k){
+  return !!(k && k.readOnly && k.until && Date.parse(k.until) <= Date.now());
+}
+function offFilesSupported(){
+  return !window.PIVOTAL_DEMO && !!S.backend && typeof caches !== "undefined" && !!caches &&
+         typeof navigator !== "undefined" && !!navigator.serviceWorker;
+}
+/* What is kept, as the addresses the screens already ask for. The filed report is asked
+   for both ways (locked, working copy); whichever is not there is simply not kept. */
+function offFileTargets(p){
+  const seen = new Set(), out = [];
+  const add = f => {
+    if(!f || !f.id || !f.filename || seen.has(f.id)) return;
+    seen.add(f.id);
+    out.push({ url:anatFileUrl(p, f), name:f.original || f.filename });
+  };
+  patientFileList(p).forEach(x => add(x.f));
+  summaryUploads(p).forEach(add);
+  if(isPostProcedure(p)){
+    [1, 0].forEach(l => out.push({ url:"/api/patients/" + encodeURIComponent(p.id) +
+      "/procedure-report/file?locked=" + l, name:"Procedure report", optional:true }));
+  }
+  return out;
+}
+/* Fetch each one and keep it. One at a time - a presentation can be tens of MB, and a
+   phone on hospital Wi-Fi does better with one stream than with eight. */
+async function offKeepFiles(p){
+  const list = offFileTargets(p);
+  const cache = await caches.open(OFF_FILES_CACHE);
+  const kept = []; let failed = 0, bytes = 0;
+  for(const it of list){
+    try{
+      const r = await fetch(it.url, { credentials:"same-origin", cache:"no-store" });
+      if(!r.ok){ if(!it.optional) failed++; continue; }
+      const blob = await r.blob();
+      await cache.put(it.url, new Response(blob, { status:200, headers:r.headers }));
+      kept.push(it.url);
+      bytes += blob.size;
+    }catch(e){ if(!it.optional) failed++; }
+  }
+  return { kept, failed, bytes, wanted:list.filter(x => !x.optional).length };
+}
+async function offDropFiles(urls){
+  if(typeof caches === "undefined" || !caches || !urls || !urls.length) return;
+  try{
+    const cache = await caches.open(OFF_FILES_CACHE);
+    for(const u of urls) await cache.delete(u);
+  }catch(e){}
+}
+/* At boot and every half hour: read-only copies past their 7 days go (with no network
+   too - the rule is about the device, not the server), and anything in the bucket that no
+   package names goes too, so a crash between "kept" and "recorded" leaves nothing behind. */
+async function offSweepFiles(){
+  for(const id of Object.keys(OFF.pkgs)) if(pkgExpired(OFF.pkgs[id])) await pkgDrop(id);
+  if(typeof caches === "undefined" || !caches || typeof location === "undefined") return;
+  try{
+    const want = new Set();
+    Object.values(OFF.pkgs).forEach(k => (k.files || []).forEach(u => want.add(new URL(u, location.href).href)));
+    const cache = await caches.open(OFF_FILES_CACHE);
+    for(const req of await cache.keys()) if(!want.has(req.url)) await cache.delete(req);
+  }catch(e){}
+}
+function offMB(n){ return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
+/* "Keep files on this device" - decision 2. */
+async function offKeepRead(p, done){
+  if(!p || !offFilesSupported()) return;
+  if(netDown()) return toast("There is no network. Files can only be kept while online.", "bad");
+  toast("Saving the files of " + p.patientCode + " on this device…");
+  let got;
+  try{ got = await offKeepFiles(p); }
+  catch(e){ return toast("The files could not be kept on this device (" + (e.message || "storage refused") + ").", "bad"); }
+  const prev = pkgOf(p.id);
+  const files = [...new Set([].concat((prev && prev.files) || [], got.kept))];
+  await pkgSave(p, { readOnly:true, files,
+                     until:new Date(Date.now() + OFF_READ_KEEP_MS).toISOString() });
+  /* The browser may clear site data under pressure unless asked not to. Best effort. */
+  try{ if(navigator.storage && navigator.storage.persist) navigator.storage.persist(); }catch(e){}
+  logAction("Subject files kept on this device for offline reading: " + p.patientCode, { locationId:p.siteId,
+    stateChanges:got.kept.length + " file(s), " + offMB(got.bytes),
+    comments:"Read only. Deleted from the device after 7 days, on Remove, or at sign-out" });
+  const k = pkgOf(p.id);
+  toast(got.failed
+    ? got.kept.length + " file(s) kept, " + got.failed + " could not be saved. Try again for the rest."
+    : (got.kept.length ? got.kept.length + " file(s) of " + p.patientCode + " are on this device" +
+        (k && k.readOnly && k.until ? " until " + offWhen(k.until) : "") + "."
+      : "There were no files to keep. The subject's record is on this device."), got.failed ? "warn" : "good");
+  if(done) done();
+}
+async function offDropRead(p, done){
+  const k = p && pkgOf(p.id);
+  if(!k) return;
+  if(k.readOnly) await pkgDrop(p.id);
+  else{
+    /* An editor package keeps its record and its hold; only the files go. */
+    await offDropFiles(k.files || []);
+    k.files = [];
+    await offPersist("pkgs", k);
+  }
+  logAction("Subject files removed from this device: " + p.patientCode, { locationId:p.siteId });
+  toast("Removed from this device.", "good");
+  if(done) done();
+}
+function offFilesBar(p){
+  if(!offFilesSupported() || !canSeeReport() || isExternalUser() || !p) return "";
+  const k = pkgOf(p.id), n = k && k.files ? k.files.length : 0;
+  if(k && (n || k.readOnly)){
+    return '<span class="pill p-blue">On this device' +
+      (k.readOnly && k.until ? ' until ' + esc(offWhen(k.until)) : '') + ' · ' + n + ' file(s)</span>' +
+      (netDown() ? '' : '<button class="btn btn-sm" id="pf-off-keep">Update</button>') +
+      '<button class="btn btn-sm" id="pf-off-drop">Remove from this device</button>';
+  }
+  if(netDown()) return "";
+  return '<button class="btn btn-sm" id="pf-off-keep" title="Read them with no network. Deleted after 7 days.">' +
+    'Keep files on this device</button>';
 }
 
 /* The treatment day, by THIS device's calendar - todayISO() is the UTC date, which is
@@ -16897,7 +17060,7 @@ async function cfTakeOffline(id){
     cfApply(id, r, {});
     if(!r.mine) return toast((r.lockedBy ? cfWho(r.lockedBy) + " is editing this report." : "That did not go through.") +
       " It was not made available offline.", "bad");
-    await pkgSave(patient(id), { pinned:true, until:r.expiresAt });
+    await pkgSave(patient(id), { pinned:true, until:r.expiresAt, editor:true });
     logAction("Procedure report made available offline for " + p.patientCode, { locationId:p.siteId,
       stateChanges:"held on this device until " + offWhen(r.expiresAt),
       comments:"Others can view it until it is synced, released or taken over" });
@@ -16933,8 +17096,9 @@ async function cfDropOffline(id){
    went is ours too, as far as anybody here can tell, and the server re-checks every change
    when it arrives. */
 function cfOfflineHold(id){
-  const k = pkgOf(id);
-  CF_HOLD = { id, mine: cfCanEdit(), by:"", at: k ? k.downloadedAt : null,
+  const k = pkgHeld(id), ro = pkgOf(id);
+  /* A subject started with no network from a READ-ONLY copy is read only (17 Nov 2026). */
+  CF_HOLD = { id, mine: cfCanEdit() && !(ro && ro.readOnly && S.offlineBoot), by:"", at: k ? k.downloadedAt : null,
               expiresAt: k ? k.until : null, ttlMs: CF_TTL_MS, offline: true, local: true };
 }
 
@@ -17072,6 +17236,8 @@ function offConfirmDiscard(o){
 async function offBootOffline(){
   if(window.PIVOTAL_DEMO) return false;
   await offLoad();
+  /* Past its 7 days, a read-only copy is not something to start on (17 Nov 2026). */
+  await offSweepFiles();
   const pkgs = Object.values(OFF.pkgs).filter(k => k && k.me && k.me.email)
     .sort((a, b) => String(b.savedAt || "").localeCompare(String(a.savedAt || "")));
   const who = pkgs.length ? pkgs[0].me : null;
@@ -17096,7 +17262,9 @@ async function offBootOffline(){
     if(!S.db.patients.some(p => p.id === k.id)) S.db.patients.push(k.patient);
   }
   S.offlineBoot = true;
-  if(mineK.length === 1){
+  /* A read-only copy (17 Nov 2026) opens on Home, where its row and its View button are -
+     never straight into the report, which it does not hold. */
+  if(mineK.length === 1 && !mineK[0].readOnly){
     S.view = "clinical"; SITEID = mineK[0].siteId || null; PID = mineK[0].id;
     /* Before the first render, so the banner is drawn saying whose it is. With no network
        claimCaseFile settles it on the device, synchronously, before it awaits anything. */
@@ -17148,6 +17316,8 @@ function offStart(){
   window.addEventListener("online",  () => { offNetBack(); });
   window.addEventListener("offline", () => { offNetGone(); });
   setInterval(() => { offProbe(); }, 30 * 1000);
+  /* Read-only copies whose 7 days ran out while the app stayed open. */
+  setInterval(() => { offSweepFiles().then(paintOffline); }, 30 * 60 * 1000);
 }
 
 /* ===================================================== WHO IS EDITING THIS FILE ===
@@ -17320,12 +17490,12 @@ async function claimCaseFile(id){
        ON THE TREATMENT DAY the editor's claim is the offline one, and the report is kept on
        this device: a network that drops in the procedure room then costs nothing (the owner,
        2 Oct 2026, decision 1). So is a report this person already took offline here. */
-    const k = pkgOf(id), p = patient(id);
+    const k = pkgHeld(id), p = patient(id);
     const off = cfCanEdit() && !!(isTreatmentDay(p) || (k && k.user === (S.me && S.me.email)));
     const r = cfCanEdit() ? await checkoutPatientRemote(id, off ? { offline:true } : {})
                           : await checkoutStatusRemote(id);
     cfApply(id, r, { first:true });
-    if(off && r.mine) await pkgSave(patient(id), { until:r.expiresAt });
+    if(off && r.mine) await pkgSave(patient(id), { until:r.expiresAt, editor:true });
   }catch(e){
     /* a failed claim must not stop the file opening - and a network that went between
        the screen and the answer leaves the device to answer, as above */
@@ -17343,7 +17513,7 @@ async function unclaimCaseFile(id){
   /* A report kept on this device is not handed back by closing it while anything recorded
      here is still waiting, with no network, or when it was downloaded ahead and has not
      been used yet. Otherwise this is the moment it has all landed, and it goes. */
-  if(pkgOf(id)) return pkgMaybeRetire(id);
+  if(pkgHeld(id)) return pkgMaybeRetire(id);
   try{ await releasePatientRemote(id); }catch(e){}
 }
 
@@ -17537,7 +17707,7 @@ function paintCaseHold(){
 }
 function cfHoldKey(){
   if(!CF_HOLD) return "";
-  const k = pkgOf(CF_HOLD.id);
+  const k = pkgHeld(CF_HOLD.id);
   return (CF_HOLD.mine ? "mine" : "") + "|" + (CF_HOLD.by || "") + "|" + (CF_HOLD.at || "") +
     "|" + (CF_HOLD.offline ? "off" : "") + "|" + (k ? (k.pinned ? "pin" : "kept") : "") +
     "|" + (netDown() ? "down" : "") + "|" + offOpsFor(CF_HOLD.id).length;
@@ -17545,7 +17715,7 @@ function cfHoldKey(){
 /* THE EDITOR'S HALF: is this report on this device, and what can be done about it. */
 function caseOfflineInner(){
   if(!CF_HOLD || !CF_HOLD.mine || !cfCanEdit()) return "";
-  const id = CF_HOLD.id, k = pkgOf(id), n = offOpsFor(id).length;
+  const id = CF_HOLD.id, k = pkgHeld(id), n = offOpsFor(id).length;
   if(netDown()){
     return '<div class="cf-offline"><span class="pill p-blue">No network</span><span>' +
       (k ? 'This report is on this device. ' : 'This report was open when the network went, so it carries on here. ') +
@@ -18023,6 +18193,10 @@ const WHATS_NEW = {
       "The Pliable Model Evaluation is scored in full every time too.",
       "Angles are entered as <b>LAO or RAO</b> with the angle and <b>CRAN or CAUD</b> with the angle, everywhere, the procedure report included.",
       "After the Digital Model Evaluation the <b>Clinical Manager</b> decides: clinically feasible — printing opens (or stages 3–6 are not required when no physical model is needed) — or not clinically feasible — the subject goes on hold. Nothing is printed before that."
+    ]},
+    { h:"Procedure summary", items:[
+      "<b>Anyone at Innoventric can fill in an open procedure summary</b>, whoever it was given to and however late it is. The people it was given to still have it as their task, with the reminders and the daily mail; they no longer decide who may write it.",
+      "A closed summary is unchanged: only an App Admin or a Manager can change it, with a reason."
     ]}
   ]},
   { version: "3.17.0", date: "16 November 2026", groups: [
@@ -20986,6 +21160,7 @@ async function boot(){
   applyExpiry();
   /* The offline queue and the reports kept on this device, before anything else asks. */
   await offLoad();
+  offSweepFiles();
   offStart();
   /* The service worker keeps a copy of the page and its scripts, so the app OPENS with no
      network (sw.js). It never touches /api or /auth. Not in the demo, which is a static
@@ -27835,6 +28010,7 @@ function openPatientFiles(p, focusId){
         ? '<button class="btn btn-sm" id="pf-report">Open the procedure report</button>' : "") +
       /* Everybody who can open this dialog since 20 Oct 2026 - it was App Admin only. */
       (S.backend && !isExternalUser() ? '<button class="btn btn-sm" id="pf-sp">Open the folder in SharePoint</button>' : "") +
+      offFilesBar(p) +
       '<span class="hint">' + esc(patientFolder(p)) + '</span>' +
     '</div>' +
     (list.length
@@ -27879,6 +28055,13 @@ function openPatientFiles(p, focusId){
   if(rep) rep.onclick = () => { closeModal(); openReportViewer(p); };
   const sp = $("#pf-sp");
   if(sp) sp.onclick = () => openSharePointFolder(p, sp);
+  /* Keep / Update / Remove (17 Nov 2026). The dialog is drawn again after, so it says
+     what is true now. */
+  const reopen = () => { if($("#pf-off-keep") || $("#pf-off-drop")) openPatientFiles(p, list[at] && list[at].f.id); };
+  const offKeep = $("#pf-off-keep");
+  if(offKeep) offKeep.onclick = () => { offKeep.disabled = true; offKeepRead(p, reopen); };
+  const offDrop = $("#pf-off-drop");
+  if(offDrop) offDrop.onclick = () => offDropRead(p, reopen);
   if(list.length) show(at);
 }
 
@@ -30262,7 +30445,7 @@ async function saveDraft(p){
     }
     /* Let go of the soft check-out - unless the report is kept on this device, whose
        hold ends when it has synced (unclaimCaseFile → pkgMaybeRetire). */
-    if(!pkgOf(p.id) && !queueFor(p)){ try{ await releasePatientRemote(p.id); }catch(_){} }
+    if(!pkgHeld(p.id) && !queueFor(p)){ try{ await releasePatientRemote(p.id); }catch(_){} }
   }
   /* AFTER the remote save, so the document is built from what was actually stored. */
   const filed = await fileProcedureReport(p, false);
@@ -37272,8 +37455,9 @@ function mayWorkSummary(p){
   const s = summaryOf(p);
   if(!s) return false;
   if(s.status === "CLOSED") return can("editSubmittedReport");
+  /* Any internal user, whoever the task is on and however late (17 Nov 2026, the owner). */
   return summaryIsMine(p) || myRoles().some(r => ["ADMIN","MANAGER","CPM"].includes(r)) ||
-    (!!s.legacy && !isExternalUser());
+    !isExternalUser();
 }
 function summaryState(p){ return PSF.state(summaryOf(p), Date.now()); }
 /* Open summaries this person was given - the badge and the Home card. */
