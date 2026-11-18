@@ -509,6 +509,10 @@ table.su-hist-t td{white-space:normal; vertical-align:top;}
    for an A4 page, so the report viewer opts into a wider dialog rather than every
    dialog growing. It still shrinks on a phone: the width is a maximum. */
 .modal-wide{max-width:940px;}
+/* The whole screen (18 Nov 2026, the owner): the subject window - registration and edit - holds the
+   fields, Initial Subject Data, the chat and the checklists. The backdrop's 20px padding is the
+   only margin left. */
+.modal.modal-full{max-width:none; width:100%; height:100%; max-height:none;}
 
 .toast-wrap{position:fixed; right:18px; bottom:18px; z-index:200; display:flex;
             flex-direction:column; gap:8px; align-items:flex-end;}
@@ -26783,7 +26787,7 @@ VIEWS.screening = {
           '</span></label>';
       }).join("") +
       '</div></div>';
-    h += screeningQuestionsCard(p);
+    h += initialDataCard(p) + screeningQuestionsCard(p);
 
     const ctReady = p.screening.ct.done;
 
@@ -40240,6 +40244,7 @@ function patientForm(p, justCreated){
   patientFormRender(p, isNew, justCreated);
 }
 let PF_PREV = null;
+const INITIAL_DATA_MAX = 15000;
 /* The code this window would save, by the shared rule - shown in the code field before the
    press, and checked again at the press. The server is the authority (caseService). */
 function pfCodePreview(p, siteId, proto, typed){
@@ -40251,6 +40256,15 @@ function pfCodePreview(p, siteId, proto, typed){
 /* THE CLINICAL QUESTIONS ON SCREENING. Since 16 Nov 2026 (the owner) this card shows every OPEN
    question and task of the subject chat - critical first, each signed - with "Open full chat"
    for the whole thread, solved items included, where everything is done. */
+/* INITIAL SUBJECT DATA on the Screening screen (18 Nov 2026): it was only inside the Edit
+   window, so a subject looked as though it had none. Read here; changed in the Edit window. */
+function initialDataCard(p){
+  const t = String(p.initialData || "").trim();
+  if(!t) return "";
+  return '<div class="card"><div class="card-hd"><h2>Initial Subject Data</h2>' +
+    '<span class="hint">' + t.length + ' characters · to change it, open the subject with Edit</span></div><div class="card-bd">' +
+    '<div style="white-space:pre-wrap;max-height:340px;overflow:auto">' + esc(t) + '</div></div></div>';
+}
 function screeningQuestionsCard(p){
   const open = chatOpenItems(p);
   const crit = open.filter(it => it.critical).length;
@@ -40315,7 +40329,11 @@ function patientFormRender(p, isNew, justCreated){
       '<div class="hint" id="p-code-why"></div></div>';
   /* INITIAL SUBJECT DATA (v3.19.0, the owner): required at creation. One free-text field for now. */
   const initField = '<div class="field"><label' + (isNew ? ' class="req"' : '') + ' for="p-init">4. Initial Subject Data</label>' +
-      '<textarea id="p-init" rows="3" maxlength="4000">' + esc(p.initialData || "") + '</textarea></div>';
+      /* 15,000 characters (18 Nov 2026): a pasted clinical summary ran past the old 4,000 and
+         was cut silently. The whole subject is one SharePoint text value (PatientJson), whose
+         largest record in production was ~20,000 characters, so this keeps well inside it. */
+      '<textarea id="p-init" rows="12" maxlength="' + INITIAL_DATA_MAX + '" style="resize:vertical">' + esc(p.initialData || "") + '</textarea>' +
+      '<div class="hint" id="p-init-n">' + String(p.initialData || "").length + ' / ' + INITIAL_DATA_MAX + ' characters</div></div>';
   if(isNew){
     modal("Register a subject",
       '<div class="grid g3">' + siteField + protoField + codeField + '</div>' + initField +
@@ -40354,8 +40372,9 @@ function patientFormRender(p, isNew, justCreated){
     '<div class="row"><button class="btn" data-close="1">' + (justCreated ? "Close" : "Cancel") + '</button>' +
     '<button class="btn btn-primary" id="p-save">Save</button>' +
     '</div>' + whyBox("p-why"));
-  /* Wide (v3.0.0, item 14): the form holds a dozen fields and a list of questions. */
-  const pfm = $("#modal-root .modal"); if(pfm) pfm.classList.add("modal-wide");
+  /* The whole screen (18 Nov 2026, the owner - it was only wide, v3.0.0 item 14): creating and
+     editing a subject. */
+  const pfm = $("#modal-root .modal"); if(pfm) pfm.classList.add("modal-full");
 
   /* The protocol follows the site. Run now and on every change of site, so choosing a
      site that is not in the study settles it in front of the person doing the registering
@@ -40425,6 +40444,9 @@ function patientFormRender(p, isNew, justCreated){
     if(pr){ const prev = pr.onchange; pr.onchange = e => { if(prev) prev(e); paintCode(); }; }
     paintProtocol();
     paintCode();
+    const ini = $("#p-init"), inN = $("#p-init-n");
+    if(ini && inN) ini.oninput = () => { inN.textContent = ini.value.length + " / " + INITIAL_DATA_MAX + " characters" +
+      (ini.value.length >= INITIAL_DATA_MAX ? " — the limit; anything longer is not kept" : ""); };
   }
 
   /* Re-rendering the modal would lose focus, so the list edits are handled in place
