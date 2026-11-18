@@ -16243,7 +16243,9 @@ const PATIENT_SERVER_OWNED = ["_itemId", "_etag", "fileLocked", "submitted",
                                  typed can be in the air when the reply lands. */
                               "patientCode",
                               /* the unused-units task (v3.19.0): written only by its routes */
-                              "unusedTask"];
+                              "unusedTask",
+                              /* the code the subject's folder was made under (18 Nov 2026) */
+                              "folderCode"];
 /* Merge a patient the SERVER sent into the local copy.
 
    THE 2 SEP 2026 DATA LOSS LIVED HERE, and it is worth stating plainly because the shape
@@ -18108,7 +18110,9 @@ function announceOrderRequest(p, opts){
    collected files, redacted images, the locked case-file archive and (later) the
    generated PDF summary all live here, so a patient's whole record is in one place.
    This is the one definition the SharePoint patient-folder work will build on. */
-function patientFolder(p){ return locName(p.siteId) + "/Clinical_Procedures/" + p.patientCode; }
+/* Built from the code the folder was made under (18 Nov 2026): a subject whose code changed
+   with its protocol keeps its folder. Same rule as procedureFiling.folderCodeOf. */
+function patientFolder(p){ return locName(p.siteId) + "/Clinical_Procedures/" + (p.folderCode || p.patientCode); }
 
 function queueBackup(path, filename, content){
   const rec = { id:uid("bkp"), path, filename, content:JSON.stringify(content), ts:nowISO(),
@@ -18358,6 +18362,9 @@ const WHATS_NEW = {
       "After <b>Done with 2.1</b>, stage 2 is shown as the <b>Anatomical evaluation team</b>’s task (2.2 scoring) — on Home, in the <b>With</b> column and in the emails — and no longer as the evaluator’s.",
       "A subject waiting for the clinical feasibility decision shows <b>Clinic managers</b> in the With column.",
       "On the days without the full summary, a member of the evaluation team finds the 2.2 scorings in their own mail, and a clinic manager the feasibility decisions."
+    ]},
+    { h:"A subject's folder keeps its name", items:[
+      "When a subject’s code changes with its protocol (for example YJP becomes 401-04, or 401-03 becomes 401-03-CU), its folder in SharePoint keeps the name it was created with, and its files and <b>Folder</b> keep working. Before this, the files of a subject whose code changed could no longer be opened."
     ]},
     { h:"Administration", items:[
       "<b>Locations</b> shows each hospital site’s <b>site number</b>, and says <b>not set</b> where it is missing — a Study subject cannot be registered there until it is set."
@@ -26961,6 +26968,7 @@ VIEWS.screening = {
       p.protocol = proto.value;
       const to = protocolOf(p);
       if(to === from) return;
+      if(!p.folderCode) p.folderCode = oldCode;    // the folder keeps its first name (18 Nov 2026)
       p.patientCode = cr.code;
       logAction("Protocol changed for " + p.patientCode + " to " + nameOf(to), {
         locationId:p.siteId, highPriority:true,
@@ -40533,6 +40541,8 @@ function patientFormRender(p, isNew, justCreated){
     if(isNew && !initialData) return showWhy("p-why", "Initial Subject Data is required.");
     const before = p.status;
     const protoBefore = protocolOf(p);
+    /* The folder keeps its first name (18 Nov 2026) - the server sets this too. */
+    if(!p.folderCode) p.folderCode = isNew ? code : String((PF_PREV && PF_PREV.patientCode) || p.patientCode || code);
     p.patientCode = code;
     p.initialData = initialData;
     p.siteId = $("#p-site").value;
