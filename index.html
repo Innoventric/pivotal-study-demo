@@ -11875,6 +11875,13 @@ function part1Done(p){
   var a = (p && p.anat && p.anat.model3d) || {};
   return !!(a.part1 && a.part1.at) || a.status === "Completed";
 }
+/* WHOSE TASK STAGE 2 IS AFTER 2.1 (18 Nov 2026, found in review): the evaluation team's, not
+   the evaluator's. The stage's assignedTo still names the 2.1 evaluator, so without this the
+   Home list, the With column and the mails went on chasing them for 2.2. */
+function waitsOnTeam(p, s){
+  var a = ((p && p.anat) || {})[s && s.k] || {};
+  return hasParts(s) && !!(a.part1 && a.part1.at) && a.status !== "Completed" && a.status !== "Not required";
+}
 /* opts.part: 1 = only what 2.1 asks, 2 = only what 2.2 asks; none = the whole stage. */
 function stageMissing(p, s, opts){
   var part = (opts && opts.part) || 0;
@@ -12432,7 +12439,7 @@ var api = {
   clinicManagerOf: clinicManagerOf, clinicManagersOf: clinicManagersOf, evalTeamOf: evalTeamOf,
   siteNumberOk: siteNumberOk, nextStudyCode: nextStudyCode, subjectCodeFor: subjectCodeFor,
   siteNumberHolder: siteNumberHolder,
-  hasParts: hasParts, part1Of: part1Of, part1Done: part1Done,
+  hasParts: hasParts, part1Of: part1Of, part1Done: part1Done, waitsOnTeam: waitsOnTeam,
   SUIT: SUIT, suitabilityOf: suitabilityOf, suitabilityOptions: suitabilityOptions,
   scoringGaps: scoringGaps, MODEL_NEED: MODEL_NEED, modelNeedLabel: modelNeedLabel,
   PRINT_GATE_STAGES: PRINT_GATE_STAGES, printGateApplies: printGateApplies,
@@ -15497,10 +15504,21 @@ function stuckWith(p){
     return { who: cpm ? assigneeLabel(cpm) : "No CPM for this site", email: cpm,
              stage: null, why: "screening", overdue: false };
   }
+  /* Waiting on the clinic managers' feasibility decision (v3.19.0): nothing after stage 2
+     opens, so the loop below would find nobody. */
+  if(AnatStages.printGatePending(p)){
+    return { who: "Clinic managers", email: "", stage: null, label: "Clinical feasibility decision",
+             why: "gate", overdue: false };
+  }
   for(const s of ANAT_STAGES){
     if(!stageOpen(p, s)) continue;
     if(!anatUnlocked(p, s.k)) continue;
     const a = p.anat[s.k] || {};
+    /* After 2.1 the Digital Model waits on the Anatomical evaluation team (v3.19.0). */
+    if(AnatStages.waitsOnTeam(p, s)){
+      return { who: "Anatomical evaluation team", email: "", stage: s, label: s.n + ". " + s.label + " — 2.2 scoring",
+               why: "team", overdue: stageOverdue(p, s) };
+    }
     /* A stage nobody was given IS the CPM's task (10 Nov 2026, the owner) - shown under
        their name like any other, never as "unassigned". Only a site with no CPM and no
        clinic manager set is a gap worth naming. */
@@ -15527,6 +15545,8 @@ function myTasks(){
     if(!ctReady) continue;
     for(const s of ANAT_STAGES){
       if(!stageOpen(p, s) || !anatUnlocked(p, s.k)) continue;
+      /* After 2.1 the stage is the evaluation team's (its own Home card), not the evaluator's. */
+      if(AnatStages.waitsOnTeam(p, s)) continue;
       const a = p.anat[s.k] || {};
       const owner = String(a.assignedTo || "").toLowerCase();
       const mine = owner === me;
@@ -18333,6 +18353,16 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.19.2", date: "18 November 2026", groups: [
+    { h:"Who a step waits on", items:[
+      "After <b>Done with 2.1</b>, stage 2 is shown as the <b>Anatomical evaluation team</b>’s task (2.2 scoring) — on Home, in the <b>With</b> column and in the emails — and no longer as the evaluator’s.",
+      "A subject waiting for the clinical feasibility decision shows <b>Clinic managers</b> in the With column.",
+      "On the days without the full summary, a member of the evaluation team finds the 2.2 scorings in their own mail, and a clinic manager the feasibility decisions."
+    ]},
+    { h:"Administration", items:[
+      "<b>Locations</b> shows each hospital site’s <b>site number</b>, and says <b>not set</b> where it is missing — a Study subject cannot be registered there until it is set."
+    ]}
+  ]},
   { version: "3.19.1", date: "18 November 2026", groups: [
     { h:"Registering a subject", items:[
       "The subject window now fills the whole screen, for registering and for editing.",
@@ -23306,10 +23336,12 @@ function stuckWithCell(p){
   const w = stuckWith(p);
   if(!w) return '<span class="hint">—</span>';
   const name = '<b>' + esc(w.who) + '</b>';
-  const where = w.stage ? '<small>' + esc(w.stage.n + ". " + w.stage.label) + '</small>'
+  const where = w.label ? '<small>' + esc(w.label) + '</small>'
+              : w.stage ? '<small>' + esc(w.stage.n + ". " + w.stage.label) + '</small>'
                         : '<small>Screening material</small>';
-  /* App Admin / Manager: hand the task to somebody else from the row (10 Nov 2026). */
-  const change = (w.stage && mayReassignTasks() && !p.fileLocked)
+  /* App Admin / Manager: hand the task to somebody else from the row (10 Nov 2026). Not for
+     a step that belongs to a group (the evaluation team, the clinic managers). */
+  const change = (w.stage && !w.label && mayReassignTasks() && !p.fileLocked)
     ? ' <button class="btn btn-sm" data-task-reassign="' + esc(p.id + "|" + w.stage.k) + '" ' +
       'title="Give this task to somebody else">Change</button>' : "";
   return name + change + (w.overdue ? ' <span class="pill p-red">Overdue</span>' : "") +
@@ -29506,7 +29538,7 @@ function modelNeedBlock(p, s, dis){
         '<input type="text" id="an-' + s.k + '-modelNeedWhy" data-anat="' + s.k + '|modelNeedWhy" maxlength="400" value="' +
           esc(a.modelNeedWhy || "") + '"' + dis + '></div>' +
     '</div>' +
-    '<div class="hint">Completing this stage asks the Clinical Manager to decide whether the subject is ' +
+    '<div class="hint">Completing 2.2 asks the clinic managers to decide whether the subject is ' +
       'clinically feasible. Nothing is printed before that.</div>' +
     printGateBlock(p);
 }
@@ -29560,10 +29592,10 @@ function printGateBlock(p){
   }
   if(g.decision === "NOT_FEASIBLE" && !AnatStages.printGatePending(p)){
     return '<div class="warn" style="margin-top:8px"><b>Not clinically feasible</b> — ' + esc(g.byName || g.by) + ', ' +
-      esc(fmtTs(g.at)) + ': ' + esc(g.reason || "") + '. The subject is on hold; when the hold is released the ' +
-      'Clinical Manager decides again.</div>';
+      esc(fmtTs(g.at)) + ': ' + esc(g.reason || "") + '. The subject is on hold; when the hold is released a ' +
+      'clinic manager decides again.</div>';
   }
-  return '<div class="warn" style="margin-top:8px"><b>Waiting for the Clinical Manager</b> to decide whether ' +
+  return '<div class="warn" style="margin-top:8px"><b>Waiting for a clinic manager</b> to decide whether ' +
       esc(p.patientCode) + ' is clinically feasible (' + esc(AnatStages.modelNeedLabel(need)) + '). ' +
       'Nothing after this stage opens until then.' +
       (mayDecidePrintGate() ? '<div class="row" style="margin-top:8px">' +
@@ -30314,7 +30346,7 @@ VIEWS.clinical = {
     function flash(saved){
       if(saved === false){
         setCaseSaveState("failed", "This device's storage is full — nothing is being kept " +
-          "here either. Submit the report before reloading.");
+          "here either. Press Save and close before reloading.");
         return;
       }
       if(S.backend) return;
@@ -30710,7 +30742,7 @@ function missingForSubmit(p){
 function outstandingList(p){
   const m = missingForSubmit(p);
   if(!m.length) return '<div class="okbox" style="margin:10px 0 0">' +
-    'Nothing outstanding — this file can be submitted.</div>';
+    'Nothing outstanding — <b>Save and close</b> submits this report.</div>';
   return '<div class="warn" style="margin:10px 0 0"><b>' + m.length +
     ' item(s) outstanding for submission.</b> You can still save and come back.' +
     '<ul style="margin:6px 0 0;padding-left:18px">' +
@@ -40832,7 +40864,7 @@ VIEWS.admin = {
     if(ADMTAB === "locations" && admTabOpen("locations")){
       h += '<div class="row" style="margin-bottom:12px">' +
         '<button class="btn btn-primary" id="l-new">Add a location</button></div>' +
-        '<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Country</th>' +
+        '<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Type</th><th>Site no.</th><th>Country</th>' +
         '<th>Region</th>' +
         '<th>Address</th><th>Contact</th><th>Responsible CPM</th><th>Devices</th><th></th>' +
         '</tr></thead><tbody>' +
@@ -40843,6 +40875,11 @@ VIEWS.admin = {
           '<td>' + (l.type === "WAREHOUSE" ? '<span class="pill p-blue">Warehouse</span>'
                     : l.type === "HQ"     ? '<span class="pill p-green">Innoventric HQ</span>'
                                           : '<span class="pill p-pink">Hospital site</span>') + '</td>' +
+          /* The site number (v3.19.0): a hospital site without one cannot register a Study
+             subject, so it is named when missing. */
+          '<td>' + (l.type !== "SITE" ? '' : String(l.siteNumber || "").trim()
+                      ? '<b>' + esc(l.siteNumber) + '</b>'
+                      : '<span class="pill p-orange">not set</span>') + '</td>' +
           /* Says "not set" rather than showing an empty cell: an empty cell reads as a
              display fault, and the country is now what groups this location in every
              picker, so its absence is worth naming. */
@@ -41619,7 +41656,7 @@ function locForm(l){
         '</option>').join("") + '</select>' +
       '<div class="hint">' + (can("setSiteCpm")
         ? 'Required for a hospital site. Any user may be it. Receives this site\'s alerts, ' +
-          'its screening tasks and its stuck subjects in the daily mail.'
+          'its screening tasks and its stuck subjects in the Sunday summary mail.'
         : (l.cpmUserId
             ? 'Set by a Manager or an App Admin.'
             : 'This site has none yet - saving makes <b>you</b> its Responsible CPM. ' +
