@@ -18357,6 +18357,12 @@ document.addEventListener("keydown", e => {
    record ever reaches it. */
 const WHATS_NEW = {
   releases: [
+  { version: "3.20.0", date: "25 November 2026", groups: [
+    { h:"Administration", items:[
+      "A new tab, <b>Roles &amp; notifications</b>: one table with a row per person and a column per tick — <b>Screen Update</b>, <b>Stage Update</b>, <b>Stuck Update</b>, <b>Clinic manager</b>, <b>Sites with no CPM</b> and <b>Anatomical evaluation team</b>. Click a cell to tick or untick it; it is saved at once and written to the activity history.",
+      "These ticks are no longer in a user’s <b>Edit</b> window. Role, location, territory, title and phone stay there."
+    ]}
+  ]},
   { version: "3.19.2", date: "18 November 2026", groups: [
     { h:"Who a step waits on", items:[
       "After <b>Done with 2.1</b>, stage 2 is shown as the <b>Anatomical evaluation team</b>’s task (2.2 scoring) — on Home, in the <b>With</b> column and in the emails — and no longer as the evaluator’s.",
@@ -27592,7 +27598,7 @@ const STAGE_DONE_MAIL = ["ct", "model3d", "flexible", "approvals", "scheduling"]
 function requestEvalTeamMail(p){
   if(!S.backend || !p) return;
   api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/eval-team-mail", {})
-    .then(r => { if(r && r.team === 0) toast("Nobody is ticked as Anatomical evaluation team - set it on Administration → Users.", "warn"); })
+    .then(r => { if(r && r.team === 0) toast("Nobody is ticked as Anatomical evaluation team - set it on Administration → Roles & notifications.", "warn"); })
     .catch(() => {});
 }
 function requestStageDoneMail(p, stage){
@@ -28626,7 +28632,7 @@ function anatStageHtml(p, s, ctReady){
       const dis2 = (open2 && may2) ? dis : " disabled";
       inner += '<h3 style="margin:18px 0 8px">2.2 Anatomical scoring — Anatomical evaluation team</h3>' +
         (!open2 ? '<div class="note">Opens once 2.1 is confirmed — the evaluation team is then emailed and given the task.</div>'
-          : !may2 ? '<div class="note">Scored by the Anatomical evaluation team (ticked on Administration → Users).</div>' : '') +
+          : !may2 ? '<div class="note">Scored by the Anatomical evaluation team (ticked on Administration → Roles &amp; notifications).</div>' : '') +
         scoringBlock(p, s, dis2) + modelNeedBlock(p, s, dis2);
     }else{
       if(s.scoring) inner += scoringBlock(p, s, dis);
@@ -40777,6 +40783,9 @@ let ADMTAB = "users";
    they have no capability of their own, and inventing one for them is not this change. */
 const ADM_TABS = [
   { k:"users",     label:"Users",                show:() => can("manageUsers") },
+  /* One table of the per-person ticks (v3.20.0, 25 Nov 2026, the owner): they left the Edit
+     dialog. App Admin only - PUT /api/admin/users is requireRole("ADMIN"). */
+  { k:"access",    label:"Roles & notifications", show:() => hasRole("ADMIN") },
   { k:"locations", label:"Locations",            show:() => can("manageLocations") },
   { k:"approvals", label:"Regulatory approvals", show:() => hasRole("ADMIN") },
   { k:"notify",    label:"Notifications",        show:() => hasRole("ADMIN") },
@@ -40806,7 +40815,7 @@ VIEWS.admin = {
        team lists empty behind it. */
     if(admTabOpen("team")) await ensureTeam();
     if(admTabOpen("approvals")) await loadApprovals(true);
-    if(admTabOpen("users")) await loadAdminUserRecords();
+    if(admTabOpen("users") || admTabOpen("access")) await loadAdminUserRecords();
   },
   body(){
     /* ADMTAB is module-level and defaults to "users", so without this a CPM opening
@@ -41065,6 +41074,37 @@ VIEWS.admin = {
         })();
     }
 
+    if(ADMTAB === "access" && admTabOpen("access")){
+      const holder = (S.db.users || []).find(x => x.taskFallback === true);
+      h += '<div class="info">One row per person, one column per tick. <b>Click a cell</b> to tick ' +
+        'or untick it — it is saved at once and written to the activity history. ' +
+        'App Admins, Managers and QA receive the Stage and Stuck mail whether or not they are ticked. ' +
+        '<b>Sites with no CPM</b> is one person at a time: ticking somebody moves it to them' +
+        (holder ? '' : ' (nobody is ticked yet, so the first clinic manager takes those tasks)') + '. ' +
+        'Clinic manager, Sites with no CPM and the evaluation team are not for partner accounts.</div>' +
+        (S.backend && !ADMIN_USERS_LOADED
+          ? '<div class="warn">The full user records could not be read from the server, so the ticks ' +
+            'cannot be shown. Reload the page and try again.</div>'
+          : '<div class="tbl-wrap"><table class="team-grid"><thead><tr><th>Person</th>' +
+            ACCESS_COLS.map(c => '<th style="text-align:center" title="' + esc(c.title) + '">' +
+              esc(c.label) + '</th>').join("") + '</tr></thead><tbody>' +
+            [...(S.db.users || [])].sort((a, b) => String(a.name || a.email).localeCompare(String(b.name || b.email)))
+              .map(u => {
+                const partner = u.accessType === "EXTERNAL";
+                return '<tr><td>' + esc(u.name || u.email) +
+                  (partner ? ' <span class="pill p-grey">partner</span>' : '') + '</td>' +
+                  ACCESS_COLS.map(c => {
+                    if(c.internal && partner) return '<td style="text-align:center" class="hint">—</td>';
+                    const on = u[c.k] === true;
+                    return '<td style="text-align:center"><button type="button" class="tm-cell' + (on ? " on" : "") +
+                      '" data-acc-user="' + esc(u.id) + '" data-acc-key="' + c.k + '" aria-pressed="' + on +
+                      '" title="' + esc((on ? "Untick " : "Tick ") + c.label + " for " + (u.name || u.email)) + '">' +
+                      (on ? "✓" : "") + '</button></td>';
+                  }).join("") + '</tr>';
+              }).join("") +
+            '</tbody></table></div>');
+    }
+
     if(ADMTAB === "notify" && admTabOpen("notify")){
       const recips = S.db.notifyRecipients || [];
       h += '<div class="info">These people also receive the <b>product order-request</b> notification email, ' +
@@ -41095,6 +41135,9 @@ VIEWS.admin = {
     const un = $("#u-new"); if(un) un.onclick = () => userForm(null);
     $$("[data-ue]").forEach(b => b.onclick = () => userForm(user(b.dataset.ue)));
     $$("[data-ud]").forEach(b => b.onclick = () => removeUser(user(b.dataset.ud)));
+    $$("[data-acc-user]").forEach(b => b.onclick = () => {
+      b.disabled = true; return toggleUserFlag(b.dataset.accUser, b.dataset.accKey);
+    });
 
     const ln = $("#l-new"); if(ln) ln.onclick = () => locForm(null);
     $$("[data-le]").forEach(b => b.onclick = () => locForm(loc(b.dataset.le)));
@@ -41210,6 +41253,53 @@ function approvalMailAlert(n, approvers, batchId){
    fields and SAVED them blank, so an ordinary edit of a user cleared their extra role,
    territory and Screen Update. Read from /api/admin/users (App Admin only) and merged onto
    the thin records, so nothing else changes. */
+/* THE ROLES & NOTIFICATIONS TABLE (v3.20.0, 25 Nov 2026, the owner): the six per-person ticks left
+   the Edit dialog for one table, a row per person and a column per tick, like Procedure team.
+   A click saves that ONE field at once (PUT /api/admin/users with just email + the field -
+   the route patches, so nothing else on the person is touched) and writes an audit line.
+   internal: not for a partner account (the server refuses it too). */
+const ACCESS_COLS = [
+  { k:"screenUpdate",  label:"Screen Update",     title:"Email when a new subject is registered and enters screening" },
+  { k:"stageUpdate",   label:"Stage Update",      title:"Email when a screening stage is completed" },
+  { k:"stuckUpdate",   label:"Stuck Update",      title:"The Sunday summary email with the subjects stuck in screening, at every site" },
+  { k:"clinicManager", label:"Clinic manager",    title:"Decides whether a subject is clinically feasible, after the anatomical scoring", internal:true },
+  { k:"taskFallback",  label:"Sites with no CPM", title:"Takes every task of a hospital site that has no Responsible CPM - one person at a time", internal:true },
+  { k:"anatEvalTeam",  label:"Anatomical evaluation team", title:"Emailed and given a task to score a digital model", internal:true }
+];
+/* True once /api/admin/users answered: before that the thin user list has none of the ticks,
+   and a table drawn from it would show everybody unticked. */
+let ADMIN_USERS_LOADED = false;
+async function toggleUserFlag(id, k){
+  const u = user(id);
+  const col = ACCESS_COLS.find(c => c.k === k);
+  if(!u || !col){ render(); return; }
+  const want = u[k] !== true;
+  if(want && col.internal && u.accessType === "EXTERNAL"){
+    toast("A partner account cannot be a clinic manager, take unassigned tasks or be on the evaluation team.", "bad");
+    render(); return;
+  }
+  if(S.backend){
+    try{
+      const r = await fetch("/api/admin/users", { method:"PUT", credentials:"same-origin",
+        headers:{ "Content-Type":"application/json" },
+        body:JSON.stringify({ email:u.email, [k]:want }) });
+      if(!r.ok){
+        const e = await r.json().catch(() => ({}));
+        toast((e.error && e.error.message) || "The server refused it.", "bad");
+        render(); return;
+      }
+    }catch(e){ toast("Could not reach the server - nothing was changed.", "bad"); render(); return; }
+  }
+  u[k] = want;
+  // One person takes the unowned site tasks: the server cleared the previous holder; mirror it here.
+  let movedFrom = null;
+  if(k === "taskFallback" && want)
+    for(const x of S.db.users) if(x !== u && x.taskFallback){ x.taskFallback = false; movedFrom = x; }
+  logAction((want ? "Ticked " : "Unticked ") + col.label + " for " + u.email,
+    { stateChanges: col.label + " = " + (want ? "yes" : "no") +
+        (movedFrom ? "; taken off " + movedFrom.email : "") });
+  commit(); render();
+}
 async function loadAdminUserRecords(){
   if(!S.backend || !hasRole("ADMIN")) return;
   try{
@@ -41224,6 +41314,7 @@ async function loadAdminUserRecords(){
                                clinicManager:f.clinicManager === true, taskFallback:f.taskFallback === true,
                                anatEvalTeam:f.anatEvalTeam === true });
     }
+    ADMIN_USERS_LOADED = true;
   }catch(e){ /* the form still opens; it simply cannot show what it was not sent */ }
 }
 function userForm(u){
@@ -41344,41 +41435,11 @@ function userForm(u){
          mind; the count and the names do, before the dialog is saved rather than after. */
       '<div class="hint" id="u-geo-sum" style="margin-top:6px"></div>' +
     '</fieldset>' +
-    /* "Screen Update" (20 Oct 2026, the owner): who is mailed the moment a new subject is
-       registered and enters screening. Per person, ticked here, and nothing else decides it. */
-    '<div style="margin:0 0 12px"><label class="check' + (u.screenUpdate ? " on" : "") +
-      '" style="margin:0"><input type="checkbox" id="u-su"' + (u.screenUpdate ? " checked" : "") +
-      '><span><b>Screen Update</b> — email me when a new subject is registered and enters screening</span></label></div>' +
-    /* "Stage Update" and "Stuck Update" (21 Oct 2026, the owner). Both ADD this person: App Admins,
-       Managers and QA always get the stage mail and the stuck list, whatever is ticked here. */
-    '<div style="margin:0 0 12px"><label class="check' + (u.stageUpdate ? " on" : "") +
-      '" style="margin:0"><input type="checkbox" id="u-sgu"' + (u.stageUpdate ? " checked" : "") +
-      '><span><b>Stage Update</b> — email me when a screening stage is completed (CT, digital model, pliable model, eligibility, scheduling)</span></label></div>' +
-    '<div style="margin:0 0 12px"><label class="check' + (u.stuckUpdate ? " on" : "") +
-      '" style="margin:0"><input type="checkbox" id="u-stu"' + (u.stuckUpdate ? " checked" : "") +
-      '><span><b>Stuck Update</b> — send me the Sunday summary email with the subjects stuck in screening, at every site</span></label></div>' +
-    '<div class="hint" style="margin:-6px 0 12px">App Admins, Managers and QA receive both whether or not these are ticked.</div>' +
-    /* Three ticks since v3.19.0 (17 Nov 2026, the owner). CLINIC MANAGER may be on many people:
-       they decide whether a subject is clinically feasible after the Digital Model Evaluation.
-       SITES WITH NO CPM is one person (it moves when ticked): every task of a hospital site
-       with no Responsible CPM - anatStages.clinicManagerOf. EVALUATION TEAM: mailed and tasked
-       to score the digital model. None of them on a partner account. */
-    '<div style="margin:0 0 12px"><label class="check' + (u.clinicManager ? " on" : "") +
-      '" style="margin:0"><input type="checkbox" id="u-cm"' + (u.clinicManager ? " checked" : "") +
-      '><span><b>Clinic manager</b> — decides whether a subject is clinically feasible, after the anatomical scoring</span></label></div>' +
-    (function(){
-      const holder = (S.db.users || []).find(x => x.taskFallback === true && x.id !== u.id);
-      return '<div style="margin:0 0 12px"><label class="check' + (u.taskFallback ? " on" : "") +
-        '" style="margin:0"><input type="checkbox" id="u-tf"' + (u.taskFallback ? " checked" : "") +
-        '><span><b>Sites with no CPM</b> — takes every task of a hospital site that has no Responsible CPM</span></label>' +
-        '<div class="hint" style="margin-top:4px">' + (holder
-          ? 'Now: <b>' + esc(holder.name || holder.email || holder.id) + '</b>. Ticking this moves it to this person.'
-          : 'Nobody is ticked yet, so the first clinic manager takes them.') + ' One person at a time.</div></div>';
-    })() +
-    '<div style="margin:0 0 12px"><label class="check' + (u.anatEvalTeam ? " on" : "") +
-      '" style="margin:0"><input type="checkbox" id="u-aet"' + (u.anatEvalTeam ? " checked" : "") +
-      '><span><b>Anatomical evaluation team</b> — email me and give me a task to score a digital model</span></label>' +
-      '<div class="hint" style="margin-top:4px">Not for partner accounts.</div></div>' +
+    /* The six ticks (Screen/Stage/Stuck Update, Clinic manager, Sites with no CPM, evaluation
+       team) moved to Administration -> Roles & notifications (v3.20.0, 25 Nov 2026, the owner). */
+    '<div class="hint" style="margin:0 0 12px">Notifications (Screen, Stage, Stuck Update) and responsibilities ' +
+      '(Clinic manager, Sites with no CPM, Anatomical evaluation team) are set on the ' +
+      '<b>Roles &amp; notifications</b> tab.</div>' +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
       '<div class="field"><label for="u-p">Phone</label><input type="tel" id="u-p" value="' + esc(u.phone||"") + '"></div></div>' +
@@ -41458,7 +41519,6 @@ function userForm(u){
     geoSummary();
   });
   ["#u-r", "#u-xr", "#u-l"].forEach(sel => { const e = $(sel); if(e) e.addEventListener("change", geoSummary); });
-  if($("#u-su")) $("#u-su").onchange = e => { const chip = e.target.closest(".check"); if(chip) chip.classList.toggle("on", e.target.checked); };
   geoSummary();
 
   $("#u-save").onclick = async () => {
@@ -41499,15 +41559,12 @@ function userForm(u){
     Object.assign(u, { name, email, role, accessType, extraRoles, geography,
       locationId:$("#u-l").value || null,
       extraLocationId: xr ? ($("#u-xl").value || null) : null,
-      title:$("#u-t").value.trim(), phone:$("#u-p").value.trim(),
-      screenUpdate: !!($("#u-su") || {}).checked,
-      stageUpdate: !!($("#u-sgu") || {}).checked,
-      stuckUpdate: !!($("#u-stu") || {}).checked,
-      clinicManager: !!($("#u-cm") || {}).checked,
-      taskFallback: !!($("#u-tf") || {}).checked,
-      anatEvalTeam: !!($("#u-aet") || {}).checked });
+      title:$("#u-t").value.trim(), phone:$("#u-p").value.trim() });
+    /* The ticks are no longer on this dialog (v3.20.0) and are NOT sent from it, so a save
+       here never clears them. A person turned partner while holding one is refused. */
     if((u.clinicManager || u.taskFallback || u.anatEvalTeam) && u.accessType === "EXTERNAL")
-      return showWhy("u-why", "A partner account cannot be a clinic manager, take unassigned tasks or be on the evaluation team.");
+      return showWhy("u-why", "A partner account cannot be a clinic manager, take unassigned tasks or be on the " +
+        "evaluation team. Untick them on the Roles & notifications tab first.");
 
     if(S.backend){
       try{
@@ -41517,13 +41574,7 @@ function userForm(u){
                                 extraRoles:u.extraRoles,
                                 geography:u.geography,
                                 name:u.name, title:u.title, phone:u.phone,
-                                locationId:u.locationId, extraLocationId:u.extraLocationId,
-                                screenUpdate:u.screenUpdate === true,
-                                stageUpdate:u.stageUpdate === true,
-                                stuckUpdate:u.stuckUpdate === true,
-                                clinicManager:u.clinicManager === true,
-                                taskFallback:u.taskFallback === true,
-                                anatEvalTeam:u.anatEvalTeam === true }) });
+                                locationId:u.locationId, extraLocationId:u.extraLocationId }) });
         if(!r.ok){
           const e = await r.json().catch(() => ({}));
           return showWhy("u-why", (e.error && e.error.message) || "The server refused it.");
@@ -41531,8 +41582,6 @@ function userForm(u){
       }catch(e){ return showWhy("u-why", "Could not reach the server."); }
     }
     if(isNew) S.db.users.push(u);
-    // One person takes the unowned site tasks: the server cleared the previous holder; mirror it here.
-    if(u.taskFallback) for(const x of S.db.users) if(x !== u && x.taskFallback) x.taskFallback = false;
     const roleText = u.role + (extraRoles.length ? " + " + extraRoles.join(", ") : "") +
       (accessType === "EXTERNAL" ? " (external)" : "");
     logAction((isNew ? "Provisioned " : "Updated ") + u.email + " as " + roleText,
