@@ -14333,6 +14333,66 @@ const DEVICE_CONFIRMS = [
 /* Contrast is injected more than once during a road map, and not always the same way. */
 const CONTRAST_ROWS = [1, 2, 3];
 
+/* ECHO, PRE AND POST (25 Nov 2026, the owner): the Imaging Core Lab page of the CRF, CLD-U-105
+   rev 02 pp. 44-45, replacing the single free-text "Echo parameter collection". EVERY
+   field is optional - none holds back the submission. Asked and answered:
+   - PRE sits in the event log before the introducer goes in, POST where the old field was.
+   - No date (it is the procedure date); no Completed by / Signature / Date lines.
+   - Numbers are not range-limited, at most two decimals (ECHO_DECIMALS).
+   - The old free-text key `echoParams` stays, as "Additional echo findings", so what older
+     reports wrote there is still where it was. Photos as before; no video, no DICOM.
+   One list read by the page (the fields) and caseFilePdf (the printout). Stored as
+   caseFile["echo" + phase + q.k], e.g. echoPreTr, echoPostLvotVti. */
+const ECHO_PHASES = [
+  { k: "Pre",  title: "Echo — pre-procedure (Imaging Core Lab)" },
+  { k: "Post", title: "Echo — post-procedure (Imaging Core Lab)" }
+];
+const ECHO_DECIMALS = 2;
+const yesNo = ["Yes", "No"].map(v => [v, v]);
+const ECHO_QUESTIONS = [
+  { k: "Time",    label: "Time of echo", type: "time" },
+  { k: "Type",    label: "Type of echo", options: [["TTE", "Transthoracic (TTE)"], ["TEE", "Transesophageal (TEE)"]] },
+  { k: "Quality", label: "Quality of echo", options: [
+      ["Adequate",   "Adequate (all necessary images for TR assessment present)"],
+      ["Inadequate", "Inadequate (missing TR protocol images for quantification)"]] },
+  { k: "Deployed", post: true, label: "Has deployment of the device in the IVC been confirmed?", options: yesNo },
+  { k: "DeployedNote", post: true, label: "If No, describe", type: "text", when: { k: "Deployed", v: "No" } },
+  { k: "Valve",   post: true, label: "Is the IVC valve functioning?", options: yesNo.concat([["N/A", "N/A"]]) },
+  { k: "Tr",      label: "TR evaluated based on quantification",
+    options: ["None", "Mild", "Moderate", "Severe", "Massive", "Torrential", "Not available"].map(v => [v, v]) },
+  { k: "Caval",   label: "Caval reflux assessment", options: [
+      ["1", "1 - no reflux, reflux extending for less than 1 cm inferior to diaphragm (RA-IVC junction)"],
+      ["2", "2 - reflux extending for less than 3 cm inferior to diaphragm (RA-IVC junction)"],
+      ["3", "3 - reflux of 3 cm or more inferior to diaphragm (RA-IVC junction)"],
+      ["Not available", "Not available"]] },
+  { k: "LvotVti", label: "LVOT VTI (cm)", type: "number" },
+  { k: "Sv",      label: "Stroke volume (mL) — LVOT stroke volume", type: "number" }
+];
+function echoKey(phase, q){ return "echo" + phase + (typeof q === "string" ? q : q.k); }
+function echoQuestions(phase){ return ECHO_QUESTIONS.filter(q => !q.post || phase === "Post"); }
+/* At most ECHO_DECIMALS after the point, cut (not rounded) as it is typed, so what is on
+   screen is what is stored. Anything that is not a number is left for the field to show. */
+function echoNumber(v){
+  const s = String(v == null ? "" : v);
+  const m = /^(-?\d*)[.,](\d*)$/.exec(s.trim());
+  return m && m[2].length > ECHO_DECIMALS ? m[1] + "." + m[2].slice(0, ECHO_DECIMALS) : s;
+}
+/* What one answer prints as: the option's full wording, else the value itself. */
+function echoText(c, phase, q){
+  const v = (c || {})[echoKey(phase, q)];
+  if(v === "" || v == null) return "";
+  const o = (q.options || []).find(x => x[0] === v);
+  return o ? o[1] : String(v);
+}
+/* [label, text] for every question of a phase, for the printout. A conditional question
+   (If No, describe) prints only when it holds something. */
+function echoRows(c, phase){
+  return echoQuestions(phase)
+    .filter(q => !q.when || echoText(c, phase, q))
+    .map(q => [q.label, echoText(c, phase, q)]);
+}
+function echoAny(c, phase){ return echoQuestions(phase).some(q => echoText(c, phase, q) !== ""); }
+
 const PT_STATUS = {
   CREATED:         { label:"Subject Created",                    cls:"p-grey"   },
   SCREENING:       { label:"Clinical Screening In Progress",     cls:"p-blue"   },
@@ -14460,7 +14520,8 @@ const api = {
   TRAINING_ITEMS, DEVICE_CHECKS, ROOM_CHECKS, POST_CHECKS, DEVICE_CONFIRMS, CONTRAST_ROWS, PT_STATUS,
   statusLabel, minsBetween, fmtDur, contrastTotal, fmtContrast, pressureText,
   contrastDiluted, contrastAnyDiluted, contrastInjectionTotal,
-  angleKey, angleTextOf, recommendationOf
+  angleKey, angleTextOf, recommendationOf,
+  ECHO_PHASES, ECHO_QUESTIONS, ECHO_DECIMALS, echoKey, echoQuestions, echoNumber, echoText, echoRows, echoAny
 };
 
 if(typeof module !== "undefined" && module.exports) module.exports = api;
@@ -14621,6 +14682,11 @@ function prefill(p, trainingItems){
   };
   var pre = pr("ivcPre"), post = pr("ivcPost");
   if(pre || post) a.ivcReductionSpecify = "IVC PRE " + (pre || "—") + " mmHg, POST " + (post || "—") + " mmHg (from the procedure report)";
+  /* 3.4 Echo modality, from the report's echo PRE/POST type (the owner, 25 Nov 2026). When the two
+     disagree the report does not say which one was "the procedure's", so it is left to the
+     team. Keys are procedureDoc's echoKey("Pre"|"Post", "Type"). */
+  var et = [str(c.echoPreType), str(c.echoPostType)].filter(function(v){ return v === "TTE" || v === "TEE"; });
+  if(et.length && et.every(function(v){ return v === et[0]; })) a.echoModality = et[0];
   return a;
 }
 
@@ -26770,6 +26836,42 @@ function contrastBlock(p){
         '<b id="calc-inj">' + fmtContrast(PD.contrastInjectionTotal(c)) + '</b></div>' : '') +
   '</div>';
 }
+/* ECHO, PRE AND POST (25 Nov 2026, the owner; CLD-U-105 pp. 44-45). The questions are
+   PD.ECHO_QUESTIONS, which the PDF reads too. Every field optional. A choice is a select
+   (as Closing method), so a value no longer offered still shows on an old report. */
+function echoBlock(p, phase){
+  const c = cf(p), ph = PD.ECHO_PHASES.find(x => x.k === phase);
+  const field = q => {
+    const key = PD.echoKey(phase, q);
+    if(q.when && c[PD.echoKey(phase, q.when.k)] !== q.when.v && !c[key]) return "";
+    if(!q.options){
+      return tf(p, key, q.label, q.type, q.type === "number" ? { step:"0.01" } : {});
+    }
+    const v = c[key] == null ? "" : String(c[key]);
+    const opts = [["", ""]].concat(q.options)
+      .concat(v && !q.options.some(o => o[0] === v) ? [[v, v]] : []);
+    return '<div class="field"><label for="cf-' + key + '">' + esc(q.label) + '</label>' +
+      '<select id="cf-' + key + '" data-cf="' + key + '"' + ro(p) + '>' +
+      opts.map(o => '<option value="' + esc(o[0]) + '"' + (v === o[0] ? " selected" : "") + '>' +
+        esc(o[1]) + '</option>').join("") +
+      '</select></div>';
+  };
+  /* In the document's order; the layout groups are the only thing decided here. */
+  const qs = PD.echoQuestions(phase);
+  const row = (cls, ks) => {
+    const inner = ks.map(k => qs.find(q => q.k === k)).filter(Boolean).map(field).join("");
+    return inner ? '<div class="grid ' + cls + '">' + inner + '</div>' : "";
+  };
+  return '<h3 style="margin:14px 0 4px">' + esc(ph.title) + '</h3>' +
+    '<div class="hint" style="margin:0 0 8px">Optional — nothing here holds back the submission. ' +
+      'Please send the echo raw DICOM data to the Imaging Core Lab.</div>' +
+    row("g3", ["Time", "Type", "Quality"]) +
+    row("g2", ["Deployed", "Valve"]) +
+    qs.filter(q => q.k === "DeployedNote").map(field).join("") +
+    row("g2", ["Tr", "Caval"]) +
+    row("g2", ["LvotVti", "Sv"]) +
+    sourceImages(p, phase === "Pre" ? "echoPre" : "echoParams", "Echo " + phase.toUpperCase());
+}
 function fmtContrast(v){ return PD.fmtContrast(v); }function fmtContrast(v){ return v === null ? "—" : String(Math.round(v * 100) / 100); }
 
 /** Source-image control for one measurement field, plus what has already been filed. */
@@ -30228,7 +30330,9 @@ VIEWS.clinical = {
          each event has a free-text note beside it for anything the standard field
          does not capture. Note fields are ordinary data-cf inputs, so the existing
          autosave persists them with no extra wiring. */
-      '<h3 style="margin:6px 0 8px">Procedure timeline</h3>' +
+      /* Echo PRE is taken before the introducer goes in (the owner, 25 Nov 2026). */
+      echoBlock(p, "Pre") +
+      '<h3 style="margin:14px 0 8px">Procedure timeline</h3>' +
       '<div class="grid g2">' + tf(p,"introducerTime","Introducer insertion time","time") + tf(p,"introducerTimeNote","Notes","text") + '</div>' +
       '<div class="grid g2">' + tf(p,"actTime","ACT >250s achieved","time") + tf(p,"actTimeNote","Notes","text") + '</div>' +
       /* IVC pressure PRE - taken before DS insertion. */
@@ -30270,8 +30374,11 @@ VIEWS.clinical = {
         tf(p,"closingTime","Closing time","time") +
         tf(p,"closingNote","Closing notes","text") +
       '</div>' +
-      tf(p,"echoParams","Echo parameter collection","textarea",{hint:"Free text; structured capture is a later change."}) +
-      sourceImages(p, "echoParams", "Echo parameters") +
+      /* Echo POST where the single free-text field was (the owner, 25 Nov 2026). That field stays,
+         same key, as "Additional echo findings" - older reports keep what they wrote. Its
+         photos (key echoParams) are the POST photos. */
+      echoBlock(p, "Post") +
+      tf(p,"echoParams","Additional echo findings","textarea") +
     '</div></div>';
 
     /* ---- Stage 4 ---- */
@@ -30639,6 +30746,13 @@ VIEWS.clinical = {
       if(cfReadOnly(p)) return;
       let structural = false;
       if(t.dataset.cf){
+        /* Echo numbers: at most two decimals, cut as typed (PD.echoNumber). */
+        if(/^echo(Pre|Post)(LvotVti|Sv)$/.test(t.dataset.cf)){
+          const cut = PD.echoNumber(t.value);
+          if(cut !== t.value) t.value = cut;
+        }
+        /* "No" reveals "If No, describe". */
+        if(t.dataset.cf === "echoPostDeployed") structural = true;
         cf(p)[t.dataset.cf] = t.type === "checkbox" ? t.checked : t.value;
         stampInjectionTime(p, t.dataset.cf);
         /* The case file keeps its own procedure date (c.procDate) but must NOT set the
