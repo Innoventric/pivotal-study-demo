@@ -772,6 +772,13 @@ body.tv .dash{gap:clamp(14px, 2vw, 34px);}
   cursor:pointer; font-size:15px; font-weight:700; color:var(--ok-fg,#1b7a3a);}
 .tm-cell:hover{border-color:var(--brand-md);}
 .tm-cell.on{background:var(--ok-bg,#e8f6ee); border-color:var(--ok-line,#7cc79a);}
+/* Roles & notifications: what each tick gives (v3.20.0). */
+.acc-desc{margin:0; display:grid; grid-template-columns:minmax(150px,240px) 1fr; gap:8px 16px;}
+.acc-desc dt{font-weight:700;}
+.acc-grid th{white-space:normal; max-width:120px; line-height:1.25; vertical-align:bottom;}
+.acc-grid td:first-child{white-space:nowrap;}
+.acc-desc dd{margin:0; color:var(--muted);}
+@media (max-width:560px){ .acc-desc{grid-template-columns:1fr; gap:2px;} .acc-desc dd{margin-bottom:8px;} }
 /* One clinical question per box (v3.0.0, items 13 and 14). */
 .q-item{border:1px solid var(--line); border-radius:8px; padding:8px; margin-bottom:8px; background:#fff;}
 .q-item textarea{width:100%;}
@@ -15516,7 +15523,7 @@ function stuckWith(p){
     const a = p.anat[s.k] || {};
     /* After 2.1 the Digital Model waits on the Anatomical evaluation team (v3.19.0). */
     if(AnatStages.waitsOnTeam(p, s)){
-      return { who: "Anatomical evaluation team", email: "", stage: s, label: s.n + ". " + s.label + " — 2.2 scoring",
+      return { who: "Digital model scoring team", email: "", stage: s, label: s.n + ". " + s.label + " — 2.2 scoring",
                why: "team", overdue: stageOverdue(p, s) };
     }
     /* A stage nobody was given IS the CPM's task (10 Nov 2026, the owner) - shown under
@@ -18359,7 +18366,8 @@ const WHATS_NEW = {
   releases: [
   { version: "3.20.0", date: "25 November 2026", groups: [
     { h:"Administration", items:[
-      "A new tab, <b>Roles &amp; notifications</b>: one table with a row per person and a column per tick — <b>Screen Update</b>, <b>Stage Update</b>, <b>Stuck Update</b>, <b>Clinic manager</b>, <b>Sites with no CPM</b> and <b>Anatomical evaluation team</b>. Click a cell to tick or untick it; it is saved at once and written to the activity history.",
+      "A new tab, <b>Roles &amp; notifications</b>: one table with a row per person and a column per tick. Click a cell to tick or untick it; it is saved at once and written to the activity history. Below the table, what each one gives.",
+      "The ticks have clearer names: <b>Screen Update</b> is now <b>New subject mail</b>, <b>Stage Update</b> is <b>Stage completed mail</b>, <b>Stuck Update</b> is <b>Weekly summary mail</b>, <b>Clinic manager</b> is <b>Feasibility decision (Clinic manager)</b>, <b>Sites with no CPM</b> is <b>Covers sites with no CPM</b>, and the <b>Anatomical evaluation team</b> is <b>Digital model scoring (2.2)</b> — on screens and in the emails too.",
       "These ticks are no longer in a user’s <b>Edit</b> window. Role, location, territory, title and phone stay there."
     ]}
   ]},
@@ -27209,7 +27217,7 @@ VIEWS.screening = {
       const stage = ANAT_STAGES.find(x => x.k === b.dataset.stgdone);
       const a = p.anat[stage.k];
       if(AnatStages.hasParts(stage) && !mayScoreModel(p)) return showWhy("stg-why-" + stage.k,
-        "2.2 is confirmed by the Anatomical evaluation team, an App Admin or a Manager.");
+        "2.2 is confirmed by the Digital model scoring team, an App Admin or a Manager.");
       const gaps = stageMissing(p, stage);
       /* 3.2 belongs to the person printing, or to the print gate. */
       if(stage.needsApproval && !mayConfirmPrinted(p, stage, myRoles(), S.me && S.me.email))
@@ -27549,7 +27557,7 @@ function autoAssignHint(p, s, a, assignedNow){
   }else if(!assignedNow && (a.status || "Not started") === "Not started"){
     const cpm = patientCpm(p, s.k);
     t = cpm ? 'Goes to <b>' + esc(assigneeLabel(cpm)) + '</b>, the site’s Responsible CPM, when this stage opens.'
-            : 'This site has no Responsible CPM and no clinic manager is set, so nobody will be assigned automatically. ' +
+            : 'This site has no Responsible CPM and nobody covers sites with no CPM, so nobody will be assigned automatically. ' +
               'Choose one, or set them in Administration → Locations.';
   }
   return t ? '<div class="hint">' + t + '</div>' : "";
@@ -27598,7 +27606,7 @@ const STAGE_DONE_MAIL = ["ct", "model3d", "flexible", "approvals", "scheduling"]
 function requestEvalTeamMail(p){
   if(!S.backend || !p) return;
   api("POST", "/api/patients/" + encodeURIComponent(p.id) + "/eval-team-mail", {})
-    .then(r => { if(r && r.team === 0) toast("Nobody is ticked as Anatomical evaluation team - set it on Administration → Roles & notifications.", "warn"); })
+    .then(r => { if(r && r.team === 0) toast("Nobody is ticked Digital model scoring (2.2) - set it on Administration → Roles & notifications.", "warn"); })
     .catch(() => {});
 }
 function requestStageDoneMail(p, stage){
@@ -28630,9 +28638,9 @@ function anatStageHtml(p, s, ctReady){
       const open2 = AnatStages.part1Done(p);
       const may2 = mayScoreModel(p);
       const dis2 = (open2 && may2) ? dis : " disabled";
-      inner += '<h3 style="margin:18px 0 8px">2.2 Anatomical scoring — Anatomical evaluation team</h3>' +
-        (!open2 ? '<div class="note">Opens once 2.1 is confirmed — the evaluation team is then emailed and given the task.</div>'
-          : !may2 ? '<div class="note">Scored by the Anatomical evaluation team (ticked on Administration → Roles &amp; notifications).</div>' : '') +
+      inner += '<h3 style="margin:18px 0 8px">2.2 Anatomical scoring — Digital model scoring team</h3>' +
+        (!open2 ? '<div class="note">Opens once 2.1 is confirmed — the Digital model scoring team is then emailed and given the task.</div>'
+          : !may2 ? '<div class="note">Scored by the Digital model scoring team (ticked on Administration → Roles &amp; notifications).</div>' : '') +
         scoringBlock(p, s, dis2) + modelNeedBlock(p, s, dis2);
     }else{
       if(s.scoring) inner += scoringBlock(p, s, dis);
@@ -29583,15 +29591,15 @@ function part1Block(p, s){
   const a = p.anat[s.k], one = a.part1;
   if(one && one.at){
     return '<div class="okbox" style="margin-top:8px"><b>2.1 confirmed</b> by ' + esc(one.byName || one.by || "") +
-      ' · ' + esc(fmtTs(one.at)) + '. The Anatomical evaluation team was asked to score it (2.2).</div>';
+      ' · ' + esc(fmtTs(one.at)) + '. The Digital model scoring team was asked to score it (2.2).</div>';
   }
   if(a.status === "Completed") return "";
   const gaps = stageMissing(p, s, { part:1 });
   if(!can("editAnatomical") || p.fileLocked) return "";
   if(gaps.length) return '<div class="hint" style="margin-top:8px">To confirm 2.1: ' + esc(gaps.join(", ")) + '.</div>';
   return '<div class="row" style="margin-top:8px"><button class="btn btn-primary" data-part1="' + s.k + '">' +
-    'Done with 2.1 — send to the evaluation team</button>' +
-    '<span class="hint">Records you and the time, emails the Anatomical evaluation team and gives them the scoring task.</span></div>' +
+    'Done with 2.1 — send to the Digital model scoring team</button>' +
+    '<span class="hint">Records you and the time, emails the Digital model scoring team and gives them the scoring task.</span></div>' +
     whyBox("part1-why");
 }
 function printGateBlock(p){
@@ -29803,7 +29811,7 @@ function stageActions(p, s, state){
   }
   if(may && !mayDone && ready){
     btns.push('<span class="hint">' + (AnatStages.hasParts(s)
-      ? 'Waiting for the Anatomical evaluation team to confirm 2.2.'
+      ? 'Waiting for the Digital model scoring team to confirm 2.2.'
       : 'Waiting for ' + esc(a.assignedTo ? assigneeLabel(a.assignedTo) : "the person printing it") +
         ' to confirm the model is printed.') + '</span>');
   }
@@ -38050,7 +38058,7 @@ function reportGapBanner(p){
          esc(TEAM_LISTS.map(t => c.team[t.field] ? t.label + " " + c.team[t.field] : "").filter(Boolean).join(", ")) +
          '. Report: <b>' + esc(nm(c.reportOwner)) + '</b>, due <b>' + esc(fmtTs(g.reportDueAt)) + '</b>' + (late ? ' <span class="pill p-red">overdue</span>' : '') +
          '. Summary: <b>' + esc(summaryWho(c.summaryAssignees)) + '</b>.'
-       : 'The site’s CPM and the clinic manager (' + esc(summaryWho(g.alertTo) || "none set") + ') confirm who the clinical team was, ' +
+       : 'The site’s CPM and the person covering sites with no CPM (' + esc(summaryWho(g.alertTo) || "none set") + ') confirm who the clinical team was, ' +
          'and who completes the report and the procedure summary.') +
     '<div class="row" style="margin-top:8px;gap:6px;flex-wrap:wrap">' +
       (mayConfirmGap(p) ? '<button class="btn btn-sm btn-primary" data-gapconfirm="' + esc(p.id) + '">' +
@@ -38317,7 +38325,7 @@ function summaryFormHtml(p){
         'Given to: <b>' + esc(summaryWho(s.assignees) || "nobody") + '</b>' + summaryReassignBtn(p) + '. It can be filled in now, before the report; ' +
         'what the report holds is added when it is submitted. Whoever closes it is recorded as Filled by.'
       : s.legacy && !(s.assignees || []).length
-      ? 'A subject implanted before summaries existed. Its site has no Responsible CPM and no clinic manager ' +
+      ? 'A subject implanted before summaries existed. Its site has no Responsible CPM and nobody covers sites with no CPM ' +
         'is set, so it is nobody’s task yet; anyone at Innoventric can fill it in, and whoever closes it is recorded as Filled by.'
       : s.legacy
       ? 'Missing summary, opened as a task: this subject was implanted without one. Due by <b>' + esc(fmtTs(s.dueAt)) + '</b>. ' +
@@ -38371,7 +38379,7 @@ function summaryListHtml(){
   return '<div class="info">One summary per treated subject (form ' + esc(PSF.DOC.number) + ' Rev' + esc(PSF.DOC.revision) +
     '), opened when the procedure report is submitted, for the procedure team and the subject’s Clinical PM. ' +
     'Due ' + PSF.DUE_HOURS + ' hours after the procedure. A subject implanted without one is opened as a task for the ' +
-    'site’s Responsible CPM (or the clinic manager), due in ' + LEGACY_DUE_DAYS + ' days. When the report has not been submitted ' +
+    'site’s Responsible CPM (or the person covering sites with no CPM), due in ' + LEGACY_DUE_DAYS + ' days. When the report has not been submitted ' +
     'the morning after the procedure, the summary is opened then, and can be filled in before the report. A procedure on or after ' +
     esc(fmtDate(PSF.ONLINE_ONLY_FROM)) + ' has its summary filled in online, not uploaded.</div>' +
     '<div class="filters">' + selField("ps-filter", "Show", PSUM.filter,
@@ -40859,9 +40867,9 @@ VIEWS.admin = {
             ? ' <span class="pill p-blue">+ ' +
               esc(userExtraRoles(u).map(r => (ROLES[r] || {}).label || r).join(", ")) + '</span>'
             : '') +
-          (u.clinicManager ? ' <span class="pill p-green" title="Decides whether a subject is clinically feasible">Clinic manager</span>' : '') +
-          (u.taskFallback ? ' <span class="pill p-green" title="Takes every task of a site with no Responsible CPM">Sites with no CPM</span>' : '') +
-          (u.anatEvalTeam ? ' <span class="pill p-blue" title="Scores the Digital Model Evaluation">Evaluation team</span>' : '') +
+          (u.clinicManager ? ' <span class="pill p-green" title="Decides whether a subject is clinically feasible, after the 2.2 scoring">Feasibility decision</span>' : '') +
+          (u.taskFallback ? ' <span class="pill p-green" title="Takes every task of a site with no Responsible CPM">Covers sites with no CPM</span>' : '') +
+          (u.anatEvalTeam ? ' <span class="pill p-blue" title="Scores the digital model (2.2)">Digital model scoring</span>' : '') +
           '</td>' +
         '<td>' + esc([u.locationId, userExtraRoles(u).length ? u.extraLocationId : null]
                        .filter(Boolean).map(locName).join(" · ") || "All locations") +
@@ -41078,14 +41086,13 @@ VIEWS.admin = {
       const holder = (S.db.users || []).find(x => x.taskFallback === true);
       h += '<div class="info">One row per person, one column per tick. <b>Click a cell</b> to tick ' +
         'or untick it — it is saved at once and written to the activity history. ' +
-        'App Admins, Managers and QA receive the Stage and Stuck mail whether or not they are ticked. ' +
-        '<b>Sites with no CPM</b> is one person at a time: ticking somebody moves it to them' +
-        (holder ? '' : ' (nobody is ticked yet, so the first clinic manager takes those tasks)') + '. ' +
-        'Clinic manager, Sites with no CPM and the evaluation team are not for partner accounts.</div>' +
+        'What each one gives is explained below the table.' +
+        (holder ? '' : ' <b>Nobody covers sites with no CPM yet</b>, so the first person ticked ' +
+          'Feasibility decision takes those tasks.') + '</div>' +
         (S.backend && !ADMIN_USERS_LOADED
           ? '<div class="warn">The full user records could not be read from the server, so the ticks ' +
             'cannot be shown. Reload the page and try again.</div>'
-          : '<div class="tbl-wrap"><table class="team-grid"><thead><tr><th>Person</th>' +
+          : '<div class="tbl-wrap"><table class="team-grid acc-grid"><thead><tr><th>Person</th>' +
             ACCESS_COLS.map(c => '<th style="text-align:center" title="' + esc(c.title) + '">' +
               esc(c.label) + '</th>').join("") + '</tr></thead><tbody>' +
             [...(S.db.users || [])].sort((a, b) => String(a.name || a.email).localeCompare(String(b.name || b.email)))
@@ -41102,7 +41109,13 @@ VIEWS.admin = {
                       (on ? "✓" : "") + '</button></td>';
                   }).join("") + '</tr>';
               }).join("") +
-            '</tbody></table></div>');
+            '</tbody></table></div>') +
+        /* What each tick gives (25 Nov 2026, the owner). Read from ACCESS_COLS so the table and the
+           explanation cannot name different things. */
+        '<div class="card" style="margin-top:14px"><h3 style="margin:0 0 8px">What each one gives</h3>' +
+          '<dl class="acc-desc">' + ACCESS_COLS.map(c =>
+            '<dt>' + esc(c.label) + '</dt><dd>' + c.desc + '</dd>').join("") + '</dl>' +
+          '<div class="hint" style="margin-top:8px">The last three are not for partner accounts.</div></div>';
     }
 
     if(ADMTAB === "notify" && admTabOpen("notify")){
@@ -41259,12 +41272,26 @@ function approvalMailAlert(n, approvers, batchId){
    the route patches, so nothing else on the person is touched) and writes an audit line.
    internal: not for a partner account (the server refuses it too). */
 const ACCESS_COLS = [
-  { k:"screenUpdate",  label:"Screen Update",     title:"Email when a new subject is registered and enters screening" },
-  { k:"stageUpdate",   label:"Stage Update",      title:"Email when a screening stage is completed" },
-  { k:"stuckUpdate",   label:"Stuck Update",      title:"The Sunday summary email with the subjects stuck in screening, at every site" },
-  { k:"clinicManager", label:"Clinic manager",    title:"Decides whether a subject is clinically feasible, after the anatomical scoring", internal:true },
-  { k:"taskFallback",  label:"Sites with no CPM", title:"Takes every task of a hospital site that has no Responsible CPM - one person at a time", internal:true },
-  { k:"anatEvalTeam",  label:"Anatomical evaluation team", title:"Emailed and given a task to score a digital model", internal:true }
+  { k:"screenUpdate",  label:"New subject mail",     title:"Email when a new subject is registered and enters screening",
+    desc:"An email each time a new subject is registered and enters screening. Only people ticked here receive it." },
+  { k:"stageUpdate",   label:"Stage completed mail", title:"Email when a screening stage is completed, a procedure report is submitted or a procedure summary is closed",
+    desc:"An email when a screening stage is completed (1 CT Measurements Report, 2 Digital Model Evaluation, 6 Pliable Model Evaluation, " +
+      "8 Eligibility & Approvals, 9 Randomization & Scheduling), " +
+      "with the stage's details and files; and when a procedure report is submitted or a procedure summary is closed. " +
+      "App Admins, Managers, QA and the subject's and site's CPM receive it anyway." },
+  { k:"stuckUpdate",   label:"Weekly summary mail",  title:"The Sunday summary email, with the subjects stuck in screening at every site",
+    desc:"The Sunday summary email: the study's figures, the open tasks and the subjects stuck in screening, at <b>every</b> site. " +
+      "App Admins, Managers, QA and Clinical PMs receive it anyway; for a Clinical PM the tick widens the stuck list from their own sites to all sites." },
+  { k:"clinicManager", label:"Feasibility decision (Clinic manager)", title:"Decides whether a subject is clinically feasible, after the anatomical scoring", internal:true,
+    desc:"Once the Digital model scoring (2.2) is done, is emailed and decides whether the subject is clinically feasible " +
+      "(Clinically feasible / Not clinically feasible). Nothing is printed before that. Several people may be ticked; any one of them decides. " +
+      "If nobody is ticked, an App Admin or a Manager decides." },
+  { k:"taskFallback",  label:"Covers sites with no CPM", title:"Takes every task of a hospital site that has no Responsible CPM - one person at a time", internal:true,
+    desc:"Takes every task of a hospital site that has no Responsible CPM and is given the missing procedure summaries of such sites. " +
+      "Is also alerted, with the site’s CPM, whenever a procedure took place and no report came, at any site. <b>One person at a time</b>: ticking somebody moves it to them." },
+  { k:"anatEvalTeam",  label:"Digital model scoring (2.2)", title:"Emailed and given a task to score a digital model", internal:true,
+    desc:"After <b>Done with 2.1</b> on a Digital Model Evaluation, is emailed and given the task of scoring it (2.2): the anatomical decision, " +
+      "the implant size and whether a physical model is needed. Only they, an App Admin or a Manager confirm 2.2." }
 ];
 /* True once /api/admin/users answered: before that the thin user list has none of the ticks,
    and a table drawn from it would show everybody unticked. */
@@ -41275,7 +41302,7 @@ async function toggleUserFlag(id, k){
   if(!u || !col){ render(); return; }
   const want = u[k] !== true;
   if(want && col.internal && u.accessType === "EXTERNAL"){
-    toast("A partner account cannot be a clinic manager, take unassigned tasks or be on the evaluation team.", "bad");
+    toast("A partner account cannot decide feasibility, cover sites with no CPM or score digital models.", "bad");
     render(); return;
   }
   if(S.backend){
@@ -41437,8 +41464,8 @@ function userForm(u){
     '</fieldset>' +
     /* The six ticks (Screen/Stage/Stuck Update, Clinic manager, Sites with no CPM, evaluation
        team) moved to Administration -> Roles & notifications (v3.20.0, 25 Nov 2026, the owner). */
-    '<div class="hint" style="margin:0 0 12px">Notifications (Screen, Stage, Stuck Update) and responsibilities ' +
-      '(Clinic manager, Sites with no CPM, Anatomical evaluation team) are set on the ' +
+    '<div class="hint" style="margin:0 0 12px">Mails (New subject, Stage completed, Weekly summary) and responsibilities ' +
+      '(Feasibility decision, Covers sites with no CPM, Digital model scoring) are set on the ' +
       '<b>Roles &amp; notifications</b> tab.</div>' +
     '<div class="grid g2"><div class="field"><label for="u-t">Title</label>' +
       '<input type="text" id="u-t" value="' + esc(u.title||"") + '"></div>' +
@@ -41563,8 +41590,8 @@ function userForm(u){
     /* The ticks are no longer on this dialog (v3.20.0) and are NOT sent from it, so a save
        here never clears them. A person turned partner while holding one is refused. */
     if((u.clinicManager || u.taskFallback || u.anatEvalTeam) && u.accessType === "EXTERNAL")
-      return showWhy("u-why", "A partner account cannot be a clinic manager, take unassigned tasks or be on the " +
-        "evaluation team. Untick them on the Roles & notifications tab first.");
+      return showWhy("u-why", "A partner account cannot decide feasibility, cover sites with no CPM or score digital " +
+        "models. Untick them on the Roles & notifications tab first.");
 
     if(S.backend){
       try{
