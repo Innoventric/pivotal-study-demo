@@ -26008,7 +26008,15 @@ async function noteUnitPresent(p, sn){
    of double-consuming or silently skipping. */
 function usedSet(p){
   const c = cf(p);
-  if(Array.isArray(c.usedUnits)) return c.usedUnits.slice();
+  /* THE FAILED UNIT IS NEVER "USED" (25 Nov 2026). A tick given before the unit was scanned
+     as failed used to survive the scan, so Confirm wrote it USED and then could not reject
+     it ("already USED") - the unit that failed was recorded as implanted. Filtered here, on
+     the one reading every caller goes through: a stored tick on it stops counting, and a
+     unit already written USED falls into confirmUsedProducts' "put back" list, which runs
+     BEFORE the rejection - so it goes USED -> back on the shelf -> REJECTED, the path the
+     server's consume() allows. */
+  const failSn = c.failSn || "";
+  if(Array.isArray(c.usedUnits)) return c.usedUnits.filter(sn => !(failSn && sameSn(sn, failSn)));
   /* A cancelled procedure implanted nothing, so it defaults to nothing ticked. Without
      this the default would be "every verified unit", and a cancelled case confirmed
      without reading the list would consume the units it opened and put back - the exact
@@ -26027,7 +26035,6 @@ function usedSet(p){
      in. An un-ticked product is caught by askMissingProducts at Confirm; a wrongly ticked
      one would have left stock unseen. The failed unit is never offered as used - it is
      REJECTED by the same confirmation, and a unit cannot be both. */
-  const failSn = c.failSn || "";
   const verified = devChecks(p).filter(u => u.sn && devUnitDone(u) && !(failSn && sameSn(u.sn, failSn)));
   const byType = {};
   verified.forEach(u => { const k = u.productType || ""; (byType[k] = byType[k] || []).push(u.sn); });
@@ -26138,9 +26145,11 @@ async function confirmUsedProducts(p){
       await applyDeviceOutcome(p, sn, "RETURNED");
       c.consumedUnits = (c.consumedUnits || []).filter(x => !eq(x, sn));
       returned++;
+      const isFail = failSn && eq(sn, failSn);
       logAction("Unit " + sn + " put back into stock — no longer recorded as used for " + p.patientCode, {
-        locationId:p.siteId, stateChanges:"→ back in stock", highPriority:true,
-        comments:"Correction made on the procedure report before it was locked" });
+        locationId:p.siteId, stateChanges: isFail ? "→ back in stock, to be rejected" : "→ back in stock", highPriority:true,
+        comments: isFail ? "It was recorded as used, then scanned as the device that failed - it is rejected next"
+                         : "Correction made on the procedure report before it was submitted" });
     }catch(e){ failures.push(sn + ": " + (e.message || "refused")); }
   }
   for(const sn of toConsume){
@@ -26260,6 +26269,15 @@ function usedProductsBlock(p){
   h += cand.map(u => {
     const d = findDeviceByCode(u.sn);
     const st = d && DEV_STATUS[d.status];
+    /* The failed unit is not a choice here (25 Nov 2026): it is rejected, never used. Shown
+       without a tick, so it cannot be ticked as implanted; the warning below says how to
+       undo a mistaken failure scan. */
+    if(c.failSn && sameSn(u.sn, c.failSn)){
+      return '<div class="check" style="cursor:default"><span>' + esc((u.productType || "") + " " + (u.size || "")) +
+        ' · <span class="mono">' + esc(u.sn) + '</span> <span class="pill p-red">' +
+        (c.rejectedUnit && sameSn(c.rejectedUnit, u.sn) ? 'failed — rejected' : 'failed — will be rejected') + '</span>' +
+        (st ? ' <span class="pill ' + st.cls + '">' + esc(st.label) + '</span>' : '') + '</span></div>';
+    }
     return '<label class="check' + (on(u.sn) ? " on" : "") + '">' +
       '<input type="checkbox" data-cfused="' + esc(u.sn) + '"' + (on(u.sn) ? " checked" : "") +
       ro(p) + '><span>' + esc((u.productType || "") + " " + (u.size || "")) +
@@ -31081,7 +31099,11 @@ function unusedAtSite(p){
   const up = s => String(s || "").toUpperCase();
   const used = new Set(usedSet(p).map(up));
   const onTable = new Set(devChecks(p).map(u => up(u.sn)));
+  /* The failed unit is not a spare to carry home - it is rejected (25 Nov 2026). Until the
+     confirmation writes that it is still stock here, so it is left out by name. */
+  const failSn = cf(p).failSn || "";
   return S.db.devices.filter(d => DEV_STATUS[d.status] && DEV_STATUS[d.status].stock &&
+    !(failSn && sameSn(d.sn, failSn)) &&
     d.locationId === p.siteId && !used.has(up(d.sn)) &&
     (onTable.has(up(d.sn)) || d.allocatedTo === p.id));
 }
