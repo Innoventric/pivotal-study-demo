@@ -20281,6 +20281,9 @@ function unitPickSelect(selId, units, isRecommended, opts){
                                                       : esc(locName(d.locationId))) : '') +
     (isRecommended && isRecommended(d) ? "  ★ Recommended" : "") + '</option>';
   return '<select id="' + esc(selId) + '" style="flex:1;min-width:0">' +
+    /* An empty first row where asked (25 Nov 2026, the owner): without it the list showed a unit
+       as though one had been chosen, when nothing is recorded until Add is pressed. */
+    (opts.blank ? '<option value="" selected>' + esc(opts.blank) + '</option>' : '') +
     (groups.length > 1
       ? groups.map(g => '<optgroup label="' + esc(g.label) + '">' + g.units.map(option).join("") + '</optgroup>').join("")
       : (groups[0] ? groups[0].units.map(option).join("") : "")) +
@@ -20335,7 +20338,7 @@ function scanField(id, label, value, opts){
                 'is the only option here.') + '</div>')))) +
     (pickList
       ? '<div class="row" style="margin-top:6px;flex-wrap:nowrap">' +
-          unitPickSelect(id + "-pick", pickList, opts.pick.recommend, { showWhere: !!opts.pick.showWhere }) +
+          unitPickSelect(id + "-pick", pickList, opts.pick.recommend, { showWhere: !!opts.pick.showWhere, blank: opts.pick.blank || "" }) +
           '<button type="button" class="btn btn-sm" data-scanpick="' + id + '" style="flex:none">Add</button></div>'
       : '') +
   '</div>';
@@ -20349,8 +20352,8 @@ function wireScanFields(){
   });
   $$("[data-scanpick]").forEach(b => b.onclick = () => {
     const id = b.dataset.scanpick, sel = $("#" + id + "-pick");
-    const d = sel && device(sel.value);
-    if(!d) return toast("Choose a unit first.", "warn");
+    const d = sel && sel.value && device(sel.value);
+    if(!d) return toast("Choose a unit from the list first.", "warn");
     deliverCode(id, d.sn, false, "picked");
   });
   $$("[data-manual]").forEach(a => a.onclick = e => {
@@ -26146,6 +26149,9 @@ async function confirmUsedProducts(p){
       c.consumedUnits = (c.consumedUnits || []).filter(x => !eq(x, sn));
       returned++;
       const isFail = failSn && eq(sn, failSn);
+      /* The failed unit passes through the shelf on its way to REJECTED - not "put back" in
+         anything the person would recognise, so it is not counted as one (25 Nov 2026). */
+      if(isFail) returned--;
       logAction("Unit " + sn + " put back into stock — no longer recorded as used for " + p.patientCode, {
         locationId:p.siteId, stateChanges: isFail ? "→ back in stock, to be rejected" : "→ back in stock", highPriority:true,
         comments: isFail ? "It was recorded as used, then scanned as the device that failed - it is rejected next"
@@ -26199,6 +26205,46 @@ function askMissingProducts(missing){
     $("#mp-back").onclick = () => { settle(false); closeModal(); };
     $("#mp-go").onclick = () => { settle(true); closeModal(); };
   });
+}
+/* CONFIRM PRODUCTS USED, as one function (25 Nov 2026): the button calls it, and so does
+   Save and submit, right before it submits - the owner: the ticks were a second step people did
+   not know they still owed. Returns true when every unit was applied; false when the person
+   went back from the missing-product question or any unit was refused (said in used-why),
+   and then nothing is submitted. */
+async function runConfirmUsed(p){
+  /* v3.0.0 (the owner, item 2): an implant with no delivery system, or the reverse, is asked
+     about before anything is written - unless the procedure was cancelled, when nothing
+     is the expected answer. */
+  const c0 = cf(p);
+  const cancelled = c0.asExpected === "NO" && c0.notExpectedBranch === "CANCELLED";
+  const want = usedSet(p).filter(Boolean);
+  const types = new Set(want.map(sn => (S.db.devices.find(d => sameSn(d.sn, sn)) || {}).productType).filter(Boolean));
+  const missing = cancelled ? [] : ["UNICA", "DS"].filter(t => !types.has(t)).map(productTypeLabel);
+  if(missing.length && !(await askMissingProducts(missing))) return false;
+  showWhy("used-why", "");
+  try{
+    const r = await confirmUsedProducts(p);
+    if(!r.failures.length) await afterProductsConfirmed(p, { cancelled, missing, recorded: want });
+    if(r.anomalies.length){
+      toast("Recorded, but " + r.anomalies.join(", ") + " was not in stock — its arrival " +
+            "was never verified. The activity log has been flagged.", "bad");
+    }
+    if(r.failures.length){
+      /* Partial application is reported as such. Saying "done" over a unit that was
+         refused would leave a stock count nobody knows is wrong. */
+      showWhy("used-why", "Some units were refused: " + r.failures.join(" · ") +
+        (r.consumed || r.returned || r.rejected
+          ? " — the rest were applied. Fix these and confirm again." : ""));
+      return false;
+    }
+    toast(r.consumed + " unit(s) removed from stock" +
+      (r.rejected ? ", 1 rejected" : "") +
+      (r.returned ? ", " + r.returned + " put back on the shelf" : "") + ".", "good");
+    return true;
+  }catch(e){
+    showWhy("used-why", e.message || "The confirmation was refused.");
+    return false;
+  }
 }
 /* What a successful confirmation means beyond the stock (v3.0.0, the owner, items 6 and 2).
    · Something was used and the procedure was not cancelled: the subject is TREATED now,
@@ -26258,7 +26304,7 @@ function usedProductsBlock(p){
 
   let h = '<h3 style="margin:16px 0 4px">Products used in this procedure</h3>' +
     '<div class="hint" style="margin-bottom:8px">Tick the units that actually went into ' +
-    'the subject. Confirming removes them from stock — a unit that was opened but not ' +
+    'the subject. Confirming (or Save and submit) removes them from stock — a unit that was opened but not ' +
     'used stays on the shelf. This can be corrected until the report is submitted.</div>';
 
   if(!cand.length){
@@ -26312,7 +26358,7 @@ function usedStateHtml(p){
   const c = cf(p);
   const pending = usedPending(p);
   if(!c.usedConfirmedAt){
-    return '<div class="hint" style="margin-top:8px">Not confirmed yet — nothing has left stock.</div>';
+    return '<div class="hint" style="margin-top:8px">Not applied to stock yet. <b>Save and submit</b> does it for you, or press <b>Confirm products used</b> now.</div>';
   }
   return '<div class="' + (pending ? "warn" : "okbox") + '" style="margin-top:8px">' +
     (pending
@@ -26508,6 +26554,48 @@ function replPickable(p){
     (!when || !d.expiration || String(d.expiration).slice(0, 10) >= when) &&
     !spoken.has(d.id) && (!d.allocatedTo || d.allocatedTo === p.id) &&
     !sameSn(d.sn, cf(p).failSn || ""));
+}
+
+/* STAGE 4's FAILURE LOG (25 Nov 2026, the owner). Shown where it is required - No → Alternative
+   devices used - or wherever it already holds something, so nothing recorded is hidden. */
+function showFailLog(p){
+  const c = cf(p);
+  return (c.asExpected === "NO" && c.notExpectedBranch === "ALTERNATIVE") ||
+    !!(c.failRef || c.replRef || c.failReason || c.failDetail);
+}
+/* The failed unit is one that was at the table - never the one named as its replacement. */
+function failPickable(p){
+  const c = cf(p);
+  return devChecks(p).map(u => S.db.devices.find(d => sameSn(d.sn, u.sn))).filter(Boolean)
+    .filter(d => !(c.replSn && sameSn(d.sn, c.replSn)));
+}
+/* The replacement comes off the shelf (replPickable), and is not a unit already ticked as
+   used for something else - that one is in the subject already. The one this field holds
+   stays on the list. (The screenshot of 25 Nov had the same -R unit offered as failed, as
+   the recommended replacement, and ticked as used.) */
+function replChoices(p){
+  const c = cf(p), used = usedSet(p);
+  return replPickable(p).filter(d => (c.replSn && sameSn(d.sn, c.replSn)) || !used.some(sn => sameSn(sn, d.sn)));
+}
+/* Recommended only once the failed unit is known: FIFO-first of the same product, the same
+   size first. With no failed unit there is nothing to replace, so nothing is starred. */
+function replRecommended(p){
+  const fd = cf(p).failSn ? findDeviceByCode(cf(p).failSn) : null;
+  if(!fd) return null;
+  const same = replChoices(p).filter(x => x.productType === fd.productType);
+  const sized = same.filter(x => x.size === fd.size);
+  return (sized.length ? sized : same).slice().sort(fifoCompare)[0] || null;
+}
+/* What the ticks say, when they read as "used as expected": something ticked, no failed
+   unit. "" otherwise. The words name the products, so the person answering sees what the
+   one-press Yes is based on. */
+function expectedFromTicks(p){
+  const c = cf(p);
+  if(c.failSn || c.failRef) return "";
+  const used = usedSet(p);
+  if(!used.length) return "";
+  return used.map(sn => { const d = findDeviceByCode(sn);
+    return d ? productTypeLabel(d.productType) + " " + (d.size || "") : sn; }).join(" + ");
 }
 
 function deviceCheckBlock(p){
@@ -30203,31 +30291,50 @@ VIEWS.clinical = {
         '<option value="CANCELLED"' + (branch === "CANCELLED" ? " selected" : "") + '>Procedure cancelled</option>' +
         '<option value="ALTERNATIVE"' + (branch === "ALTERNATIVE" ? " selected" : "") + '>Alternative devices used</option>' +
         '</select></div>' : "") +
-      (failReq ? '<div class="warn"><b>Alternative devices were used, so the Rejected/Failure Device Log ' +
-        'is mandatory.</b> Submission is blocked until it is complete.</div>' :
-        '<div class="hint" style="margin-bottom:10px">Rejected/Failure Device Log is optional here.</div>') +
-      /* Both identifiers are scanned, so the failed unit and the one actually used are
-         tied to real inventory instead of being typed as free text. */
-      '<div class="grid g2">' +
-        scanField("fail-scan", "Rejected / failed device — scan its label", c.failRef,
-                  { req:failReq, disabled:cfReadOnly(p),
-                    pick:{ units: devChecks(p).map(u => S.db.devices.find(d => sameSn(d.sn, u.sn))).filter(Boolean) } }) +
-        scanField("repl-scan", "Replacement actually used — scan its label", c.replRef,
-                  { req:failReq, disabled:cfReadOnly(p),
-                    pick:{ units: replPickable(p), recommend: d => replPickable(p).filter(x =>
-                      x.productType === d.productType && x.size === d.size).sort(fifoCompare)[0] === d } }) +
-      '</div>' +
-      (c.failRef || c.replRef ? '<div class="info">' +
-        (c.failRef ? '<div>Failed: <span class="mono">' + esc(c.failRef) + '</span>' +
-          (c.failManual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</div>' : '') +
-        (c.replRef ? '<div>Used instead: <span class="mono">' + esc(c.replRef) + '</span>' +
-          (c.replManual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</div>' : '') +
-        '</div>' : "") +
-      '<div class="grid g2">' +
-        /* The mandatory mark said out loud (v3.19.0, the owner): a small asterisk was easy to miss. */
-        tf(p,"failReason","Reason","text",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
-        tf(p,"failDetail","Failure detail","textarea",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
-      '</div>' +
+      /* THE ANSWER AND THE TICKS AGREE (25 Nov 2026, the owner). Not answered yet, and what is
+         ticked below reads as Yes (something used, nothing failed, not cancelled): one
+         press answers it. Never answered for them - it is a statement about the procedure. */
+      (!asExp && !cfReadOnly(p) && expectedFromTicks(p)
+        ? '<div class="hint" style="margin:-4px 0 10px">The products ticked below — ' + esc(expectedFromTicks(p)) +
+          ' — and no failed device read as <b>Yes</b>. ' +
+          '<button type="button" class="btn btn-sm" id="asexp-yes">Yes, as expected</button></div>' : '') +
+      /* THE FAILURE LOG ONLY WHERE IT BELONGS (25 Nov 2026, the owner). It used to be on screen
+         whatever the answer - before one was given, and under Yes - with two lists that
+         looked as though a unit was already chosen. Now it opens with No → Alternative
+         devices used, which is where it is required. A report that already holds failure
+         data from before keeps showing it (with the contradiction named), so nothing that
+         was recorded is hidden. */
+      (showFailLog(p)
+        ? (failReq ? '<div class="warn"><b>Alternative devices were used, so the Rejected/Failure Device Log ' +
+            'is mandatory.</b> Submission is blocked until it is complete.</div>'
+          : '<div class="warn"><b>A failed device is recorded, but the answer above is not "No → Alternative ' +
+            'devices used".</b> Change the answer, or clear the failed-device field if it was scanned by mistake.</div>') +
+          /* Both identifiers are scanned, so the failed unit and the one actually used are
+             tied to real inventory instead of being typed as free text. Neither list offers
+             the unit the other field holds, and the replacement list does not offer a unit
+             already ticked as used for something else (25 Nov 2026). */
+          '<div class="grid g2">' +
+            scanField("fail-scan", "Rejected / failed device — scan its label", c.failRef,
+                      { req:failReq, disabled:cfReadOnly(p),
+                        pick:{ units: failPickable(p), blank:"— choose the unit that failed —" } }) +
+            scanField("repl-scan", "Replacement actually used — scan its label", c.replRef,
+                      { req:failReq, disabled:cfReadOnly(p),
+                        pick:{ units: replChoices(p), blank:"— choose the unit used instead —",
+                               recommend: d => { const r = replRecommended(p); return !!(r && r.id === d.id); } } }) +
+          '</div>' +
+          (c.failRef || c.replRef ? '<div class="info">' +
+            (c.failRef ? '<div>Failed: <span class="mono">' + esc(c.failRef) + '</span>' +
+              (c.failManual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</div>' : '') +
+            (c.replRef ? '<div>Used instead: <span class="mono">' + esc(c.replRef) + '</span>' +
+              (c.replManual ? ' <span class="pill p-orange">hand-entered</span>' : '') + '</div>' : '') +
+            '</div>' : "") +
+          '<div class="grid g2">' +
+            /* The mandatory mark said out loud (v3.19.0, the owner): a small asterisk was easy to miss. */
+            tf(p,"failReason","Reason","text",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
+            tf(p,"failDetail","Failure detail","textarea",{req:failReq, hint: failReq ? FAIL_REQ_HINT : "", hintReq:true}) +
+          '</div>'
+        : (!asExp ? '<div class="hint" style="margin-bottom:10px">If a device failed or another one was used ' +
+            'instead, answer <b>No → Alternative devices used</b>: the failure log opens there.</div>' : '')) +
       /* Two optional ticks (v3.19.0, the owner) - nothing waits on them. */
       '<h3 style="margin:14px 0 7px">At the end of the procedure <span class="hint" style="font-weight:400">— optional</span></h3>' +
       PD.POST_CHECKS.map((t, i) => cbox(p, "postChecks", t, i)).join("") +
@@ -30647,40 +30754,18 @@ VIEWS.clinical = {
       commit(); scheduleCaseFileSave(p); render();
     };
     const esb = $("#pt-edit-sub"); if(esb) esb.onclick = () => askEditSubmitted(p);
+    /* One press for the answer the ticks already give (25 Nov 2026). The same write as
+       choosing Yes in the list, so it is saved and logged the same way. */
+    const ay = $("#asexp-yes");
+    if(ay) ay.onclick = () => {
+      if(cfReadOnly(p)) return;
+      cf(p).asExpected = "YES";
+      commit(); scheduleCaseFileSave(p); render();
+    };
     const ug = $("#used-go");
     if(ug) ug.onclick = async () => {
-      /* v3.0.0 (the owner, item 2): an implant with no delivery system, or the reverse, is asked
-         about before anything is written - unless the procedure was cancelled, when nothing
-         is the expected answer. */
-      const c0 = cf(p);
-      const cancelled = c0.asExpected === "NO" && c0.notExpectedBranch === "CANCELLED";
-      const want = usedSet(p).filter(Boolean);
-      const types = new Set(want.map(sn => (S.db.devices.find(d => sameSn(d.sn, sn)) || {}).productType).filter(Boolean));
-      const missing = cancelled ? [] : ["UNICA", "DS"].filter(t => !types.has(t)).map(productTypeLabel);
-      if(missing.length && !(await askMissingProducts(missing))) return;
       ug.disabled = true;
-      showWhy("used-why", "");
-      try{
-        const r = await confirmUsedProducts(p);
-        if(!r.failures.length) await afterProductsConfirmed(p, { cancelled, missing, recorded: want });
-        if(r.failures.length){
-          /* Partial application is reported as such. Saying "done" over a unit that was
-             refused would leave a stock count nobody knows is wrong. */
-          showWhy("used-why", "Some units were refused: " + r.failures.join(" · ") +
-            (r.consumed || r.returned || r.rejected
-              ? " — the rest were applied. Fix these and confirm again." : ""));
-        }else{
-          toast(r.consumed + " unit(s) removed from stock" +
-            (r.rejected ? ", 1 rejected" : "") +
-            (r.returned ? ", " + r.returned + " put back" : "") + ".", "good");
-        }
-        if(r.anomalies.length){
-          toast("Recorded, but " + r.anomalies.join(", ") + " was not in stock — its arrival " +
-                "was never verified. The activity log has been flagged.", "bad");
-        }
-      }catch(e){
-        showWhy("used-why", e.message || "The confirmation was refused.");
-      }
+      await runConfirmUsed(p);
       ug.disabled = false;
       render();
     };
@@ -30824,8 +30909,17 @@ function missingForSubmit(p){
     if(!c.failReason) out.push("Stage 4 — failure reason");
     if(!c.failDetail) out.push("Stage 4 — failure detail");
   }
-  const uo = usedOutstanding(p);
-  if(uo) out.push("Stage 4 — " + uo);
+  /* The answer and the ticks must tell one story (25 Nov 2026, the owner). */
+  const ticked = usedSet(p);
+  if(c.asExpected === "YES" && (c.failSn || c.failRef))
+    out.push("Stage 4 — a failed device is recorded, but the answer is “used as expected”: answer No → Alternative devices used, or clear the failed device");
+  if(c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED" && ticked.length)
+    out.push("Stage 4 — the procedure is marked cancelled, but " + ticked.length + " unit(s) are ticked as used");
+  if(c.replSn && !ticked.some(sn => sameSn(sn, c.replSn)))
+    out.push("Stage 4 — the replacement " + c.replSn + " is not ticked as used");
+  /* Confirming the products is no longer an item of its own (25 Nov 2026, the owner): Save and
+     submit applies the ticks to stock itself, right before it submits (submitCase). The
+     Confirm button stays for applying them earlier. */
   const un = unusedOutstanding(p);
   if(un) out.push("Stage 4 — " + un);
   /* A training session moved after the order for a perfect fit (26 Oct 2026) must be done
@@ -30963,6 +31057,18 @@ async function submitCase(p){
     return false;
   }
   clearWhy("pt-why");
+  /* THE PRODUCTS USED ARE APPLIED HERE TOO (25 Nov 2026, the owner): not a separate step to
+     remember. Only when there is something to apply; if the person goes back from the
+     missing-product question, or a unit is refused, nothing is submitted. */
+  if(usedOutstanding(p)){
+    const applied = await runConfirmUsed(p);
+    if(!applied){
+      render();
+      showWhy("pt-why", "Not submitted — the products used were not applied to stock. " +
+        "See the message under Products used, then press the button again.");
+      return false;
+    }
+  }
   /* The unused units (v3.19.0): did the team take them? Answered in stage 4 since 25 Nov
      2026 - missingForSubmit refuses above until it is - and read from the record here,
      before anything is sent, so the snapshot travels with the submitted case file. */
