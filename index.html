@@ -15067,7 +15067,7 @@ const DRAFT_KEY   = DEMO ? "pivotal.demo.drafts"     : "pivotal.drafts";
 /* Roles must match VALID_ROLES in roleStore.js exactly. */
 const ROLES = {
   ADMIN:    { label:"App Admin",           blurb:"Everything, plus the Admin screen." },
-  CPM:      { label:"Clinical PM",         blurb:"Employee rights plus create/edit subjects, overrides, final lock." },
+  CPM:      { label:"Clinical PM",         blurb:"Employee rights plus create/edit subjects, overrides, taking over a report." },
   EMPLOYEE: { label:"Innoventric Employee",blurb:"Main workflow. Cannot create or edit subjects." },
   WH_ADMIN: { label:"WH Admin",            blurb:"Warehouse operations, own warehouse only." },
   QA:       { label:"QA",                  blurb:"Employee rights plus releasing a produced batch into stock." },
@@ -22257,14 +22257,8 @@ function todoItems(){
         title: "Reminder — " + p.patientCode, sub: r.text + " · due " + fmtDate(r.date) });
   }
 
-  /* 5 — submitted files still waiting on the person who is allowed to lock them. */
-  if(can("lockCaseFile")){
-    const wait = myPatients.filter(p => p.submitted && !p.fileLocked);
-    if(wait.length) out.push({ ic:"case", tone:"t-blue", view:"clinical",
-      patientId: wait[0].id,
-      title: wait.length + " procedure report(s) submitted, awaiting final lock",
-      sub: wait.map(p => p.patientCode).join(", ") + " — locking archives them to OneDrive." });
-  }
+  /* 5 — (removed 25 Nov 2026) the Home task asking a Clinical PM or App Admin to lock
+     submitted reports: there is no lock any more; the submit ends the report. */
 
   /* 6 — expired stock still sitting on a shelf. */
   const exp = mine.filter(d => d.status === "EXPIRED");
@@ -25844,7 +25838,7 @@ function devUnitDone(u){
 function devVerificationDone(p){
   const list = devChecks(p);
   const room = cf(p).roomChecks || [];
-  return list.length > 0 && list.every(devUnitDone) &&
+  return list.length > 0 && unitsToVerify(p).every(devUnitDone) &&
          ROOM_CHECKS.every((_, i) => !!room[i]);
 }
 function ptAddDeviceUnit(code, manual){
@@ -26020,11 +26014,38 @@ function usedSet(p){
      without reading the list would consume the units it opened and put back - the exact
      error this screen exists to prevent, made by the screen itself. */
   if(c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED") return [];
-  /* Otherwise offer the fully-verified units pre-ticked: the common case, and the same
-     set the follow-up screen has always reported as implanted. The default is COMPUTED,
-     never written here - a render must not mutate the record, or merely opening a report
-     would decide what it consumed. */
-  return devChecks(p).filter(devUnitDone).map(u => u.sn).filter(Boolean);
+  /* Otherwise pre-tick a verified unit only where the answer is not in doubt: exactly ONE
+     verified unit of that product on the table. The default is COMPUTED, never written
+     here - a render must not mutate the record, or merely opening a report would decide
+     what it consumed.
+
+     It used to pre-tick EVERY verified unit (25 Nov 2026, the owner). Since v2.40.0 there are
+     two of each product on the table, both checked before anything is opened, so the old
+     default ticked the spares as implanted - and finishing a spare's checks later flipped
+     it from unticked to ticked without anybody touching stage 4. With two verified units
+     of one product nothing of that product is pre-ticked: the operator says which one went
+     in. An un-ticked product is caught by askMissingProducts at Confirm; a wrongly ticked
+     one would have left stock unseen. The failed unit is never offered as used - it is
+     REJECTED by the same confirmation, and a unit cannot be both. */
+  const failSn = c.failSn || "";
+  const verified = devChecks(p).filter(u => u.sn && devUnitDone(u) && !(failSn && sameSn(u.sn, failSn)));
+  const byType = {};
+  verified.forEach(u => { const k = u.productType || ""; (byType[k] = byType[k] || []).push(u.sn); });
+  return Object.keys(byType).filter(k => byType[k].length === 1).map(k => byType[k][0]);
+}
+/* Which scanned units stage 2 must have fully verified before the report can go in: the
+   ones that went into the subject, and the failed one (it was opened too). A spare that
+   was scanned and never opened goes back on the shelf, so its checks cannot be what
+   blocks the report (25 Nov 2026, the owner: "verification incomplete" for the two spares
+   while the two units used were verified). When nothing is ticked as used and nothing
+   failed, every unit on the table is still required, as before - there is no answer yet
+   to narrow it by. */
+function unitsToVerify(p){
+  const list = devChecks(p);
+  const c = cf(p);
+  const keep = usedSet(p).concat(c.failSn ? [c.failSn] : []).filter(Boolean);
+  const need = list.filter(u => keep.some(sn => sameSn(sn, u.sn)));
+  return need.length ? need : list;
 }
 /* Every unit stage 4 can ask about: the ones checked at the table, plus a replacement
    scanned here that never appeared there. */
@@ -26229,7 +26250,7 @@ function usedProductsBlock(p){
   let h = '<h3 style="margin:16px 0 4px">Products used in this procedure</h3>' +
     '<div class="hint" style="margin-bottom:8px">Tick the units that actually went into ' +
     'the subject. Confirming removes them from stock — a unit that was opened but not ' +
-    'used stays on the shelf. Until the final lock this can be corrected.</div>';
+    'used stays on the shelf. This can be corrected until the report is submitted.</div>';
 
   if(!cand.length){
     return h + '<div class="empty">No unit has been scanned yet. Scan the units at the ' +
@@ -30196,6 +30217,9 @@ VIEWS.clinical = {
       /* Last thing in the last stage, and deliberately AFTER the failure fields: the
          failed unit is one of the answers, so the list cannot be settled before them. */
       usedProductsBlock(p) +
+      /* Directly under the products used (25 Nov 2026, the owner): what was not used is the
+         rest of the same answer, and the list follows the ticks above. */
+      unusedBlock(p) +
     '</div><div class="card-ft">' +
       /* Export is available whatever the file's state — including after the final lock,
          which is exactly when a shareable PDF of the whole procedure is wanted. */
@@ -30210,12 +30234,24 @@ VIEWS.clinical = {
       cfHeldByOther(p) ? '<div class="row">' +
         '<button class="btn" id="pt-exit">Close</button>' +
         '<span class="hint">' + esc(cfWho(CF_HOLD.by)) + ' is editing this report. ' +
-        'Saving, submitting and locking belong to whoever is editing it.</span></div>' :
+        'Saving and submitting belong to whoever is editing it.</span></div>' :
+      /* SUBMITTED AND NOT REOPENED (25 Nov 2026, the owner): nothing here can be typed into, so
+         there is nothing to save and nothing to submit - only the way out, and what state
+         the report is in. It used to offer Save and close beside "Nothing outstanding -
+         Save and close submits this report", about a report already submitted. */
+      (p.submitted && !cfSubmittedOpen(p)) ? '<div class="row">' +
+        '<button class="btn" id="pt-exit">Close</button></div>' +
+        '<div class="okbox" style="margin:10px 0 0"><b>Submitted.</b> Filling in this report is finished' +
+          (can("editSubmittedReport") ? ' — to change it, use <b>Edit this submitted report</b> at the top.'
+                                      : '. Only an App Admin or a Manager may change it now.') + '</div>' :
       whyBox("pt-why") +
       '<div class="row">' +
         /* Saving is ALWAYS possible, whatever is still blank. Submission is a separate
-           action and it is the one that enforces the mandatory fields. */
-        '<button class="btn" id="pt-save">Save and close</button>' +
+           action and it is the one that enforces the mandatory fields. The button SAYS which
+           of the two it will do (25 Nov 2026, the owner) - submitBtnState, repainted as fields
+           are filled in, so nobody presses it believing they submitted. */
+        '<button class="btn' + (submitBtnState(p).submit ? ' btn-primary' : '') + '" id="pt-save">' +
+          esc(submitBtnState(p).label) + '</button>' +
         /* "Close", not "Exit without saving", changed 2 Sep 2026. The old name was
            reasoned from the right premise - everything here is written as it is typed, so
            there is no unsaved state a button could discard - and then did the one thing
@@ -30226,16 +30262,12 @@ VIEWS.clinical = {
            what is still outstanding. */
         '<button class="btn" id="pt-exit">Close</button>' +
         /* NO SUBMIT BUTTON (v3.19.0, 17 Nov 2026, the owner): Save and close submits by itself when
-           nothing is outstanding (saveOrSubmit), and only saves when something is. */
-        (p.submitted && can("lockCaseFile")
-          ? '<button class="btn btn-dark" id="pt-lock">Final permanent lock</button>' : "") +
-        (p.submitted && !can("lockCaseFile")
-          ? '<span class="hint">Only a Clinical PM or App Admin can perform the final lock.</span>' : "") +
+           nothing is outstanding (saveOrSubmit), and only saves when something is.
+           NO LOCK BUTTON (25 Nov 2026, the owner): "filling in the report ends with Save and
+           close". The submit is the end; after it only editSubmittedReport (App Admin,
+           Manager) reopens it, with a reason. A report locked before this stays locked. */
       '</div>' +
-      '<div class="hint" style="margin-top:8px">Fields save as you type. ' +
-        '<b>Save and close</b> always works. When nothing is outstanding it also <b>submits</b> the ' +
-        'report; while something is, it only saves.</div>' +
-      outstandingList(p)) +
+      '<div id="pt-submit-note">' + submitNoteHtml(p) + '</div>') +
     '</div></div></div>';
     return h;
   },
@@ -30543,6 +30575,25 @@ VIEWS.clinical = {
         t.closest(".check").classList.toggle("on", t.checked);
         const st = $("#used-state");
         if(st) st.innerHTML = usedStateHtml(p);
+        /* The not-used list below is the other half of these ticks. */
+        const uw = $("#unused-wrap");
+        if(uw) uw.innerHTML = unusedInner(p);
+      }else if(t.dataset.utook){
+        if(!t.checked) return;
+        cf(p).unusedTook = t.dataset.utook;
+        const uw = $("#unused-wrap");
+        if(uw) uw.innerHTML = unusedInner(p);
+      }else if(t.dataset.utstay){
+        /* Ticked = taken (the default); unticked = it stays at the site. */
+        const id = t.dataset.utstay, c = cf(p);
+        const stay = (c.unusedStay || []).filter(x => x !== id);
+        if(!t.checked) stay.push(id);
+        c.unusedStay = stay;
+        const uw = $("#unused-wrap");
+        if(uw) uw.innerHTML = unusedInner(p);
+      }else if(t.dataset.utto){
+        const c = cf(p);
+        c.unusedTo = Object.assign({}, c.unusedTo || {}, { [t.dataset.utto]: t.value });
       }else if(t.dataset.cfdn){
         const u = devChecks(p)[+t.dataset.cfdn];
         if(!u) return;
@@ -30551,6 +30602,9 @@ VIEWS.clinical = {
         p.customQuestions[+t.dataset.cq].a = t.value;
       }else return;
       flash(commit()); recalc();
+      /* The button says whether it will submit or only save; an answer just given may
+         have changed that. */
+      paintSubmitState(p);
       /* Queue the write FIRST. markFieldSaved reports on a write in flight and says
          nothing when there is none, so marking before queuing showed nothing at all
          while typing - the moment the feedback is actually wanted. */
@@ -30669,7 +30723,6 @@ VIEWS.clinical = {
       else if(!_exitWarned) toast("Left the report. Everything you typed is saved.", "good");
     };
     /* #pt-submit is gone (v3.19.0) - Save and close submits. */
-    const lk = $("#pt-lock");   if(lk) lk.onclick = () => lockCase(p);
     const pf = $("#pt-pdf");    if(pf) pf.onclick = () => exportCaseFilePDF(p);
     const ps = $("#pt-sum");    if(ps) ps.onclick = () => openSummary(p.id);
     const psu = $("#pt-sum-up"); if(psu) psu.onclick = () => chooseSummaryWay(p.id);
@@ -30736,7 +30789,7 @@ function missingForSubmit(p){
   const units = devChecks(p);
   if(!units.length) out.push("Stage 2 — scan and verify the devices used");
   else {
-    const short = units.filter(u => !devUnitDone(u));
+    const short = unitsToVerify(p).filter(u => !devUnitDone(u));
     if(short.length) out.push("Stage 2 — verification incomplete for " +
       short.map(u => u.sn).join(", "));
   }
@@ -30755,6 +30808,8 @@ function missingForSubmit(p){
   }
   const uo = usedOutstanding(p);
   if(uo) out.push("Stage 4 — " + uo);
+  const un = unusedOutstanding(p);
+  if(un) out.push("Stage 4 — " + un);
   /* A training session moved after the order for a perfect fit (26 Oct 2026) must be done
      before the report goes in; caseService.submit refuses it too. Not when cancelling. */
   const cancelling = c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED";
@@ -30764,11 +30819,42 @@ function missingForSubmit(p){
 function outstandingList(p){
   const m = missingForSubmit(p);
   if(!m.length) return '<div class="okbox" style="margin:10px 0 0">' +
-    'Nothing outstanding — <b>Save and close</b> submits this report.</div>';
-  return '<div class="warn" style="margin:10px 0 0"><b>' + m.length +
-    ' item(s) outstanding for submission.</b> You can still save and come back.' +
+    'Nothing missing — <b>' + esc(submitBtnState(p).label) + '</b> submits this report.</div>';
+  return '<div class="warn" style="margin:10px 0 0"><b>Not ready to submit — ' + m.length +
+    ' item(s) missing.</b> Pressing the button now only saves; fill these in to submit.' +
     '<ul style="margin:6px 0 0;padding-left:18px">' +
     m.map(x => '<li>' + esc(x) + '</li>').join("") + '</ul></div>';
+}
+/* WHAT THE BUTTON WILL DO, SAID ON THE BUTTON (25 Nov 2026, the owner: when submission is
+   blocked because something is missing, the user must know they are only saving, not
+   submitting - and only once everything is filled in can it be submitted). The rule is
+   saveOrSubmit's own: submittable and nothing missing -> submit, else save. */
+function submitBtnState(p){
+  const submittable = !p.submitted || cfSubmittedOpen(p);
+  const missing = missingForSubmit(p).length;
+  if(submittable && !missing){
+    return { submit:true, label: p.submitted ? "Save and re-submit" : "Save and submit" };
+  }
+  return { submit:false, missing, label: "Save only — information missing, NOT submitted" };
+}
+function submitNoteHtml(p){
+  const st = submitBtnState(p);
+  return '<div class="hint" style="margin-top:8px">Fields save as you type. ' +
+      (st.submit
+        ? 'Everything is filled in: <b>' + esc(st.label) + '</b> submits the report and ends filling it in.'
+        : '<b>The report will not be submitted</b> while anything below is missing — the button only saves, ' +
+          'and you can come back to it. Once everything is filled in, the same button submits it.') +
+    '</div>' + outstandingList(p);
+}
+/* Repainted in place as fields change - a full render would move the page under somebody
+   typing. Only the button's words and colour and the note below it. */
+function paintSubmitState(p){
+  const b = $("#pt-save"), n = $("#pt-submit-note");
+  if(!b || !n) return;
+  const st = submitBtnState(p);
+  b.textContent = st.label;
+  b.classList.toggle("btn-primary", !!st.submit);
+  n.innerHTML = submitNoteHtml(p);
 }
 
 /* An explicit user save. Always succeeds, however much is still blank. */
@@ -30834,15 +30920,16 @@ async function saveDraft(p){
   const filed = await fileProcedureReport(p, false);
   logAction("Procedure report saved as a draft for " + p.patientCode, { locationId:p.siteId,
     stateChanges: m.length ? m.length + " item(s) still outstanding" : "complete, not yet submitted" });
-  const left = m.length ? " " + m.length + " item(s) still outstanding." : "";
+  /* Said plainly (25 Nov 2026, the owner): a save with something missing is NOT a submission. */
+  const left = m.length ? " NOT submitted — " + m.length + " item(s) still missing." : "";
   if(filed && filed.queued){
     toast("Saved on this device." + left + " It is sent, and the report PDF filed, when the network returns.", "warn");
   }else if(filed && filed.error){
     toast("Saved." + left + " The report PDF was not filed: " + filed.error, "warn");
   }else if(filed && filed.filename){
-    toast("Saved." + left + " Report filed as " + filed.filename + ".", "good");
+    toast("Saved." + left + " Report filed as " + filed.filename + ".", m.length ? "warn" : "good");
   }else{
-    toast(m.length ? "Saved." + left : "Saved.", "good");
+    toast(m.length ? "Saved." + left : "Saved.", m.length ? "warn" : "good");
   }
   PID = null;                      // "and close" - back to the site/patient chooser
   render();
@@ -30858,10 +30945,11 @@ async function submitCase(p){
     return false;
   }
   clearWhy("pt-why");
-  /* The unused units, before anything is sent (v3.19.0): did the team take them? Backing
-     out submits nothing. */
-  const back = await askUnusedTaken(p);
-  if(back === null) return false;
+  /* The unused units (v3.19.0): did the team take them? Answered in stage 4 since 25 Nov
+     2026 - missingForSubmit refuses above until it is - and read from the record here,
+     before anything is sent, so the snapshot travels with the submitted case file. */
+  const back = unusedPlan(p);
+  snapshotUnused(p, back);
   const cancelled = c.asExpected === "NO" && c.notExpectedBranch === "CANCELLED";
   const newStatus = cancelled && p.status !== "CANCELLED" ? "CANCELLED" : p.status;
 
@@ -30869,7 +30957,7 @@ async function submitCase(p){
     if(cancelled && p.status === "CANCELLED") logAction("Procedure cancelled for " + p.patientCode,
       { locationId:p.siteId, stateChanges:"→ Cancelled", highPriority:true });
     logAction("Procedure report submitted for " + p.patientCode, { locationId:p.siteId,
-      stateChanges:"submitted = true", comments:"Editable until the final permanent lock" });
+      stateChanges:"submitted = true", comments:"After this only an App Admin or Manager can change it, with a reason" });
   };
 
   let offline = false;
@@ -30889,7 +30977,7 @@ async function submitCase(p){
     }
     if(!offline){
       logSubmit();
-      toast("Procedure report submitted. Still editable until locked.", "good"); render();
+      toast("Procedure report submitted.", "good"); render();
       await releaseAfterClose(p, "procedure report submitted");
       await takeBackUnused(p, back);
       await reportUnusedUnits(p, back);
@@ -30921,7 +31009,7 @@ async function submitCase(p){
   logSubmit();
   commit();
   toast(offline ? "Procedure report submitted on this device. It reaches the server when the network returns."
-                : "Procedure report submitted. Still editable until locked.", offline ? "warn" : "good");
+                : "Procedure report submitted.", offline ? "warn" : "good");
   render();
   await releaseAfterClose(p, "procedure report submitted");
   await takeBackUnused(p, back);
@@ -30997,80 +31085,125 @@ function unusedAtSite(p){
     d.locationId === p.siteId && !used.has(up(d.sn)) &&
     (onTable.has(up(d.sn)) || d.allocatedTo === p.id));
 }
-/* THE UNUSED UNITS AT SUBMISSION (v3.19.0, 17 Nov 2026, the owner). One question to the person
-   closing the report: did the team take the unused units with them?
-     Yes - they tick which, where to, and who carries them: those go hand-carried (as before),
-           and the warehouse managers and App Admins are told.
+/* THE UNUSED UNITS, ASKED IN THE FORM (25 Nov 2026, the owner: "move the question to sit under
+   the products used"). The same question and the same answers as v3.19.0, which asked it
+   in a dialog at the moment of submission - so whoever filled in stage 4 never saw it
+   coming and could not answer it while the team was still in the room:
+     Yes - they tick which, where to, and who carries them: those go hand-carried, and the
+           warehouse managers and App Admins are told.
      No  - nothing moves: the units stay at the site, and the App Admins and warehouse
            managers get a task to decide - keep them there, or send them to a warehouse.
-   Resolves the same plan takeBackUnused reads ({ deviceId: to, __who }) plus __stayed (the
-   ids left at the site), or null when the person backs out - then nothing is submitted. */
-function askUnusedTaken(p){
+   The answer is part of the case file (unusedTook, unusedStay, unusedTo, unusedWho), saved
+   as typed like every other field, and an unanswered question is an outstanding item, so
+   Save and close only submits once it is answered. Nothing moves until the submit: the
+   plan is built from the stored answer then (unusedPlan), in the shape takeBackUnused and
+   reportUnusedUnits have always read. A snapshot of what was answered is kept in the case
+   file at the submit (unusedSnapshot), because afterwards the units taken are no longer
+   at the site and the live list could not show them. */
+function unusedHomes(){ return visibleLocations().filter(l => l.type === "WAREHOUSE" || l.type === "HQ"); }
+function unusedDefaultHome(d, homes){
+  const o = loc(d.shippedFromId);
+  if(o && (o.type === "WAREHOUSE" || o.type === "HQ")) return o.id;
+  const hq = homes.find(l => l.type === "HQ");
+  return (hq || homes[0] || {}).id || "";
+}
+function unusedDest(p, d, homes){
+  const to = (cf(p).unusedTo || {})[d.id];
+  return to && homes.some(l => l.id === to) ? to : unusedDefaultHome(d, homes);
+}
+/* Shown filled with the name of whoever is looking, as the dialog did - the one who carries
+   them is usually the one filling it in. Read by the plan the same way, so what is on the
+   screen is what is sent. */
+function unusedWho(p){
+  const c = cf(p);
+  return c.unusedWho != null ? String(c.unusedWho) : ((S.me && S.me.name) || "");
+}
+function unusedTaken(p, d){ return !(cf(p).unusedStay || []).includes(d.id); }
+function unusedOutstanding(p){
   const units = unusedAtSite(p);
-  if(!units.length) return Promise.resolve({ __stayed:[] });
-  const homes = visibleLocations().filter(l => l.type === "WAREHOUSE" || l.type === "HQ");
-  const homeOf = d => {
-    const o = loc(d.shippedFromId);
-    if(o && (o.type === "WAREHOUSE" || o.type === "HQ")) return o.id;
-    const hq = homes.find(l => l.type === "HQ");
-    return (hq || homes[0] || {}).id || "";
-  };
-  return new Promise(resolve => {
-    let settled = false;
-    const finish = v => { if(!settled){ settled = true; resolve(v); } };
-    modal("Products that were not used",
-      '<p>These units were not used in <b>' + esc(p.patientCode) + '</b> and are recorded at <b>' +
-        esc(locName(p.siteId)) + '</b>.</p>' +
-      '<div class="field"><label class="req">Did the team take the unused units with them?</label>' +
-        '<label class="check" style="margin:0 0 4px"><input type="radio" name="ut-took" value="YES"><span>Yes — the team took them</span></label>' +
-        '<label class="check" style="margin:0 0 4px"><input type="radio" name="ut-took" value="NO"><span>No — they stayed at ' +
-          esc(locName(p.siteId)) + '</span></label></div>' +
-      '<div id="ut-yes" hidden>' +
-        units.map(d => '<div style="border:1px solid var(--line-2);border-radius:6px;padding:10px;margin:0 0 8px">' +
-          '<label class="check on" style="margin:0 0 6px"><input type="checkbox" data-ut-took="' + esc(d.id) + '" checked><span><b>' +
-            esc((d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || "")) + '</b> <span class="mono">' +
-            esc(d.sn || "—") + '</span> — taken</span></label>' +
-          '<select data-ut-to="' + esc(d.id) + '" style="width:100%" aria-label="Taking ' + esc(d.sn || "it") + ' to">' +
-            homes.map(l => '<option value="' + esc(l.id) + '"' + (l.id === homeOf(d) ? ' selected' : '') + '>' +
-              esc(l.name) + '</option>').join("") + '</select></div>').join("") +
-        '<div class="field" style="margin-top:10px"><label class="req" for="ut-who">Who is carrying them</label>' +
-          '<input type="text" id="ut-who" value="' + esc((S.me && S.me.name) || "") + '"></div>' +
+  if(!units.length) return "";
+  const c = cf(p);
+  if(c.unusedTook !== "YES" && c.unusedTook !== "NO") return "say whether the team took the unused units";
+  if(c.unusedTook === "YES"){
+    const taking = units.filter(d => unusedTaken(p, d));
+    if(taking.length && !unusedWho(p).trim()) return "say who is carrying the unused units";
+    const homes = unusedHomes();
+    const lost = taking.find(d => !unusedDest(p, d, homes));
+    if(lost) return "choose where " + (lost.sn || "each unused unit") + " is going";
+  }
+  return "";
+}
+function unusedPlan(p){
+  const units = unusedAtSite(p);
+  const c = cf(p), plan = { __stayed:[] };
+  if(!units.length) return plan;
+  if(c.unusedTook === "YES"){
+    const homes = unusedHomes();
+    for(const d of units){
+      if(unusedTaken(p, d)) plan[d.id] = unusedDest(p, d, homes);
+      else plan.__stayed.push(d.id);
+    }
+    plan.__who = unusedWho(p).trim();
+  }else plan.__stayed = units.map(d => d.id);
+  return plan;
+}
+function unusedLabel(d){ return (d.productType === "UNICA" ? "Unica " : "DS ") + (d.size || ""); }
+function unusedBlock(p){
+  return '<h3 style="margin:18px 0 4px">Products that were not used</h3><div id="unused-wrap">' +
+    unusedInner(p) + '</div>';
+}
+function unusedInner(p){
+  const c = cf(p);
+  const ro = cfReadOnly(p);
+  /* After the submit: what was answered, from the snapshot - the units taken have left. */
+  if(p.submitted && !cfSubmittedOpen(p) && Array.isArray(c.unusedSnapshot)){
+    if(!c.unusedSnapshot.length) return '<div class="hint">No unused unit was recorded at the site.</div>';
+    return '<div class="hint" style="margin-bottom:6px">Answered at submission' +
+        (c.unusedWhoSent ? ' — carried by <b>' + esc(c.unusedWhoSent) + '</b>' : '') + '.</div>' +
+      c.unusedSnapshot.map(u => '<div class="check' + (u.toId ? " on" : "") + '" style="cursor:default"><span><b>' +
+        esc(u.label) + '</b> <span class="mono">' + esc(u.sn || "—") + '</span> — ' +
+        (u.toId ? 'taken to ' + esc(locName(u.toId)) : 'stayed at ' + esc(locName(p.siteId))) + '</span></div>').join("");
+  }
+  const units = unusedAtSite(p);
+  if(!units.length){
+    return '<div class="hint">No unit is left over at ' + esc(locName(p.siteId)) +
+      ' — every unit scanned or reserved for this subject is ticked as used above, or is not filed here.</div>';
+  }
+  const took = c.unusedTook || "";
+  const homes = unusedHomes();
+  const dis = ro ? " disabled" : "";
+  return '<div class="hint" style="margin-bottom:8px">These units were not ticked as used and are recorded at <b>' +
+      esc(locName(p.siteId)) + '</b>. The answer is applied when the report is submitted.</div>' +
+    '<div class="field"><label class="req">Did the team take the unused units with them?</label>' +
+      '<label class="check' + (took === "YES" ? " on" : "") + '" style="margin:0 0 4px"><input type="radio" name="ut-took" data-utook="YES"' +
+        (took === "YES" ? " checked" : "") + dis + '><span>Yes — the team took them</span></label>' +
+      '<label class="check' + (took === "NO" ? " on" : "") + '" style="margin:0 0 4px"><input type="radio" name="ut-took" data-utook="NO"' +
+        (took === "NO" ? " checked" : "") + dis + '><span>No — they stayed at ' + esc(locName(p.siteId)) + '</span></label></div>' +
+    (took === "YES"
+      ? units.map(d => {
+          const on = unusedTaken(p, d), to = unusedDest(p, d, homes);
+          return '<div style="border:1px solid var(--line-2);border-radius:6px;padding:10px;margin:0 0 8px">' +
+            '<label class="check' + (on ? " on" : "") + '" style="margin:0 0 6px"><input type="checkbox" data-utstay="' + esc(d.id) + '"' +
+              (on ? " checked" : "") + dis + '><span><b>' + esc(unusedLabel(d)) + '</b> <span class="mono">' +
+              esc(d.sn || "—") + '</span> — taken</span></label>' +
+            (on ? '<select data-utto="' + esc(d.id) + '" style="width:100%" aria-label="Taking ' + esc(d.sn || "it") + ' to"' + dis + '>' +
+              homes.map(l => '<option value="' + esc(l.id) + '"' + (l.id === to ? ' selected' : '') + '>' + esc(l.name) + '</option>').join("") +
+              '</select>' : '<div class="hint">Stays at the site.</div>') + '</div>';
+        }).join("") +
+        '<div class="field" style="margin-top:10px"><label class="req" for="cf-unusedWho">Who is carrying them</label>' +
+          '<input type="text" id="cf-unusedWho" data-cf="unusedWho" value="' + esc(unusedWho(p)) + '"' + dis + '></div>' +
         '<div class="hint">A unit taken shows as <b>on the way (hand-carried)</b> until it is checked in with ' +
-          '<b>Receive Devices</b>. The warehouse managers and App Admins are told. An unticked unit stays at the site.</div>' +
-      '</div>' +
-      '<div id="ut-no" class="hint" hidden>Nothing moves. The App Admins and warehouse managers get a task to decide: ' +
-        'keep the units at the site, or send them to a warehouse.</div>' +
-      whyBox("ut-why"),
-      '<div class="row"><button class="btn btn-primary" id="ut-go">Submit the report</button>' +
-      '<button class="btn" data-close="1">Cancel</button></div>');
-    MODAL_CLEANUP = () => finish(null);
-    const paint = () => {
-      const v = (document.querySelector('input[name="ut-took"]:checked') || {}).value;
-      $("#ut-yes").hidden = v !== "YES"; $("#ut-no").hidden = v !== "NO";
-    };
-    $$('input[name="ut-took"]').forEach(r => r.onchange = paint);
-    $$("[data-ut-took]").forEach(cb => cb.onchange = () => cb.closest(".check").classList.toggle("on", cb.checked));
-    $("#ut-go").onclick = () => {
-      const v = (document.querySelector('input[name="ut-took"]:checked') || {}).value;
-      if(!v) return showWhy("ut-why", "Say whether the team took the unused units.");
-      const plan = { __stayed:[] };
-      if(v === "YES"){
-        for(const d of units){
-          const cb = document.querySelector('[data-ut-took="' + CSS.escape(d.id) + '"]');
-          if(cb && cb.checked){
-            const to = (document.querySelector('[data-ut-to="' + CSS.escape(d.id) + '"]') || {}).value;
-            if(!to) return showWhy("ut-why", "Choose where " + d.sn + " is going.");
-            plan[d.id] = to;
-          }else plan.__stayed.push(d.id);
-        }
-        const who = ($("#ut-who").value || "").trim();
-        if(Object.keys(plan).some(k => !k.startsWith("__")) && !who) return showWhy("ut-why", "Say who is carrying them.");
-        plan.__who = who;
-      }else plan.__stayed = units.map(d => d.id);
-      finish(plan);
-      closeModal();
-    };
-  });
+          '<b>Receive Devices</b>. The warehouse managers and App Admins are told. An unticked unit stays at the site.</div>'
+      : took === "NO"
+        ? '<div class="hint">Nothing moves. The App Admins and warehouse managers get a task to decide: ' +
+          'keep the units at the site, or send them to a warehouse.</div>'
+        : '');
+}
+/* Kept at the submit, before anything moves: what the answer covered. */
+function snapshotUnused(p, plan){
+  const c = cf(p);
+  c.unusedSnapshot = unusedAtSite(p).map(d => ({ id:d.id, sn:d.sn || "", label:unusedLabel(d), toId: plan[d.id] || "" }));
+  c.unusedWhoSent = plan.__who || "";
 }
 /* Tell the server what happened to the unused units (v3.19.0): the units taken are announced
    to the warehouse managers and App Admins; the units left at the site become their task.
@@ -31196,94 +31329,10 @@ async function takeBackUnused(p, plan){
   }
   if(ids.length){ commit(); renderNav(); render(); }
 }
-function lockCase(p){
-  if(!can("lockCaseFile")) return toast("Only a Clinical PM or App Admin can lock a procedure report.", "bad");
-  /* The only irreversible action in the app that a normal day's work reaches.
-     Typing the code is friction on purpose — it makes locking the wrong patient's
-     file something you have to mean. */
-  modal("Final permanent lock",
-    '<p>Locking <b>' + esc(p.patientCode) + '</b> makes every field read-only for good and ' +
-    'archives the complete procedure report to OneDrive.</p>' +
-    '<div class="warn"><b>This cannot be undone.</b> Nobody, including an App Admin, ' +
-    'can reopen the file afterwards.</div>' +
-    '<div class="field"><label class="req" for="lk-code">Type <b>' + esc(p.patientCode) +
-      '</b> to confirm</label><input type="text" id="lk-code" autocomplete="off"></div>' +
-    whyBox("lk-why"),
-    '<div class="row"><button class="btn" data-close="1">Cancel</button>' +
-    '<button class="btn btn-dark" id="lk-go">Lock permanently</button></div>');
-  $("#lk-go").onclick = async () => {
-    const typed = ($("#lk-code").value || "").trim();
-    if(typed.toUpperCase() !== String(p.patientCode).toUpperCase())
-      return showWhy("lk-why", "That does not match. Type " + p.patientCode + " exactly.");
-    const status = p.status === "CANCELLED" ? "CANCELLED" : "TREATED";
-
-    let offline = false;
-    if(S.backend){
-      const btn = $("#lk-go"); btn.disabled = true;
-      clearTimeout(_cfTimer);
-      if(_cfPending === p.id) _cfPending = null;
-      offline = queueFor(p);
-      if(!offline){
-        try{
-          try{ await saveCaseFileRemote(p.id, p.caseFile || {}, p.customQuestions || []); }
-          catch(e2){ if(e2.code === "OFFLINE") throw e2; }
-          Object.assign(p, await lockPatientRemote(p.id, { status }));   // server makes it terminal
-        }catch(e){
-          if(e.code !== "OFFLINE"){ btn.disabled = false; return showWhy("lk-why", e.message || "Could not lock on the server."); }
-          offline = true;
-        }
-      }
-      if(offline){
-        /* Locked on this device, read-only from here, and the lock waits in the queue
-           behind the report it locks. The server still decides: it refuses a lock from
-           somebody without lockCaseFile, and one on a file taken over meanwhile. */
-        offQueueCaseFile(p);
-        offEnqueue({ kind:"lock", pid:p.id, code:p.patientCode, method:"POST",
-          path:"/api/patients/" + encodeURIComponent(p.id) + "/lock", body:{ status },
-          label:"Procedure report permanently locked" });
-      }
-    }
-    if(!S.backend || offline){
-      p.fileLocked = true;
-      if(p.status !== "CANCELLED") p.status = "TREATED";
-    }
-
-    queueBackup(patientFolder(p),
-      "case_" + p.patientCode + "_locked.json",
-      { type:"CLINICAL_CASE_FILE", patientCode:p.patientCode, site:locName(p.siteId),
-        unicaSize:p.unicaSize, dsSize:p.dsSize, status:p.status,
-        caseFile:p.caseFile, customQuestions:p.customQuestions,
-        lockedBy:S.me.email, lockedAt:nowISO() });
-    /* The locked PDF, beside the JSON the queue above files. Written once: a locked
-       record does not change, so neither does its document. */
-    const filed = await fileProcedureReport(p, true);
-    /* THE SPARE GOES BACK. Two units of each are sent and one is normally used, so the
-       other has been reserved to this patient since stage 10. Consuming a unit never
-       cleared `allocatedTo` - it did not have to while exactly one unit was reserved and
-       that one was the one used - so without this the spare stays promised to a patient
-       whose file is closed: invisible to FIFO, uncountable as available, and nothing on
-       any screen saying why. Released at the lock because that is the moment the record
-       says the procedure is over and nothing else is coming. */
-    const spares = await releaseSpares(p);
-    logAction("Procedure report permanently locked for " + p.patientCode, { locationId:p.siteId,
-      stateChanges:"fileLocked = true; status → " + PT_STATUS[p.status].label +
-        (spares.length ? "; " + spares.length + " unused unit(s) released" : ""),
-      comments:"Archived to Clinical_Procedures" +
-        (filed && filed.filename ? " · " + filed.filename : "") +
-        (spares.length ? " · released " + spares.join(", ") : "") });
-    commit(); closeModal();
-    if(offline || (filed && filed.queued)){
-      toast("Locked on this device. It is locked on the server, archived and its PDF filed when the network returns.", "warn");
-    }else if(filed && filed.error){
-      toast("Locked and archived — but the report PDF was not filed: " + filed.error, "warn");
-    }else if(filed && filed.filename){
-      toast("Locked and archived. " + filed.filename + " filed.", "good");
-    }else{
-      toast("Locked and archived.", "good");
-    }
-    render();
-  };
-}
+/* lockCase - the "Final permanent lock" dialog - was removed on 25 Nov 2026 (the owner: filling in
+   the report ends with Save and close). The server route /api/patients/:id/lock is left in
+   place so a lock already waiting in an offline queue still lands; nothing in the page sends
+   one any more. */
 
 /* ================================================== 3. OUT FOR SHIPMENT === */
 let SH = null;
